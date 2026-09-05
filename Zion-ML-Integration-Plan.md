@@ -303,10 +303,11 @@ int  iMLHighlightMode; float fMLHighlight; // [-0.3, 0.4]
 | 2 | `ps_ml_chroma.hlsl` (port body_b, IsPQ wrap like siblings) | Shaders/d3d11 + compile.cmd + vcxproj + rc2 (ID 887) | 4th step **after gamma** (matches libplacebo chroma-last) |
 | 3 | Skin LUT: copy bin → `Source/res/`, resource ID, D3D11 R8 texture + bounds parse at load | Source/res/*, resource.h, rc2, DX11 load fn | 96×96 immutable; per-frame bind at t1+s1 (_FinalPass dither texture precedent) |
 | 4 | Process: 4 ML steps + LUT binding for the chroma pass; copy-mode covers all 4 | DX11VideoProcessor.cpp | GetPostScaleSteps +3→+4 |
-| 5 | Settings: `fMLHunt`, `fMLChromaNeutral/Fire/Knee/SkinProtect` (+ defaults matching mpv) + registry + dialog row(s) + live-apply + stats line | IVideoRenderer.h, VideoRenderer.cpp, MpcVideoRenderer.rc, resource.h, PropPage | AUTO keeps the mpv defaults; manual boxes override |
+| 5 | Settings: per-feature enable toggles + `fMLHunt`, `fMLChromaNeutral/Fire/Knee/SkinProtect` (defaults matching mpv) + registry + dialog row(s) + live-apply + stats line. **Control model (user decision): a Default preset + an enabled/disabled checkbox per feature in the settings window** — when untouched the mpv defaults apply | IVideoRenderer.h, VideoRenderer.cpp, MpcVideoRenderer.rc, resource.h, PropPage | |
 | 6 | Validation: Python cross-check of LUT sampling mapping; visual A/B on skin vs fire content; debug log MLPASS→4 draws | ml_test harness + manual | target ≤1 LSB on LUT lookup |
 
-### Interplay notes
-- Chroma runs in the same γ2.2 space after gamma — additive to DV too (skin guard still protects under DoVi).
-- `l1max` feeds both hunt brightness term (Auto) and `SetMLParams` guard; Manual uses 0.5 default (unchanged).
+### Interplay notes (decisions, 2026-09-05)
+- **DoVi: chroma is gated OFF while `bHdrPreferDoVi` is active** (user decision: "for now no. consider overriding DV afterwards once all ML features are backed in and working"). `l1max`/hunt follow the gamma pass, which is already neutral at DV (model →1.0); the chroma pass additionally gets an explicit `!bHdrPreferDoVi`-ish spur gate. Revisit the DV-override design in Phase 2/3.
+- Control model: chroma + hunt each get a **Default preset + enable checkbox** in the settings window (user decision, in place of mpv-style manual/auto split).
+- `l1max` feeds both hunt brightness term and `SetMLParams` guard; Manual uses 0.5 default (unchanged).
 - Effort ≈ 600–700 lines + one asset file.
