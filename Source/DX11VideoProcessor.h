@@ -116,24 +116,38 @@ private:
 
 	// Zion ML grade (shared cbuffer layout for ps_ml_*.hlsl)
 	struct MLParams_t {
-		float MLGamma;           // [0.5, 1.5], 1.0 = neutral
-		float MLShadowToe;       // [0.0, 0.4]
-		float MLShadowKnee;      // 0.25
-		float MLShadowDehaze;    // 0.0 (SDR out of scope)
+		float MLGamma;            // [0.5, 1.5], 1.0 = neutral
+		float MLShadowToe;        // [0.0, 0.4]
+		float MLShadowKnee;       // 0.25
+		float MLShadowDehaze;     // 0.0 (SDR out of scope)
 		float MLHighlightRolloff; // [-0.3, 0.4]
-		float MLHighlightKnee;   // adaptive on gamma
-		float MLGuard;           // highlight guard, 0.85 default
-		float MLHunt;            // hunt compensation
-		float MLL1Max;           // scene peak in PQ (feature extraction TBD)
-		float MLHiDesat;         // highlight desaturation
-		float IsPQ;              // 1 = PQ input (HDR passthrough), 0 = gamma-2.2 (HDR->SDR)
+		float MLHighlightKnee;    // adaptive on gamma
+		float MLGuard;            // highlight guard, 0.85 default
+		float MLHunt;             // hunt compensation
+		float MLL1Max;            // scene peak in PQ
+		float MLHiDesat;          // highlight desaturation
+		float IsPQ;               // 1 = PQ input, 0 = gamma-2.2 (HDR->SDR)
 		float Padding;
+		// Phase 1b — chroma vector tuning (Spectrum Shift)
+		float MLChromaNeutral;     // chroma gain at/below the knee (1.0 == off)
+		float MLChromaFire;        // chroma gain above the knee
+		float MLChromaKnee;        // luma knee where the boost transitions
+		float MLChromaSkinProtect; // 0..1 how strongly P(skin) pulls the boost to 1.0
+		float MLSkinLUTCR0;        // skin LUT grid bounds
+		float MLSkinLUTCR1;
+		float MLSkinLUTCB0;
+		float MLSkinLUTCB1;
+		float MLChromaGate;        // 1.0 = chroma pass active (enabled && !bHdrPreferDoVi)
+		float MLHuntGate;          // 1.0 = hunt active
+		float MLPad1;
+		float MLPad2;
 	};
 	MLParams_t m_lastMLParams = {};
 	CComPtr<ID3D11Buffer> m_pMLParams;
 	CComPtr<ID3D11PixelShader> m_pPSMLGamma;
 	CComPtr<ID3D11PixelShader> m_pPSMLShadow;
 	CComPtr<ID3D11PixelShader> m_pPSMLHighlight;
+	CComPtr<ID3D11PixelShader> m_pPSMLChroma;
 
 	// Zion ML feature extraction (Phase 1: AUTO gamma)
 	CComPtr<ID3D11Texture2D> m_MLDownsample;   // 256x144 R16_UNORM luma cache
@@ -148,6 +162,29 @@ private:
 	uint64_t m_MLDebugStepCount = 0;
 	uint16_t m_MLDebugLastMin = 0, m_MLDebugLastMax = 0;
 	float m_MLDebugLastAvg = 0.0f, m_MLDebugLastClipF = 0.0f, m_MLDebugLastEdgeF = 0.0f;
+	// Phase 1b feature-state placeholders (wired to Settings_t in task 5)
+	bool  m_bMLToneCurveEnabled = true;
+	bool  m_bMLGammaEnabled = true;
+	bool  m_bMLShadowEnabled = true;
+	bool  m_bMLHighlightEnabled = true;
+	bool  m_bMLHuntEnabled = true;
+	float m_fMLHunt = 0.80f;
+	bool  m_bMLChromaEnabled = true;
+	bool  m_bMLChromaNeutralEnabled = true;
+	float m_fMLChromaNeutral = 1.20f;
+	bool  m_bMLChromaFireEnabled = true;
+	float m_fMLChromaFire = 1.35f;
+	bool  m_bMLChromaKneeEnabled = true;
+	float m_fMLChromaKnee = 0.55f;
+	bool  m_bMLChromaSkinEnabled = true;
+	float m_fMLChromaSkinProtect = 0.95f;
+	float m_fSkinLUTCR0 = -0.2009f, m_fSkinLUTCR1 = 0.3295f;
+	float m_fSkinLUTCB0 = -0.2494f, m_fSkinLUTCB1 = 0.1967f;
+	CComPtr<ID3D11Texture2D> m_SkinLUT;
+	CComPtr<ID3D11ShaderResourceView> m_SkinLUTSRV;
+	CComPtr<ID3D11SamplerState> m_pSamplerSkin;
+	HRESULT LoadSkinLUT();
+
 	int m_MLDebugWinW = 0, m_MLDebugWinH = 0;
 	int m_MLDebugFeatReady = 0;
 	int m_MLDebugStale = 0, m_MLDebugConvertSeen = 0, m_MLDebugTexConv = 0;
@@ -159,8 +196,12 @@ private:
 	bool m_bMLConvertSeen = false; // a previous frame's convert output exists
 	bool m_bMLModelLoadTried = false;
 	bool m_bMLGammaModelLoaded = false;
+	bool m_bMLShadowModelLoaded = false;
+	bool m_bMLHighlightModelLoaded = false;
 	float m_MLFeatures[ML_FEATURE_DIM] = {};
 	CMLModel m_MLGammaModel;
+	CMLModel m_MLShadowModel;
+	CMLModel m_MLHighlightModel;
 	float m_MLIIRGamma = 1.0f;
 	float m_MLPrevL1Max = -1.0f;
 
@@ -332,7 +373,7 @@ private:
 	void SetMLParams();
 	void ExtractMLFeatures();
 	void CreateMLTextures();
-	std::wstring GetMLModelPath();
+	std::wstring GetMLModelPath(const wchar_t* fileName);
 	void InitMLDebug();
 	void LogMLFrame();
 	void LogMLFrameStats(const Tex2D_t& src, const wchar_t* tag);

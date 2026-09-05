@@ -417,6 +417,13 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_fMLHighlight          = config.fMLHighlight;
 	m_bMLDebugCopy          = config.bMLDebugCopy;
 	m_bMLDebug              = config.bMLDebugLog;
+	m_bMLHuntEnabled        = config.bMLHuntEnabled;
+	m_fMLHunt               = config.fMLHunt;
+	m_bMLChromaEnabled      = config.bMLChromaEnabled;
+	m_fMLChromaNeutral      = config.fMLChromaNeutral;
+	m_fMLChromaFire         = config.fMLChromaFire;
+	m_fMLChromaKnee         = config.fMLChromaKnee;
+	m_fMLChromaSkinProtect  = config.fMLChromaSkinProtect;
 
 	m_nCurrentAdapter = -1;
 
@@ -732,6 +739,10 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_pPSMLGamma.Release();
 	m_pPSMLShadow.Release();
 	m_pPSMLHighlight.Release();
+	m_pPSMLChroma.Release();
+	m_SkinLUT.Release();
+	m_SkinLUTSRV.Release();
+	m_pSamplerSkin.Release();
 	m_pPSMLDownsample.Release();
 	m_MLDownsample.Release();
 	m_MLStaging.Release();
@@ -814,6 +825,9 @@ UINT CDX11VideoProcessor::GetPostScaleSteps()
 	}
 	if (m_bMLActive && m_pPSMLGamma) {
 		nSteps += 3; // shadow -> highlight -> gamma
+	}
+	if (m_bMLActive && m_pPSMLChroma) {
+		nSteps++; // chroma vector tuning (skin-guarded)
 	}
 	if (m_pPSHalfOUtoInterlace) {
 		nSteps++;
@@ -1026,9 +1040,13 @@ void CDX11VideoProcessor::UpdateMLActive()
 
 	if (m_iMLMode == ML_Auto && !m_bMLModelLoadTried) {
 		m_bMLModelLoadTried = true;
-		const std::wstring path = GetMLModelPath();
-		m_bMLGammaModelLoaded = m_MLGammaModel.Load(path.c_str());
-		DLogIf(!m_bMLGammaModelLoaded, L"CDX11VideoProcessor::UpdateMLActive() failed to load '{}'; AUTO mode unavailable", path);
+		m_bMLGammaModelLoaded     = m_MLGammaModel.Load(GetMLModelPath(L"xgb_gamma_model.plxgb").c_str());
+		m_bMLShadowModelLoaded    = m_MLShadowModel.Load(GetMLModelPath(L"xgb_shadow_recovery.plxgb").c_str());
+		m_bMLHighlightModelLoaded = m_MLHighlightModel.Load(GetMLModelPath(L"xgb_highlight_rolloff.plxgb").c_str());
+		DLog(L"CDX11VideoProcessor::UpdateMLActive() models: gamma={} shadow={} highlight={}",
+			(m_bMLGammaModelLoaded ? L"ok" : L"missing"),
+			(m_bMLShadowModelLoaded ? L"ok" : L"missing"),
+			(m_bMLHighlightModelLoaded ? L"ok" : L"missing"));
 	}
 
 	const bool bAutoReady = (m_iMLMode == ML_Auto) && m_bMLGammaModelLoaded;
@@ -1044,6 +1062,12 @@ void CDX11VideoProcessor::UpdateMLActive()
 		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLShadow, IDF_PS_11_ML_SHADOW));
 		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLHighlight, IDF_PS_11_ML_HIGHLIGHT));
 		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLDownsample, IDF_PS_11_ML_DOWNSAMPLE));
+		// chroma pass exists only when the trained skin LUT is available
+		if (SUCCEEDED(LoadSkinLUT())) {
+			EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLChroma, IDF_PS_11_ML_CHROMA));
+		} else {
+			DLog(L"CDX11VideoProcessor::UpdateMLActive() skin LUT missing; chroma tuning disabled");
+		}
 		m_lastMLParams = {};
 		m_bMLFeaturesReady = false;
 		m_bMLFeaturesStale = false;
@@ -1065,6 +1089,10 @@ void CDX11VideoProcessor::UpdateMLActive()
 		m_pPSMLGamma.Release();
 		m_pPSMLShadow.Release();
 		m_pPSMLHighlight.Release();
+		m_pPSMLChroma.Release();
+		m_SkinLUT.Release();
+		m_SkinLUTSRV.Release();
+		m_pSamplerSkin.Release();
 		m_pPSMLDownsample.Release();
 		m_MLDownsample.Release();
 		m_MLStaging.Release();
@@ -1083,9 +1111,9 @@ void CDX11VideoProcessor::SetMLParams()
 	float l1max   = 0.5f;
 
 	if (m_iMLMode == ML_Manual) {
-		gamma   = discard<float>(m_fMLGamma, 1.0f, 0.5f, 1.5f);
-		shadow  = discard<float>(m_fMLShadow, 0.0f, 0.0f, 0.4f);
-		rolloff = discard<float>(m_fMLHighlight, 0.0f, -0.3f, 0.4f);
+		gamma   = (m_bMLToneCurveEnabled && m_bMLGammaEnabled) ? discard<float>(m_fMLGamma, 1.0f, 0.5f, 1.5f) : 1.0f;
+		shadow  = (m_bMLToneCurveEnabled && m_bMLShadowEnabled) ? discard<float>(m_fMLShadow, 0.0f, 0.0f, 0.5f) : 0.0f;
+		rolloff = (m_bMLToneCurveEnabled && m_bMLHighlightEnabled) ? discard<float>(m_fMLHighlight, 0.0f, -0.3f, 0.4f) : 0.0f;
 	}
 	else if (m_iMLMode == ML_Auto && m_bMLFeaturesReady && m_bMLGammaModelLoaded) {
 		// Model inference on the (previous frame's) feature vector,
@@ -1104,6 +1132,19 @@ void CDX11VideoProcessor::SetMLParams()
 			m_MLPrevL1Max = l1now;
 			gamma = m_MLIIRGamma;
 		}
+		// Shadow toe-lift + highlight roll-off: raw predictions, clamped to the
+		// libplacebo output ranges (ml_render evaluate). Gated by the same
+		// per-row enables as the manual values.
+		float shadowPred = 0.0f, highlightPred = 0.0f;
+		if (m_bMLShadowModelLoaded && m_MLShadowModel.Predict(m_MLFeatures, ML_FEATURE_DIM, shadowPred)) {
+			shadowPred = fmaxf(0.0f, fminf(0.5f, shadowPred));
+		}
+		if (m_bMLHighlightModelLoaded && m_MLHighlightModel.Predict(m_MLFeatures, ML_FEATURE_DIM, highlightPred)) {
+			highlightPred = fmaxf(-0.30f, fminf(0.40f, highlightPred));
+		}
+		shadow  = (m_bMLToneCurveEnabled && m_bMLShadowEnabled) ? shadowPred : 0.0f;
+		rolloff = (m_bMLToneCurveEnabled && m_bMLHighlightEnabled) ? highlightPred : 0.0f;
+
 		m_MLDebugFeat0 = m_MLFeatures[0];
 		m_MLDebugFeat1 = m_MLFeatures[1];
 		m_MLDebugPred = gamma;
@@ -1113,6 +1154,10 @@ void CDX11VideoProcessor::SetMLParams()
 	// Adaptive highlight guard from the scene peak (same formula as ml_render.c).
 	const float guard = (l1max > 0.6f) ? fmaxf(0.50f, 0.85f - (l1max - 0.6f) * 0.75f) : 0.85f;
 
+	const float hunt = m_bMLHuntEnabled
+		? discard<float>(m_fMLHunt, 0.80f, 0.0f, 1.0f) : 0.0f;
+	const bool bChromaActive = m_bMLChromaEnabled && !m_bHdrPreferDoVi; // user decision: defer DoVi
+
 	const MLParams_t params = {
 		gamma,
 		shadow,
@@ -1121,7 +1166,7 @@ void CDX11VideoProcessor::SetMLParams()
 		rolloff,
 		fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(gamma, 0.5f)) * 0.20f)), // highlight knee
 		guard,
-		0.10f,                                            // hunt compensation
+		hunt,                                             // hunt compensation
 		l1max,
 		0.25f,                                            // highlight desaturation
 		// The grade input is PQ iff the swap chain is in the PQ color space.
@@ -1130,7 +1175,16 @@ void CDX11VideoProcessor::SetMLParams()
 		// frame at this stage is gamma-2.2 SDR - the PQ round-trip then
 		// corrupts the whole image even at neutral settings.
 		(m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ? 1.0f : 0.0f,
-		0.0f
+		0.0f,
+		// Phase 1b — chroma vector tuning (per-row enables)
+		(bChromaActive && m_bMLChromaNeutralEnabled) ? discard<float>(m_fMLChromaNeutral, 1.20f, 1.0f, 1.5f) : 1.0f,
+		(bChromaActive && m_bMLChromaFireEnabled) ? discard<float>(m_fMLChromaFire, 1.35f, 1.0f, 1.5f) : 1.0f,
+		(bChromaActive && m_bMLChromaKneeEnabled) ? discard<float>(m_fMLChromaKnee, 0.55f, 0.1f, 0.9f) : 0.55f,
+		(bChromaActive && m_bMLChromaSkinEnabled) ? discard<float>(m_fMLChromaSkinProtect, 0.95f, 0.5f, 1.0f) : 0.95f,
+		m_fSkinLUTCR0, m_fSkinLUTCR1, m_fSkinLUTCB0, m_fSkinLUTCB1,
+		bChromaActive ? 1.0f : 0.0f,
+		m_bMLHuntEnabled ? 1.0f : 0.0f,
+		0.0f, 0.0f
 	};
 
 	m_lastMLParams = params;
@@ -1204,11 +1258,69 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 	str = std::format(
 		L"mode: {}   domain: {}   active: {}\n"
 		L"gamma={:.4f}   shadow={:.3f}   highlight={:.3f}\n"
-		L"scene: peak={:.4f} avg={:.4f}   pred={:.4f}   feat={}",
+		L"scene: peak={:.4f} avg={:.4f}   pred={:.4f}   feat={}\n"
+		L"hunt={:.3f}{}   chroma={:.2f}/{:.2f} knee={:.2f} skin={:.2f}{}",
 		mode, domain, (m_bMLActive ? L"yes" : L"no"),
 		m_lastMLParams.MLGamma, m_lastMLParams.MLShadowToe, m_lastMLParams.MLHighlightRolloff,
 		m_MLFeatures[0], m_MLFeatures[1], m_lastMLParams.MLGamma,
-		(m_bMLFeaturesReady ? L"ready" : L"n/a"));
+		(m_bMLFeaturesReady ? L"ready" : L"n/a"),
+		m_lastMLParams.MLHunt, (m_lastMLParams.MLHuntGate > 0.5f ? L"" : L"(off)"),
+		m_lastMLParams.MLChromaNeutral, m_lastMLParams.MLChromaFire,
+		m_lastMLParams.MLChromaKnee, m_lastMLParams.MLChromaSkinProtect,
+		(m_lastMLParams.MLChromaGate > 0.5f ? L"" : L"(off)"));
+}
+
+HRESULT CDX11VideoProcessor::LoadSkinLUT()
+{
+	LPVOID data = nullptr;
+	DWORD size = 0;
+	HRESULT hr = GetDataFromResource(data, size, IDF_SKIN_LUT);
+	if (FAILED(hr) || !data || size < 20) {
+		return E_FAIL;
+	}
+
+	// header: 4x float cr0,cr1,cb0,cb1 + 2x u16 N,N, then N*N u8 P(skin)
+	const float* f = (const float*)data;
+	const uint16_t* n = (const uint16_t*)((const BYTE*)data + 16);
+	const UINT N = n[0];
+	if (N == 0 || n[1] != N || (size_t)(size - 20) < (size_t)N * N) {
+		return E_FAIL;
+	}
+
+	m_fSkinLUTCR0 = f[0]; m_fSkinLUTCR1 = f[1];
+	m_fSkinLUTCB0 = f[2]; m_fSkinLUTCB1 = f[3];
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = N;
+	desc.Height = N;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_R8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_IMMUTABLE;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA init = { (const BYTE*)data + 20, (UINT)N, 0 };
+	hr = m_pDevice->CreateTexture2D(&desc, &init, &m_SkinLUT);
+	if (FAILED(hr)) {
+		return hr;
+	}
+	hr = m_pDevice->CreateShaderResourceView(m_SkinLUT, nullptr, &m_SkinLUTSRV);
+	if (FAILED(hr)) {
+		return hr;
+	}
+
+	if (!m_pSamplerSkin) {
+		D3D11_SAMPLER_DESC sd = {};
+		sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		hr = m_pDevice->CreateSamplerState(&sd, &m_pSamplerSkin);
+	}
+
+	DLog(L"CDX11VideoProcessor::LoadSkinLUT() {0}x{0} cr[{1:.4f},{2:.4f}] cb[{3:.4f},{4:.4f}]",
+		N, m_fSkinLUTCR0, m_fSkinLUTCR1, m_fSkinLUTCB0, m_fSkinLUTCB1);
+	return hr;
 }
 
 void CDX11VideoProcessor::CreateMLTextures()
@@ -1262,9 +1374,9 @@ std::wstring CDX11VideoProcessor::GetMLModuleDir()
 	return L".";
 }
 
-std::wstring CDX11VideoProcessor::GetMLModelPath()
+std::wstring CDX11VideoProcessor::GetMLModelPath(const wchar_t* fileName)
 {
-	return GetMLModuleDir() + L"\\xgb_gamma_model.plxgb";
+	return GetMLModuleDir() + L"\\" + fileName;
 }
 
 void CDX11VideoProcessor::InitMLDebug()
@@ -3848,18 +3960,32 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			StepSetting();
 			hrs[2] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psGamma, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 
-			if (m_bMLDebug && m_pMLDebugFile) {
-				fwprintf(m_pMLDebugFile, L"MLPASS draws %s %s %s (hr=%x,%x,%x)\n",
-					m_bMLDebugCopy ? L"copy" : L"shadow",
-					m_bMLDebugCopy ? L"copy" : L"highlight",
-					m_bMLDebugCopy ? L"copy" : L"gamma",
-					(unsigned)hrs[0], (unsigned)hrs[1], (unsigned)hrs[2]);
-				fflush(m_pMLDebugFile);
-			}
-
 			// log luma stats of the gamma-step INPUT (pre-grade content) every 8th frame
 			if (m_bMLDebug && m_bMLDebugCopy == false && m_MLDebugFrame % 8 == 0) {
 				LogMLFrameStats(*pInputTexture, L"IN");
+			}
+
+			// 4. chroma vector tuning (skin-guarded) — LUT on t1 + s1 like FinalPass
+			hrs[3] = S_OK;
+			if (m_pPSMLChroma && m_SkinLUTSRV) {
+				StepSetting();
+				m_pDeviceContext->PSSetShaderResources(1, 1, &m_SkinLUTSRV.p);
+				m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerSkin.p);
+				hrs[3] = TextureCopyRect(*pInputTexture, pRT, rect, rect,
+					m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLChroma.p,
+					m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
+				ID3D11ShaderResourceView* nullSRVs[1] = {};
+				m_pDeviceContext->PSSetShaderResources(1, 1, nullSRVs);
+			}
+
+			if (m_bMLDebug && m_pMLDebugFile) {
+				fwprintf(m_pMLDebugFile, L"MLPASS draws %s %s %s %s (hr=%x,%x,%x,%x)\n",
+					m_bMLDebugCopy ? L"copy" : L"shadow",
+					m_bMLDebugCopy ? L"copy" : L"highlight",
+					m_bMLDebugCopy ? L"copy" : L"gamma",
+					(m_pPSMLChroma ? (m_bMLDebugCopy ? L"copy" : L"chroma") : L"none"),
+					(unsigned)hrs[0], (unsigned)hrs[1], (unsigned)hrs[2], (unsigned)hrs[3]);
+				fflush(m_pMLDebugFile);
 			}
 		}
 
@@ -4462,14 +4588,42 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	if (config.bMLEnabled != m_bML || config.iMLMode != m_iMLMode ||
 			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow ||
 			config.fMLHighlight != m_fMLHighlight ||
-			config.bMLDebugCopy != m_bMLDebugCopy || config.bMLDebugLog != m_bMLDebug) {
+			config.bMLGammaEnabled != m_bMLGammaEnabled ||
+			config.bMLShadowEnabled != m_bMLShadowEnabled ||
+			config.bMLHighlightEnabled != m_bMLHighlightEnabled ||
+			config.bMLDebugCopy != m_bMLDebugCopy || config.bMLDebugLog != m_bMLDebug ||
+			config.bMLHuntEnabled != m_bMLHuntEnabled || config.fMLHunt != m_fMLHunt ||
+			config.bMLChromaEnabled != m_bMLChromaEnabled ||
+			config.bMLChromaNeutralEnabled != m_bMLChromaNeutralEnabled ||
+			config.fMLChromaNeutral != m_fMLChromaNeutral ||
+			config.bMLChromaFireEnabled != m_bMLChromaFireEnabled ||
+			config.fMLChromaFire != m_fMLChromaFire ||
+			config.bMLChromaKneeEnabled != m_bMLChromaKneeEnabled ||
+			config.fMLChromaKnee != m_fMLChromaKnee ||
+			config.bMLChromaSkinEnabled != m_bMLChromaSkinEnabled ||
+			config.fMLChromaSkinProtect != m_fMLChromaSkinProtect) {
 		m_bML          = config.bMLEnabled;
 		m_iMLMode      = config.iMLMode;
 		m_fMLGamma     = config.fMLGamma;
 		m_fMLShadow    = config.fMLShadow;
 		m_fMLHighlight = config.fMLHighlight;
+		m_bMLToneCurveEnabled = config.bMLToneCurveEnabled;
+		m_bMLGammaEnabled   = config.bMLGammaEnabled;
+		m_bMLShadowEnabled  = config.bMLShadowEnabled;
+		m_bMLHighlightEnabled = config.bMLHighlightEnabled;
 		m_bMLDebugCopy = config.bMLDebugCopy;
 		m_bMLDebug     = config.bMLDebugLog;
+		m_bMLHuntEnabled = config.bMLHuntEnabled;
+		m_fMLHunt        = config.fMLHunt;
+		m_bMLChromaEnabled = config.bMLChromaEnabled;
+		m_bMLChromaNeutralEnabled = config.bMLChromaNeutralEnabled;
+		m_fMLChromaNeutral = config.fMLChromaNeutral;
+		m_bMLChromaFireEnabled = config.bMLChromaFireEnabled;
+		m_fMLChromaFire    = config.fMLChromaFire;
+		m_bMLChromaKneeEnabled = config.bMLChromaKneeEnabled;
+		m_fMLChromaKnee    = config.fMLChromaKnee;
+		m_bMLChromaSkinEnabled = config.bMLChromaSkinEnabled;
+		m_fMLChromaSkinProtect = config.fMLChromaSkinProtect;
 		UpdateMLActive();
 	}
 

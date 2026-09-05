@@ -30,6 +30,19 @@ cbuffer MLParams : register(b0)
 	float MLHiDesat;
 	float IsPQ;
 	float Padding;
+	// Phase 1b — chroma vector tuning (unused in this pass, layout shared)
+	float MLChromaNeutral;
+	float MLChromaFire;
+	float MLChromaKnee;
+	float MLChromaSkinProtect;
+	float MLSkinLUTCR0;
+	float MLSkinLUTCR1;
+	float MLSkinLUTCB0;
+	float MLSkinLUTCB1;
+	float MLChromaGate;
+	float MLHuntGate;
+	float MLPad1;
+	float MLPad2;
 };
 
 static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);

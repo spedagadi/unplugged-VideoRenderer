@@ -142,11 +142,27 @@ struct Settings_t {
 	// Zion ML grade
 	bool  bMLEnabled = false;
 	int   iMLMode = ML_Disable; // ML_Disable / ML_Manual / ML_Auto
+	bool  bMLToneCurveEnabled = true; // "Tone curve" group master
+	bool  bMLGammaEnabled = true;
 	float fMLGamma = 1.0f;       // manual gamma [0.5, 1.5]
-	float fMLShadow = 0.0f;      // manual shadow toe-lift [0.0, 0.4]
+	bool  bMLShadowEnabled = true;
+	float fMLShadow = 0.0f;      // manual shadow toe-lift [0.0, 0.5]
+	bool  bMLHighlightEnabled = true;
 	float fMLHighlight = 0.0f;   // manual highlight roll-off [-0.3, 0.4]
 	bool  bMLDebugCopy = false;  // grade steps use the plain copy shader (shader-vs-plumbing bisect)
 	bool  bMLDebugLog = false;   // per-frame diagnostic CSV next to the filter
+	// Phase 1b — chroma vector tuning / hunt compensation
+	bool  bMLHuntEnabled = true;         // default preset: enabled
+	float fMLHunt = 0.80f;  // libplacebo default (ml_render.h)
+	bool  bMLChromaEnabled = true;       // master pass gate (also off under DoVi)
+	bool  bMLChromaNeutralEnabled = true;
+	float fMLChromaNeutral = 1.20f;
+	bool  bMLChromaFireEnabled = true;
+	float fMLChromaFire = 1.35f;
+	bool  bMLChromaKneeEnabled = true;
+	float fMLChromaKnee = 0.55f;
+	bool  bMLChromaSkinEnabled = true;
+	float fMLChromaSkinProtect = 0.95f;
 
 	Settings_t() {
 		SetDefault();
@@ -199,11 +215,26 @@ struct Settings_t {
 		iSDRDisplayNits                 = SDR_NITS_DEF;
 		bMLEnabled                      = false;
 		iMLMode                         = ML_Disable;
+		bMLToneCurveEnabled             = true;
+		bMLGammaEnabled                 = true;
 		fMLGamma                        = 1.0f;
+		bMLShadowEnabled                = true;
 		fMLShadow                       = 0.0f;
+		bMLHighlightEnabled             = true;
 		fMLHighlight                    = 0.0f;
 		bMLDebugCopy                    = false;
 		bMLDebugLog                     = false;
+		bMLHuntEnabled                  = true;
+		fMLHunt                         = 0.80f;
+		bMLChromaEnabled                = true;
+		bMLChromaNeutralEnabled         = true;
+		fMLChromaNeutral                = 1.20f;
+		bMLChromaFireEnabled            = true;
+		fMLChromaFire                   = 1.35f;
+		bMLChromaKneeEnabled            = true;
+		fMLChromaKnee                   = 0.55f;
+		bMLChromaSkinEnabled            = true;
+		fMLChromaSkinProtect            = 0.95f;
 	}
 };
 

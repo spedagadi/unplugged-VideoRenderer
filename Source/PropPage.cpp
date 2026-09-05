@@ -81,6 +81,51 @@ CVRMainPPage::~CVRMainPPage()
 	DLog(L"~CVRMainPPage()");
 }
 
+namespace {
+
+struct MLSliderRange {
+	int nSlider, nEdit;
+	float lo, hi;
+	float Settings_t::* pField;
+};
+
+// libplacebo-authoritative ranges (ml_render.h + manifest clips)
+const MLSliderRange kMLSliders[] = {
+	{ IDC_SLIDER3,  IDC_EDIT3,  0.50f, 1.50f, &Settings_t::fMLGamma },
+	{ IDC_SLIDER4,  IDC_EDIT4,  0.0f,  0.50f, &Settings_t::fMLShadow },
+	{ IDC_SLIDER5,  IDC_EDIT5, -0.30f, 0.40f, &Settings_t::fMLHighlight },
+	{ IDC_SLIDER6,  IDC_EDIT7,  0.0f,  1.00f, &Settings_t::fMLHunt },
+	{ IDC_SLIDER7,  IDC_EDIT8,  1.0f,  1.50f, &Settings_t::fMLChromaNeutral },
+	{ IDC_SLIDER8,  IDC_EDIT9,  1.0f,  1.50f, &Settings_t::fMLChromaFire },
+	{ IDC_SLIDER9,  IDC_EDIT10, 0.10f, 0.90f, &Settings_t::fMLChromaKnee },
+	{ IDC_SLIDER10, IDC_EDIT11, 0.50f, 1.00f, &Settings_t::fMLChromaSkinProtect },
+};
+
+constexpr int kMLSlideRange(const MLSliderRange& r) { return (int)((r.hi - r.lo) * 100.0f + 0.5f); }
+int MLSliderPos(float value, const MLSliderRange& r) { return (int)roundf((value - r.lo) * kMLSlideRange(r) / (r.hi - r.lo)); }
+float MLSliderValue(int pos, const MLSliderRange& r) { return r.lo + (r.hi - r.lo) * ((float)pos / kMLSlideRange(r)); }
+
+} // namespace
+
+void CVRMainPPage::InitMLSliders()
+{
+	for (const auto& r : kMLSliders) {
+		const int range = kMLSlideRange(r);
+		SendDlgItemMessageW(r.nSlider, TBM_SETRANGE, 1, MAKELONG(0, range));
+		SendDlgItemMessageW(r.nSlider, TBM_SETLINESIZE, 0, 1);
+		SendDlgItemMessageW(r.nSlider, TBM_SETPAGESIZE, 0, (range / 10 > 1) ? range / 10 : 1);
+	}
+}
+
+void CVRMainPPage::SetMLSliders()
+{
+	for (const auto& r : kMLSliders) {
+		const float v = m_SetsPP.*(r.pField);
+		SendDlgItemMessageW(r.nSlider, TBM_SETPOS, 1, MLSliderPos(v, r));
+		SetDlgItemTextW(r.nEdit, std::to_wstring(v).c_str());
+	}
+}
+
 void CVRMainPPage::SetControls()
 {
 	CheckDlgButton(IDC_CHECK1, m_SetsPP.bUseD3D11             ? BST_CHECKED : BST_UNCHECKED);
@@ -136,11 +181,19 @@ void CVRMainPPage::SetControls()
 
 	CheckDlgButton(IDC_CHECK20, m_SetsPP.bMLEnabled ? BST_CHECKED : BST_UNCHECKED);
 	SendDlgItemMessageW(IDC_COMBO11, CB_SETCURSEL, m_SetsPP.iMLMode, 0);
-	SetDlgItemTextW(IDC_EDIT3, std::to_wstring(m_SetsPP.fMLGamma).c_str());
-	SetDlgItemTextW(IDC_EDIT4, std::to_wstring(m_SetsPP.fMLShadow).c_str());
-	SetDlgItemTextW(IDC_EDIT5, std::to_wstring(m_SetsPP.fMLHighlight).c_str());
+	SetMLSliders();
 	CheckDlgButton(IDC_CHECK21, m_SetsPP.bMLDebugCopy ? BST_CHECKED : BST_UNCHECKED);
 	CheckDlgButton(IDC_CHECK22, m_SetsPP.bMLDebugLog  ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK23, m_SetsPP.bMLHuntEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK24, m_SetsPP.bMLChromaEnabled ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK32, m_SetsPP.bMLToneCurveEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK25, m_SetsPP.bMLGammaEnabled       ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK26, m_SetsPP.bMLShadowEnabled      ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK27, m_SetsPP.bMLHighlightEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK28, m_SetsPP.bMLChromaNeutralEnabled ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK29, m_SetsPP.bMLChromaFireEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK30, m_SetsPP.bMLChromaKneeEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK31, m_SetsPP.bMLChromaSkinEnabled   ? BST_CHECKED : BST_UNCHECKED);
 }
 
 void CVRMainPPage::EnableControls()
@@ -182,15 +235,37 @@ void CVRMainPPage::EnableControls()
 	const BOOL bMLManual  = bMLEnable && m_SetsPP.iMLMode == ML_Manual;
 	GetDlgItem(IDC_STATIC101).EnableWindow(bMLEnable);
 	GetDlgItem(IDC_COMBO11).EnableWindow(bMLEnable);
-	GetDlgItem(IDC_STATIC102).EnableWindow(bMLManual);
-	GetDlgItem(IDC_STATIC103).EnableWindow(bMLManual);
-	GetDlgItem(IDC_STATIC104).EnableWindow(bMLManual);
-	GetDlgItem(IDC_EDIT3).EnableWindow(bMLManual);
-	GetDlgItem(IDC_EDIT4).EnableWindow(bMLManual);
-	GetDlgItem(IDC_EDIT5).EnableWindow(bMLManual);
+	const BOOL bChromaRow  = m_SetsPP.bMLChromaEnabled;
+	const BOOL bToneRow   = m_SetsPP.bMLToneCurveEnabled;
+	GetDlgItem(IDC_CHECK32).EnableWindow(bMLEnable);                       // tone curve master
+	GetDlgItem(IDC_CHECK25).EnableWindow(bMLEnable);                       // gamma row
+	GetDlgItem(IDC_SLIDER3).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLGammaEnabled);
+	GetDlgItem(IDC_EDIT3).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLGammaEnabled);
+	GetDlgItem(IDC_CHECK26).EnableWindow(bMLEnable);                       // shadow row
+	GetDlgItem(IDC_SLIDER4).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLShadowEnabled);
+	GetDlgItem(IDC_EDIT4).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLShadowEnabled);
+	GetDlgItem(IDC_CHECK27).EnableWindow(bMLEnable);                       // highlight row
+	GetDlgItem(IDC_SLIDER5).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLHighlightEnabled);
+	GetDlgItem(IDC_EDIT5).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLHighlightEnabled);
+	GetDlgItem(IDC_CHECK23).EnableWindow(bMLEnable);                       // hunt row
+	GetDlgItem(IDC_SLIDER6).EnableWindow(bMLEnable && m_SetsPP.bMLHuntEnabled);
+	GetDlgItem(IDC_EDIT7).EnableWindow(bMLEnable && m_SetsPP.bMLHuntEnabled);
+	GetDlgItem(IDC_CHECK28).EnableWindow(bMLEnable);                       // ch-neutral row
+	GetDlgItem(IDC_SLIDER7).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaNeutralEnabled);
+	GetDlgItem(IDC_EDIT8).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaNeutralEnabled);
+	GetDlgItem(IDC_CHECK29).EnableWindow(bMLEnable);                       // ch-fire row
+	GetDlgItem(IDC_SLIDER8).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaFireEnabled);
+	GetDlgItem(IDC_EDIT9).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaFireEnabled);
+	GetDlgItem(IDC_CHECK30).EnableWindow(bMLEnable);                       // knee row
+	GetDlgItem(IDC_SLIDER9).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaKneeEnabled);
+	GetDlgItem(IDC_EDIT10).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaKneeEnabled);
+	GetDlgItem(IDC_CHECK31).EnableWindow(bMLEnable);                       // skin row
+	GetDlgItem(IDC_SLIDER10).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaSkinEnabled);
+	GetDlgItem(IDC_EDIT11).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaSkinEnabled);
 	GetDlgItem(IDC_STATIC105).EnableWindow(bMLEnable);
 	GetDlgItem(IDC_CHECK21).EnableWindow(bMLEnable);
 	GetDlgItem(IDC_CHECK22).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_CHECK24).EnableWindow(bMLEnable);                       // chroma master
 }
 
 HRESULT CVRMainPPage::OnConnect(IUnknown *pUnk)
@@ -358,6 +433,8 @@ HRESULT CVRMainPPage::OnActivate()
 	// poll the live Zion ML state for the stats box
 	SetTimer(1001, 500);
 
+	InitMLSliders();
+
 	return S_OK;
 }
 
@@ -488,6 +565,44 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 			}
 			if (nID == IDC_CHECK22) {
 				m_SetsPP.bMLDebugLog = IsDlgButtonChecked(IDC_CHECK22) == BST_CHECKED;
+				m_pVideoRenderer->SetSettings(m_SetsPP);
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK23) {
+				m_SetsPP.bMLHuntEnabled = IsDlgButtonChecked(IDC_CHECK23) == BST_CHECKED;
+				EnableControls();
+				m_pVideoRenderer->SetSettings(m_SetsPP);
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK24) {
+				m_SetsPP.bMLChromaEnabled = IsDlgButtonChecked(IDC_CHECK24) == BST_CHECKED;
+				EnableControls();
+				m_pVideoRenderer->SetSettings(m_SetsPP);
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK32) {
+				m_SetsPP.bMLToneCurveEnabled = IsDlgButtonChecked(IDC_CHECK32) == BST_CHECKED;
+				EnableControls();
+				m_pVideoRenderer->SetSettings(m_SetsPP);
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK25 || nID == IDC_CHECK26 || nID == IDC_CHECK27 ||
+				nID == IDC_CHECK28 || nID == IDC_CHECK29 || nID == IDC_CHECK30 || nID == IDC_CHECK31) {
+				const bool bChecked = IsDlgButtonChecked(nID) == BST_CHECKED;
+				switch (nID) {
+				case IDC_CHECK25: m_SetsPP.bMLGammaEnabled       = bChecked; break;
+				case IDC_CHECK26: m_SetsPP.bMLShadowEnabled      = bChecked; break;
+				case IDC_CHECK27: m_SetsPP.bMLHighlightEnabled   = bChecked; break;
+				case IDC_CHECK28: m_SetsPP.bMLChromaNeutralEnabled = bChecked; break;
+				case IDC_CHECK29: m_SetsPP.bMLChromaFireEnabled   = bChecked; break;
+				case IDC_CHECK30: m_SetsPP.bMLChromaKneeEnabled   = bChecked; break;
+				case IDC_CHECK31: m_SetsPP.bMLChromaSkinEnabled   = bChecked; break;
+				}
+				EnableControls();
 				m_pVideoRenderer->SetSettings(m_SetsPP);
 				SetDirty();
 				return (LRESULT)1;
@@ -636,7 +751,9 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 			if (nID == IDC_EDIT_DISPLAYMAX) {
 				SetDirty();
 			}
-			if (nID == IDC_EDIT3 || nID == IDC_EDIT4 || nID == IDC_EDIT5) {
+			if (nID == IDC_EDIT3 || nID == IDC_EDIT4 || nID == IDC_EDIT5 ||
+				nID == IDC_EDIT7 || nID == IDC_EDIT8 || nID == IDC_EDIT9 ||
+				nID == IDC_EDIT10 || nID == IDC_EDIT11) {
 				// Zion ML value edits: live-apply on every keystroke, clamping
 				// out-of-range entries to the valid range instead of rejecting
 				// them (so typing "3" visibly applies 1.5 rather than doing
@@ -644,8 +761,13 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 				float* pDst = nullptr;
 				float def = 0.f, lo = 0.f, hi = 0.f;
 				if (nID == IDC_EDIT3) { pDst = &m_SetsPP.fMLGamma; def = 1.0f; lo = 0.5f;  hi = 1.5f; }
-				if (nID == IDC_EDIT4) { pDst = &m_SetsPP.fMLShadow; def = 0.0f; lo = 0.0f;  hi = 0.4f; }
+				if (nID == IDC_EDIT4) { pDst = &m_SetsPP.fMLShadow; def = 0.0f; lo = 0.0f;  hi = 0.5f; }
 				if (nID == IDC_EDIT5) { pDst = &m_SetsPP.fMLHighlight; def = 0.0f; lo = -0.3f; hi = 0.4f; }
+				if (nID == IDC_EDIT7) { pDst = &m_SetsPP.fMLHunt; def = 0.80f; lo = 0.0f; hi = 1.0f; }
+				if (nID == IDC_EDIT8) { pDst = &m_SetsPP.fMLChromaNeutral; def = 1.20f; lo = 1.0f; hi = 1.5f; }
+				if (nID == IDC_EDIT9) { pDst = &m_SetsPP.fMLChromaFire; def = 1.35f; lo = 1.0f; hi = 1.5f; }
+				if (nID == IDC_EDIT10) { pDst = &m_SetsPP.fMLChromaKnee; def = 0.55f; lo = 0.1f; hi = 0.9f; }
+				if (nID == IDC_EDIT11) { pDst = &m_SetsPP.fMLChromaSkinProtect; def = 0.95f; lo = 0.5f; hi = 1.0f; }
 				WCHAR buffer[32];
 				::GetDlgItemTextW(m_hWnd, nID, buffer, _countof(buffer));
 				const float v = (float)_wtof(buffer);
@@ -682,6 +804,18 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 				}
 			}
 			return (LRESULT)1;
+		}
+
+		// Zion ML sliders — live-apply on every move
+		for (const auto& r : kMLSliders) {
+			if ((HWND)lParam == GetDlgItem(r.nSlider)) {
+				const float v = MLSliderValue((int)SendDlgItemMessageW(r.nSlider, TBM_GETPOS, 0, 0), r);
+				m_SetsPP.*(r.pField) = v;
+				SetDlgItemTextW(r.nEdit, std::to_wstring(v).c_str());
+				m_pVideoRenderer->SetSettings(m_SetsPP);
+				SetDirty();
+				return (LRESULT)1;
+			}
 		}
 	}
 

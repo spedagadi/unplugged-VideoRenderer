@@ -75,6 +75,21 @@
 #define OPT_MLHighlight                    L"MLHighlight"
 #define OPT_MLDebugCopy                    L"MLDebugPassthrough" // legacy registry name
 #define OPT_MLDebugLog                     L"MLDebugLog"
+#define OPT_MLHuntEnabled                  L"MLHuntEnabled"
+#define OPT_MLHunt                         L"MLHunt"
+#define OPT_MLChromaEnabled                L"MLChromaEnabled"
+#define OPT_MLChromaNeutral                L"MLChromaNeutral"
+#define OPT_MLChromaFire                   L"MLChromaFire"
+#define OPT_MLChromaKnee                   L"MLChromaKnee"
+#define OPT_MLChromaSkinProtect            L"MLChromaSkinProtect"
+#define OPT_MLToneCurveEnabled             L"MLToneCurveEnabled"
+#define OPT_MLGammaEnabled                 L"MLGammaEnabled"
+#define OPT_MLShadowEnabled                L"MLShadowEnabled"
+#define OPT_MLHighlightEnabled             L"MLHighlightEnabled"
+#define OPT_MLChromaNeutralEnabled         L"MLChromaNeutralEnabled"
+#define OPT_MLChromaFireEnabled            L"MLChromaFireEnabled"
+#define OPT_MLChromaKneeEnabled            L"MLChromaKneeEnabled"
+#define OPT_MLChromaSkinEnabled            L"MLChromaSkinEnabled"
 
 static std::atomic_int g_nInstance = 0;
 static const wchar_t g_szClassName[] = L"VRWindow";
@@ -296,7 +311,7 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 			}
 			nChars = _countof(str);
 			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLShadow, str, &nChars)) {
-				m_Sets.fMLShadow = discard<float>((float)_wtof(str), 0.0f, 0.0f, 0.4f);
+				m_Sets.fMLShadow = discard<float>((float)_wtof(str), 0.0f, 0.0f, 0.5f);
 			}
 			nChars = _countof(str);
 			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLHighlight, str, &nChars)) {
@@ -308,6 +323,43 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLDebugLog, dw)) {
 			m_Sets.bMLDebugLog = !!dw;
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLHuntEnabled, dw)) {
+			m_Sets.bMLHuntEnabled = !!dw;
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLChromaEnabled, dw)) {
+			m_Sets.bMLChromaEnabled = !!dw;
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLToneCurveEnabled, dw)) m_Sets.bMLToneCurveEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLGammaEnabled, dw)) m_Sets.bMLGammaEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLShadowEnabled, dw)) m_Sets.bMLShadowEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLHighlightEnabled, dw)) m_Sets.bMLHighlightEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLChromaNeutralEnabled, dw)) m_Sets.bMLChromaNeutralEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLChromaFireEnabled, dw)) m_Sets.bMLChromaFireEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLChromaKneeEnabled, dw)) m_Sets.bMLChromaKneeEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLChromaSkinEnabled, dw)) m_Sets.bMLChromaSkinEnabled = !!dw;
+		{
+			WCHAR str[32];
+			ULONG nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLHunt, str, &nChars)) {
+				m_Sets.fMLHunt = discard<float>((float)_wtof(str), 0.80f, 0.0f, 1.0f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLChromaNeutral, str, &nChars)) {
+				m_Sets.fMLChromaNeutral = discard<float>((float)_wtof(str), 1.20f, 1.0f, 1.5f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLChromaFire, str, &nChars)) {
+				m_Sets.fMLChromaFire = discard<float>((float)_wtof(str), 1.35f, 1.0f, 1.5f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLChromaKnee, str, &nChars)) {
+				m_Sets.fMLChromaKnee = discard<float>((float)_wtof(str), 0.55f, 0.1f, 0.9f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLChromaSkinProtect, str, &nChars)) {
+				m_Sets.fMLChromaSkinProtect = discard<float>((float)_wtof(str), 0.95f, 0.5f, 1.0f);
+			}
 		}
 	}
 
@@ -1362,6 +1414,21 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 		key.SetStringValue(OPT_MLHighlight,        std::to_wstring(m_Sets.fMLHighlight).c_str());
 		key.SetDWORDValue(OPT_MLDebugCopy,         m_Sets.bMLDebugCopy);
 		key.SetDWORDValue(OPT_MLDebugLog,          m_Sets.bMLDebugLog);
+		key.SetDWORDValue(OPT_MLHuntEnabled,       m_Sets.bMLHuntEnabled);
+		key.SetDWORDValue(OPT_MLChromaEnabled,     m_Sets.bMLChromaEnabled);
+		key.SetDWORDValue(OPT_MLToneCurveEnabled,    m_Sets.bMLToneCurveEnabled);
+		key.SetDWORDValue(OPT_MLGammaEnabled,        m_Sets.bMLGammaEnabled);
+		key.SetDWORDValue(OPT_MLShadowEnabled,       m_Sets.bMLShadowEnabled);
+		key.SetDWORDValue(OPT_MLHighlightEnabled,    m_Sets.bMLHighlightEnabled);
+		key.SetDWORDValue(OPT_MLChromaNeutralEnabled,m_Sets.bMLChromaNeutralEnabled);
+		key.SetDWORDValue(OPT_MLChromaFireEnabled,   m_Sets.bMLChromaFireEnabled);
+		key.SetDWORDValue(OPT_MLChromaKneeEnabled,   m_Sets.bMLChromaKneeEnabled);
+		key.SetDWORDValue(OPT_MLChromaSkinEnabled,   m_Sets.bMLChromaSkinEnabled);
+		key.SetStringValue(OPT_MLHunt,             std::to_wstring(m_Sets.fMLHunt).c_str());
+		key.SetStringValue(OPT_MLChromaNeutral,    std::to_wstring(m_Sets.fMLChromaNeutral).c_str());
+		key.SetStringValue(OPT_MLChromaFire,       std::to_wstring(m_Sets.fMLChromaFire).c_str());
+		key.SetStringValue(OPT_MLChromaKnee,       std::to_wstring(m_Sets.fMLChromaKnee).c_str());
+		key.SetStringValue(OPT_MLChromaSkinProtect, std::to_wstring(m_Sets.fMLChromaSkinProtect).c_str());
 	}
 
 	return S_OK;

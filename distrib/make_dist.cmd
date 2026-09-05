@@ -69,8 +69,10 @@ COPY /Y "history.txt"                          "%DIST_DIR%\" >NUL
 
 IF EXIST "models\xgb_gamma_model.plxgb" (
   COPY /Y "models\xgb_gamma_model.plxgb" "%DIST_DIR%\" >NUL
+  COPY /Y "models\xgb_shadow_recovery.plxgb" "%DIST_DIR%\" >NUL
+  COPY /Y "models\xgb_highlight_rolloff.plxgb" "%DIST_DIR%\" >NUL
 ) ELSE (
-  ECHO [WARN] models\xgb_gamma_model.plxgb not found - AUTO mode will be unavailable.
+  ECHO [WARN] models\*.plxgb not found - AUTO mode will be unavailable.
 )
 
 ECHO.

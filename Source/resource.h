@@ -7,6 +7,7 @@
 #define IDS_MAINPROPPAGE_TITLE          104
 #define IDS_INFOPROPPAGE_TITLE          105
 #define IDF_DITHER_32X32_FLOAT16        401
+#define IDF_SKIN_LUT                    402
 #define IDF_HLSL_ST2084                 501
 #define IDF_HLSL_HLG                    502
 #define IDF_HLSL_HDR_TONE_MAPPING       503
@@ -90,6 +91,7 @@
 #define IDF_PS_11_ML_SHADOW             884
 #define IDF_PS_11_ML_HIGHLIGHT          885
 #define IDF_PS_11_ML_DOWNSAMPLE         886
+#define IDF_PS_11_ML_CHROMA             887
 #define IDF_PS_11_TEST                  900
 #define IDC_EDIT1                       1001
 #define IDC_EDIT2                       1002
@@ -134,6 +136,14 @@
 #define IDC_BUTTON1                     1051
 #define IDC_SLIDER1                     1061
 #define IDC_SLIDER2                     1062
+#define IDC_SLIDER3                     1092
+#define IDC_SLIDER4                     1093
+#define IDC_SLIDER5                     1094
+#define IDC_SLIDER6                     1095
+#define IDC_SLIDER7                     1096
+#define IDC_SLIDER8                     1097
+#define IDC_SLIDER9                     1098
+#define IDC_SLIDER10                    1099
 #define IDC_COMBO10                     1063
 #define IDC_STATIC99                    1064
 #define IDC_STATIC100                   1065
@@ -149,6 +159,28 @@
 #define IDC_CHECK22                     1075
 #define IDC_STATIC105                   1076
 #define IDC_EDIT6                       1077
+#define IDC_CHECK23                     1078
+#define IDC_CHECK24                     1079
+#define IDC_EDIT7                       1080
+#define IDC_EDIT8                       1081
+#define IDC_EDIT9                       1082
+#define IDC_EDIT10                      1083
+#define IDC_EDIT11                      1084
+#define IDC_EDIT12                      1085
+#define IDC_STATIC106                   1086
+#define IDC_STATIC107                   1087
+#define IDC_STATIC108                   1088
+#define IDC_STATIC109                   1089
+#define IDC_STATIC110                   1090
+#define IDC_STATIC111                   1091
+#define IDC_CHECK25                     1100
+#define IDC_CHECK26                     1101
+#define IDC_CHECK27                     1102
+#define IDC_CHECK28                     1103
+#define IDC_CHECK29                     1104
+#define IDC_CHECK30                     1105
+#define IDC_CHECK31                     1106
+#define IDC_CHECK32                     1107
 
 // Next default values for new objects
 // 
