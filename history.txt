@@ -2,6 +2,7 @@
 ------------------------
 Added the ability to get the original frame size using IExFilterConfig::Flt_GetInt64("originalVideoSize").
 Fixed the initial inactivity of the "Apply" button.
+Added "Zion ML" experimental grade for HDR content (Direct3D 11 only): midtone gamma, shadow toe-lift and highlight roll-off. Manual mode is available now; automatic (ML-predicted) mode will follow with frame-feature extraction.
 Recommended MPC-BE 1.9.1.12 or newer.
 
 0.10.7.2560 - 2026-08-01

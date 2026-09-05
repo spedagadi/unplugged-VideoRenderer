@@ -112,6 +112,28 @@ private:
 	CComPtr<ID3D11Buffer> m_pDoViDynamicConstants;
 	CComPtr<ID3D11PixelShader> m_pPSHDR10ToneMapping;
 
+	// Zion ML grade (shared cbuffer layout for ps_ml_*.hlsl)
+	struct MLParams_t {
+		float MLGamma;           // [0.5, 1.5], 1.0 = neutral
+		float MLShadowToe;       // [0.0, 0.4]
+		float MLShadowKnee;      // 0.25
+		float MLShadowDehaze;    // 0.0 (SDR out of scope)
+		float MLHighlightRolloff; // [-0.3, 0.4]
+		float MLHighlightKnee;   // adaptive on gamma
+		float MLGuard;           // highlight guard, 0.85 default
+		float MLHunt;            // hunt compensation
+		float MLL1Max;           // scene peak in PQ (feature extraction TBD)
+		float MLHiDesat;         // highlight desaturation
+		float IsPQ;              // 1 = PQ input (HDR passthrough), 0 = gamma-2.2 (HDR->SDR)
+		float Padding;
+	};
+	MLParams_t m_lastMLParams = {};
+	CComPtr<ID3D11Buffer> m_pMLParams;
+	CComPtr<ID3D11PixelShader> m_pPSMLGamma;
+	CComPtr<ID3D11PixelShader> m_pPSMLShadow;
+	CComPtr<ID3D11PixelShader> m_pPSMLHighlight;
+	bool m_bMLActive = false;
+
 	// D3D11 Shader Video Processor
 	CComPtr<ID3D11PixelShader> m_pPSConvertColor;
 	CComPtr<ID3D11PixelShader> m_pPSConvertColorDeint;
@@ -275,6 +297,9 @@ private:
 
 	void SetHDR10ShaderParams(float, float, float, float, float, int);
 	void SetDolbyVisionDynamicParams();
+
+	void UpdateMLActive();
+	void SetMLParams();
 
 	HRESULT SetShaderDoviCurvesPoly();
 	HRESULT SetShaderDoviCurves();

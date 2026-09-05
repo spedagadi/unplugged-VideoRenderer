@@ -105,6 +105,9 @@
     <ClCompile Include="MediaSampleSideData.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ml_model.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="SubPic\SubPicQueueImpl.cpp">
       <Filter>SubPic</Filter>
     </ClCompile>
@@ -216,6 +219,9 @@
       <Filter>Utils</Filter>
     </ClInclude>
     <ClInclude Include="MediaSampleSideData.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ml_model.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Utils\gpu_memcpy_sse4.h">

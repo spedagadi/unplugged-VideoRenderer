@@ -101,6 +101,12 @@ struct VPEnableFormats_t {
 	bool bOther;
 };
 
+enum : int {
+	ML_Disable = 0,
+	ML_Manual,
+	ML_Auto
+};
+
 struct Settings_t {
 	bool bUseD3D11;
 	bool bShowStats;
@@ -132,6 +138,13 @@ struct Settings_t {
 	bool bHdrLocalToneMapping;
 	int  iHdrLocalToneMappingType;
 	int iHdrDisplayMaxNits;
+
+	// Zion ML grade
+	bool  bMLEnabled = false;
+	int   iMLMode = ML_Disable; // ML_Disable / ML_Manual / ML_Auto (Auto reserved for feature extraction)
+	float fMLGamma = 1.0f;       // manual gamma [0.5, 1.5]
+	float fMLShadow = 0.0f;      // manual shadow toe-lift [0.0, 0.4]
+	float fMLHighlight = 0.0f;   // manual highlight roll-off [-0.3, 0.4]
 
 	Settings_t() {
 		SetDefault();
@@ -182,6 +195,11 @@ struct Settings_t {
 		bConvertToSdr                   = true;
 		iHdrOsdBrightness               = 0;
 		iSDRDisplayNits                 = SDR_NITS_DEF;
+		bMLEnabled                      = false;
+		iMLMode                         = ML_Disable;
+		fMLGamma                        = 1.0f;
+		fMLShadow                       = 0.0f;
+		fMLHighlight                    = 0.0f;
 	}
 };
 

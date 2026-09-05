@@ -133,6 +133,12 @@ void CVRMainPPage::SetControls()
 
 	m_SetsPP.iHdrDisplayMaxNits = discard<int>(m_SetsPP.iHdrDisplayMaxNits, HDR_NITS_DEF, HDR_NITS_MIN, HDR_NITS_MAX);
 	SetDlgItemTextW(IDC_EDIT_DISPLAYMAX, std::to_wstring(m_SetsPP.iHdrDisplayMaxNits).c_str());
+
+	CheckDlgButton(IDC_CHECK20, m_SetsPP.bMLEnabled ? BST_CHECKED : BST_UNCHECKED);
+	SendDlgItemMessageW(IDC_COMBO11, CB_SETCURSEL, m_SetsPP.iMLMode, 0);
+	SetDlgItemTextW(IDC_EDIT3, std::to_wstring(m_SetsPP.fMLGamma).c_str());
+	SetDlgItemTextW(IDC_EDIT4, std::to_wstring(m_SetsPP.fMLShadow).c_str());
+	SetDlgItemTextW(IDC_EDIT5, std::to_wstring(m_SetsPP.fMLHighlight).c_str());
 }
 
 void CVRMainPPage::EnableControls()
@@ -168,6 +174,18 @@ void CVRMainPPage::EnableControls()
 	GetDlgItem(IDC_EDIT1).EnableWindow(m_SetsPP.bConvertToSdr);
 	GetDlgItem(IDC_SLIDER2).EnableWindow(m_SetsPP.bConvertToSdr);
 	GetDlgItem(IDC_EDIT_DISPLAYMAX).EnableWindow(m_SetsPP.bHdrLocalToneMapping);
+
+	// Zion ML
+	const BOOL bMLEnable  = m_SetsPP.bMLEnabled;
+	const BOOL bMLManual  = bMLEnable && m_SetsPP.iMLMode == ML_Manual;
+	GetDlgItem(IDC_STATIC101).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_COMBO11).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_STATIC102).EnableWindow(bMLManual);
+	GetDlgItem(IDC_STATIC103).EnableWindow(bMLManual);
+	GetDlgItem(IDC_STATIC104).EnableWindow(bMLManual);
+	GetDlgItem(IDC_EDIT3).EnableWindow(bMLManual);
+	GetDlgItem(IDC_EDIT4).EnableWindow(bMLManual);
+	GetDlgItem(IDC_EDIT5).EnableWindow(bMLManual);
 }
 
 HRESULT CVRMainPPage::OnConnect(IUnknown *pUnk)
@@ -293,6 +311,9 @@ HRESULT CVRMainPPage::OnActivate()
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO10, L"Hable", 3);
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO10, L"Mobius", 4);
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO10, L"BT2390/ST 2094-10", 5);
+
+	SendDlgItemMessageW(IDC_COMBO11, CB_ADDSTRING, 0, (LPARAM)L"Disable");
+	SendDlgItemMessageW(IDC_COMBO11, CB_ADDSTRING, 0, (LPARAM)L"Manual");
 
 	SetControls();
 
@@ -431,6 +452,12 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 				SetDirty();
 				return (LRESULT)1;
 			}
+			if (nID == IDC_CHECK20) {
+				m_SetsPP.bMLEnabled = IsDlgButtonChecked(IDC_CHECK20) == BST_CHECKED;
+				EnableControls();
+				SetDirty();
+				return (LRESULT)1;
+			}
 
 			if (nID == IDC_BUTTON1) {
 				m_SetsPP.SetDefault();
@@ -560,9 +587,21 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 				EnableControls();
 				return (LRESULT)1;
 			}
+			if (nID == IDC_COMBO11) {
+				lValue = SendDlgItemMessageW(IDC_COMBO11, CB_GETCURSEL, 0, 0);
+				if (lValue != m_SetsPP.iMLMode) {
+					m_SetsPP.iMLMode = lValue;
+					EnableControls();
+					SetDirty();
+				}
+				return (LRESULT)1;
+			}
 		}
 		if (action == EN_CHANGE) {
 			if (nID == IDC_EDIT_DISPLAYMAX) {
+				SetDirty();
+			}
+			if (nID == IDC_EDIT3 || nID == IDC_EDIT4 || nID == IDC_EDIT5) {
 				SetDirty();
 			}
 		}
@@ -612,6 +651,18 @@ HRESULT CVRMainPPage::OnApplyChanges()
 	else {
 		m_SetsPP.iHdrDisplayMaxNits = displayMaxNits;
 	}
+
+	// Zion ML manual values
+	auto readFloat = [](HWND hWnd, int idEdit, float& dst, float def, float lo, float hi) {
+		WCHAR buffer[32];
+		::GetDlgItemTextW(hWnd, idEdit, buffer, _countof(buffer));
+		if (buffer[0]) {
+			dst = discard<float>((float)_wtof(buffer), def, lo, hi);
+		}
+	};
+	readFloat(m_hWnd, IDC_EDIT3, m_SetsPP.fMLGamma, 1.0f, 0.5f, 1.5f);
+	readFloat(m_hWnd, IDC_EDIT4, m_SetsPP.fMLShadow, 0.0f, 0.0f, 0.4f);
+	readFloat(m_hWnd, IDC_EDIT5, m_SetsPP.fMLHighlight, 0.0f, -0.3f, 0.4f);
 
 	m_pVideoRenderer->SetSettings(m_SetsPP);
 	m_pVideoRenderer->SaveSettings();

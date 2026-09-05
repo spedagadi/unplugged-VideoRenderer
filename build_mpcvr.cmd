@@ -85,6 +85,15 @@ IF /I "%SIGN%" == "True" (
   )
 )
 
+REM Assemble the distributable filter folder (_bin\MpcVideoRenderer-<version>)
+REM so the filter can be registered/deregistered easily.
+IF /I "%BUILDCFG%" == "Release" (
+  CALL "%~dp0\distrib\make_dist.cmd"
+  IF !ERRORLEVEL! NEQ 0 (
+    CALL :SubMsg "WARNING" "Distribution folder assembly reported errors."
+  )
+)
+
 FOR /F "tokens=3,4 delims= " %%A IN (
   'FINDSTR /I /L /C:"define VER_MAJOR" "Include\Version.h"') DO (SET "VERMAJOR=%%A")
 FOR /F "tokens=3,4 delims= " %%A IN (

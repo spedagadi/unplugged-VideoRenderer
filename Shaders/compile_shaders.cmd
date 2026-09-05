@@ -108,6 +108,10 @@ SET fxc_ps4=%fxcexe% /nologo /O2 /T ps_4_0
 %fxc_ps4% /Fo "%workdir%\ps_convert_bitmap_to_pq1.cso"   "d3d11\ps_convert_bitmap_to_pq.hlsl" /DSDR_PEAK_LUM=50
 %fxc_ps4% /Fo "%workdir%\ps_convert_bitmap_to_pq2.cso"   "d3d11\ps_convert_bitmap_to_pq.hlsl" /DSDR_PEAK_LUM=30
 
+%fxc_ps4% /Fo "%workdir%\ps_ml_gamma.cso"      "d3d11\ps_ml_gamma.hlsl"
+%fxc_ps4% /Fo "%workdir%\ps_ml_shadow.cso"     "d3d11\ps_ml_shadow.hlsl"
+%fxc_ps4% /Fo "%workdir%\ps_ml_highlight.cso"  "d3d11\ps_ml_highlight.hlsl"
+
 EXIT /B
 
 :SubColorText

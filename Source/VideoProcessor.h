@@ -67,6 +67,13 @@ protected:
 	bool m_bHdrLocalToneMapping            = false;
 	int  m_iHdrLocalToneMappingType        = 0;
 	int  m_iHdrDisplayMaxNits              = 1000;
+
+	// Zion ML grade
+	bool  m_bML                           = false;
+	int   m_iMLMode                       = ML_Disable;
+	float m_fMLGamma                      = 1.0f;
+	float m_fMLShadow                     = 0.0f;
+	float m_fMLHighlight                  = 0.0f;
 	int  m_iHdrToggleDisplay               = HDRTD_Disabled;
 	int  m_iHdrOsdBrightness               = 0;
 	bool m_bConvertToSdr                   = true;

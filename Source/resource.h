@@ -86,6 +86,9 @@
 #define IDF_PS_11_FINAL_PASS            880
 #define IDF_PS_11_FINAL_PASS_10         881
 #define IDF_PS_11_HDR10_TONEMAP         882
+#define IDF_PS_11_ML_GAMMA              883
+#define IDF_PS_11_ML_SHADOW             884
+#define IDF_PS_11_ML_HIGHLIGHT          885
 #define IDF_PS_11_TEST                  900
 #define IDC_EDIT1                       1001
 #define IDC_EDIT2                       1002
@@ -117,6 +120,7 @@
 #define IDC_CHECK17                     1037
 #define IDC_CHECK18                     1038
 #define IDC_CHECK19                     1039
+#define IDC_CHECK20                     1040
 #define IDC_COMBO1                      1041
 #define IDC_COMBO2                      1042
 #define IDC_COMBO3                      1043
@@ -132,6 +136,14 @@
 #define IDC_COMBO10                     1063
 #define IDC_STATIC99                    1064
 #define IDC_STATIC100                   1065
+#define IDC_COMBO11                     1066
+#define IDC_EDIT3                       1067
+#define IDC_EDIT4                       1068
+#define IDC_EDIT5                       1069
+#define IDC_STATIC101                   1070
+#define IDC_STATIC102                   1071
+#define IDC_STATIC103                   1072
+#define IDC_STATIC104                   1073
 
 // Next default values for new objects
 // 

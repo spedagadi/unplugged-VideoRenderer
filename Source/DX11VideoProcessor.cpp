@@ -410,6 +410,12 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_bConvertToSdr        = config.bConvertToSdr;
 	m_iSDRDisplayNits      = config.iSDRDisplayNits;
 
+	m_bML                   = config.bMLEnabled;
+	m_iMLMode               = config.iMLMode;
+	m_fMLGamma              = config.fMLGamma;
+	m_fMLShadow             = config.fMLShadow;
+	m_fMLHighlight          = config.fMLHighlight;
+
 	m_nCurrentAdapter = -1;
 
 	hr = CreateDXGIFactory1(IID_IDXGIFactory1, (void**)&m_pDXGIFactory1);
@@ -721,6 +727,13 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_pHDR10ToneMappingConstants.Release();
 	m_pDoViDynamicConstants.Release();
 
+	m_pPSMLGamma.Release();
+	m_pPSMLShadow.Release();
+	m_pPSMLHighlight.Release();
+	m_pMLParams.Release();
+	m_lastMLParams = {};
+	m_bMLActive = false;
+
 #if TEST_SHADER
 	m_pPS_TEST.Release();
 #endif
@@ -785,6 +798,9 @@ UINT CDX11VideoProcessor::GetPostScaleSteps()
 	}
 	if (m_pPSHDR10ToneMapping) {
 		nSteps++;
+	}
+	if (m_bMLActive && m_pPSMLGamma) {
+		nSteps += 3; // shadow -> highlight -> gamma
 	}
 	if (m_pPSHalfOUtoInterlace) {
 		nSteps++;
@@ -986,6 +1002,84 @@ void CDX11VideoProcessor::SetDolbyVisionDynamicParams()
 #ifndef NDEBUG
 	UpdateStatsStatic();
 #endif
+}
+
+void CDX11VideoProcessor::UpdateMLActive()
+{
+	// Native-SDR enhancement is out of scope (SDR->P5 emulation deferred):
+	// the ML grade runs only on HDR source content. Phase 0: manual mode only,
+	// AUTO is activated when feature extraction + models land.
+	const bool bActive = m_bML && SourceIsHDR() && m_iMLMode == ML_Manual;
+
+	if (bActive == m_bMLActive) {
+		return;
+	}
+	m_bMLActive = bActive;
+
+	if (m_bMLActive) {
+		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLGamma, IDF_PS_11_ML_GAMMA));
+		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLShadow, IDF_PS_11_ML_SHADOW));
+		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLHighlight, IDF_PS_11_ML_HIGHLIGHT));
+		m_lastMLParams = {};
+		if (!m_pMLParams) {
+			D3D11_BUFFER_DESC BufferDesc = {
+				.ByteWidth = sizeof(MLParams_t),
+				.Usage = D3D11_USAGE_DEFAULT,
+				.BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+			};
+			HRESULT result = m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pMLParams);
+			EXECUTE_ASSERT(S_OK == result);
+		}
+		DLogIf(m_bMLActive, L"CDX11VideoProcessor::UpdateMLActive() ML grade shaders created");
+	} else {
+		m_pPSMLGamma.Release();
+		m_pPSMLShadow.Release();
+		m_pPSMLHighlight.Release();
+		m_pMLParams.Release();
+		m_lastMLParams = {};
+	}
+	UpdatePostScaleTexures();
+}
+
+void CDX11VideoProcessor::SetMLParams()
+{
+	// Phase 0 (manual mode): predict scalars come straight from settings.
+	// Feature-driven constants (guard/hunt/L1 max) stay at their trained defaults.
+	const float gamma = discard<float>(m_fMLGamma, 1.0f, 0.5f, 1.5f);
+	const float l1max = 0.5f; // fixed until feature extraction (Phase 1) provides the scene peak
+
+	const MLParams_t params = {
+		gamma,
+		discard<float>(m_fMLShadow, 0.0f, 0.0f, 0.4f),
+		0.25f,                                            // shadow knee
+		0.0f,                                             // dehaze (SDR out of scope)
+		discard<float>(m_fMLHighlight, 0.0f, -0.3f, 0.4f),
+		fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(gamma, 0.5f)) * 0.20f)), // highlight knee
+		0.85f,                                            // guard (l1max <= 0.6 default)
+		0.10f,                                            // hunt compensation
+		l1max,
+		0.25f,                                            // highlight desaturation
+		(m_bHdrPassthrough && m_bHdrPassthroughSupport) ? 1.0f : 0.0f, // IsPQ
+		0.0f
+	};
+
+	if (memcmp(&m_lastMLParams, &params, sizeof(params)) == 0) {
+		return;
+	}
+	m_lastMLParams = params;
+
+	if (m_pMLParams) {
+		m_pDeviceContext->UpdateSubresource(m_pMLParams, 0, nullptr, &params, 0, 0);
+	} else {
+		D3D11_BUFFER_DESC BufferDesc = {
+			.ByteWidth = sizeof(params),
+			.Usage = D3D11_USAGE_DEFAULT,
+			.BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+		};
+		D3D11_SUBRESOURCE_DATA InitData = { &params, 0, 0 };
+		HRESULT result = m_pDevice->CreateBuffer(&BufferDesc, &InitData, &m_pMLParams);
+		EXECUTE_ASSERT(S_OK == result);
+	}
 }
 
 HRESULT CDX11VideoProcessor::SetShaderDoviCurvesPoly()
@@ -1952,6 +2046,7 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 		UpdateStatsStatic();
 
 		m_pFilter->m_inputMT = *pmt;
+		UpdateMLActive();
 
 		return TRUE;
 	}
@@ -2734,6 +2829,10 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 									 m_iHdrDisplayMaxNits, m_iHdrLocalToneMappingType);
 			}
 		}
+
+		if (m_bMLActive && m_pPSMLGamma) {
+			SetMLParams();
+		}
 	}
 
 	if (!m_renderRect.IsRectEmpty()) {
@@ -3308,7 +3407,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			const bool bNeedShaderTransform =
 				(m_TexConvertOutput.desc.Width != dstRect.Width() || m_TexConvertOutput.desc.Height != dstRect.Height() || m_bFlip
 				|| dstRect.right > m_windowRect.right || dstRect.bottom > m_windowRect.bottom)
-				|| (m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)); // At least on Nvidia we can sometimes get the "D3D11: Removing Device" error here when HDR Passthrough.
+				|| (m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping || m_bMLActive)); // At least on Nvidia we can sometimes get the "D3D11: Removing Device" error here when HDR Passthrough.
 			if (!bNeedShaderTransform && !numSteps) {
 				m_bVPScalingUseShaders = false;
 				hr = D3D11VPPass(pRenderTarget, rSrc, dstRect, second);
@@ -3374,6 +3473,16 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			}
 
 			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSHDR10ToneMapping, m_pHDR10ToneMappingConstants, 0, false);
+		}
+
+		if (m_bMLActive && m_pPSMLGamma && m_pMLParams) {
+			// Zion ML grade — hook order matches libplacebo: shadow -> highlight -> gamma
+			StepSetting();
+			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSMLShadow, m_pMLParams, 0, false);
+			StepSetting();
+			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSMLHighlight, m_pMLParams, 0, false);
+			StepSetting();
+			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSMLGamma, m_pMLParams, 0, false);
 		}
 
 		if (m_pPostScaleShaders.size()) {
@@ -3960,6 +4069,17 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		if (SourceIsHDR()) {
 			changeLuminanceParams = true;
 		}
+	}
+
+	if (config.bMLEnabled != m_bML || config.iMLMode != m_iMLMode ||
+			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow ||
+			config.fMLHighlight != m_fMLHighlight) {
+		m_bML          = config.bMLEnabled;
+		m_iMLMode      = config.iMLMode;
+		m_fMLGamma     = config.fMLGamma;
+		m_fMLShadow    = config.fMLShadow;
+		m_fMLHighlight = config.fMLHighlight;
+		UpdateMLActive();
 	}
 
 	if (!m_pFilter->GetActive()) {

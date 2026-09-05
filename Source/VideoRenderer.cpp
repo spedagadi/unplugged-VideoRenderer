@@ -68,6 +68,11 @@
 #define OPT_ConvertToSdr                   L"ConvertToSdr"
 #define OPT_UseD3DFullscreen               L"UseD3DFullscreen"
 #define OPT_DisplayNits                    L"DisplayNits"
+#define OPT_MLEnabled                      L"MLEnabled"
+#define OPT_MLMode                         L"MLMode"
+#define OPT_MLGamma                        L"MLGamma"
+#define OPT_MLShadow                       L"MLShadow"
+#define OPT_MLHighlight                    L"MLHighlight"
 
 static std::atomic_int g_nInstance = 0;
 static const wchar_t g_szClassName[] = L"VRWindow";
@@ -271,6 +276,30 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DisplayNits, dw)) {
 			m_Sets.iSDRDisplayNits = discard<int>(dw, SDR_NITS_DEF, SDR_NITS_MIN, SDR_NITS_MAX);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLEnabled, dw)) {
+			m_Sets.bMLEnabled = !!dw;
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLMode, dw)) {
+			m_Sets.iMLMode = discard<int>(dw, ML_Disable, ML_Disable, ML_Auto);
+		}
+		m_Sets.fMLGamma    = discard<float>(m_Sets.fMLGamma,    1.0f, 0.5f, 1.5f);
+		m_Sets.fMLShadow   = discard<float>(m_Sets.fMLShadow,   0.0f, 0.0f, 0.4f);
+		m_Sets.fMLHighlight = discard<float>(m_Sets.fMLHighlight, 0.0f, -0.3f, 0.4f);
+		{
+			WCHAR str[32];
+			ULONG nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLGamma, str, &nChars)) {
+				m_Sets.fMLGamma = discard<float>((float)_wtof(str), 1.0f, 0.5f, 1.5f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLShadow, str, &nChars)) {
+				m_Sets.fMLShadow = discard<float>((float)_wtof(str), 0.0f, 0.0f, 0.4f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLHighlight, str, &nChars)) {
+				m_Sets.fMLHighlight = discard<float>((float)_wtof(str), 0.0f, -0.3f, 0.4f);
+			}
 		}
 	}
 
@@ -1309,6 +1338,11 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 		key.SetDWORDValue(OPT_HdrOsdBrightness,    m_Sets.iHdrOsdBrightness);
 		key.SetDWORDValue(OPT_ConvertToSdr,        m_Sets.bConvertToSdr);
 		key.SetDWORDValue(OPT_DisplayNits,         m_Sets.iSDRDisplayNits);
+		key.SetDWORDValue(OPT_MLEnabled,           m_Sets.bMLEnabled);
+		key.SetDWORDValue(OPT_MLMode,              m_Sets.iMLMode);
+		key.SetStringValue(OPT_MLGamma,            std::to_wstring(m_Sets.fMLGamma).c_str());
+		key.SetStringValue(OPT_MLShadow,           std::to_wstring(m_Sets.fMLShadow).c_str());
+		key.SetStringValue(OPT_MLHighlight,        std::to_wstring(m_Sets.fMLHighlight).c_str());
 	}
 
 	return S_OK;
