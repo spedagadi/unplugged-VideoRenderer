@@ -314,6 +314,7 @@ HRESULT CVRMainPPage::OnActivate()
 
 	SendDlgItemMessageW(IDC_COMBO11, CB_ADDSTRING, 0, (LPARAM)L"Disable");
 	SendDlgItemMessageW(IDC_COMBO11, CB_ADDSTRING, 0, (LPARAM)L"Manual");
+	SendDlgItemMessageW(IDC_COMBO11, CB_ADDSTRING, 0, (LPARAM)L"Auto");
 
 	SetControls();
 

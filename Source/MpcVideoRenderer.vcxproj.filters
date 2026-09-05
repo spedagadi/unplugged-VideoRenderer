@@ -105,7 +105,13 @@
     <ClCompile Include="MediaSampleSideData.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ml_features.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ml_model.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tone_spline.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="SubPic\SubPicQueueImpl.cpp">
@@ -221,7 +227,13 @@
     <ClInclude Include="MediaSampleSideData.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="ml_features.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="ml_model.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tone_spline.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Utils\gpu_memcpy_sse4.h">

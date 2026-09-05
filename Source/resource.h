@@ -89,6 +89,7 @@
 #define IDF_PS_11_ML_GAMMA              883
 #define IDF_PS_11_ML_SHADOW             884
 #define IDF_PS_11_ML_HIGHLIGHT          885
+#define IDF_PS_11_ML_DOWNSAMPLE         886
 #define IDF_PS_11_TEST                  900
 #define IDC_EDIT1                       1001
 #define IDC_EDIT2                       1002

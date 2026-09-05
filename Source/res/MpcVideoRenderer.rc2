@@ -73,6 +73,7 @@ IDF_PS_11_FIXCONVERT_PQ_TO_SDR  FILE                    "..\\_bin\\shaders\\ps_f
 IDF_PS_11_FIXCONVERT_HLG_TO_SDR FILE                    "..\\_bin\\shaders\\ps_fixconvert_hlg_to_sdr.cso"
 IDF_PS_11_FIX_BT2020            FILE                    "..\\_bin\\shaders\\ps_fix_bt2020.cso"
 IDF_PS_11_HDR10_TONEMAP         FILE                    "..\\_bin\\shaders\\ps_hdr10_tonemap.cso"
+IDF_PS_11_ML_DOWNSAMPLE         FILE                    "..\\_bin\\shaders\\ps_ml_luma.cso"
 IDF_PS_11_ML_GAMMA              FILE                    "..\\_bin\\shaders\\ps_ml_gamma.cso"
 IDF_PS_11_ML_SHADOW             FILE                    "..\\_bin\\shaders\\ps_ml_shadow.cso"
 IDF_PS_11_ML_HIGHLIGHT          FILE                    "..\\_bin\\shaders\\ps_ml_highlight.cso"

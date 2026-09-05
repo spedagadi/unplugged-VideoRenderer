@@ -32,6 +32,8 @@
 #include "D3DUtil/D3D11Geometry.h"
 #include "VideoProcessor.h"
 #include "SubPic/DX11SubPic.h"
+#include "ml_model.h"
+#include "ml_features.h"
 
 #include <atomic>
 
@@ -132,7 +134,21 @@ private:
 	CComPtr<ID3D11PixelShader> m_pPSMLGamma;
 	CComPtr<ID3D11PixelShader> m_pPSMLShadow;
 	CComPtr<ID3D11PixelShader> m_pPSMLHighlight;
+
+	// Zion ML feature extraction (Phase 1: AUTO gamma)
+	CComPtr<ID3D11Texture2D> m_MLDownsample;   // 256x144 R16_UNORM luma cache
+	CComPtr<ID3D11Texture2D> m_MLStaging;      // CPU-readable copy
+	CComPtr<ID3D11PixelShader> m_pPSMLDownsample;
 	bool m_bMLActive = false;
+	bool m_bMLFeaturesReady = false;
+	bool m_bMLFeaturesStale = false;
+	bool m_bMLConvertSeen = false; // a previous frame's convert output exists
+	bool m_bMLModelLoadTried = false;
+	bool m_bMLGammaModelLoaded = false;
+	float m_MLFeatures[ML_FEATURE_DIM] = {};
+	CMLModel m_MLGammaModel;
+	float m_MLIIRGamma = 1.0f;
+	float m_MLPrevL1Max = -1.0f;
 
 	// D3D11 Shader Video Processor
 	CComPtr<ID3D11PixelShader> m_pPSConvertColor;
@@ -300,6 +316,9 @@ private:
 
 	void UpdateMLActive();
 	void SetMLParams();
+	void ExtractMLFeatures();
+	void CreateMLTextures();
+	std::wstring GetMLModelPath();
 
 	HRESULT SetShaderDoviCurvesPoly();
 	HRESULT SetShaderDoviCurves();

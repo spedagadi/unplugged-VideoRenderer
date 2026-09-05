@@ -67,6 +67,12 @@ COPY /Y "LICENSE.txt"                          "%DIST_DIR%\" >NUL
 COPY /Y "Readme.md"                            "%DIST_DIR%\" >NUL
 COPY /Y "history.txt"                          "%DIST_DIR%\" >NUL
 
+IF EXIST "models\xgb_gamma_model.plxgb" (
+  COPY /Y "models\xgb_gamma_model.plxgb" "%DIST_DIR%\" >NUL
+) ELSE (
+  ECHO [WARN] models\xgb_gamma_model.plxgb not found - AUTO mode will be unavailable.
+)
+
 ECHO.
 ECHO Distribution folder ready:  "%CD%\%DIST_DIR%"
 ECHO.

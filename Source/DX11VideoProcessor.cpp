@@ -730,9 +730,15 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_pPSMLGamma.Release();
 	m_pPSMLShadow.Release();
 	m_pPSMLHighlight.Release();
+	m_pPSMLDownsample.Release();
+	m_MLDownsample.Release();
+	m_MLStaging.Release();
 	m_pMLParams.Release();
 	m_lastMLParams = {};
 	m_bMLActive = false;
+	m_bMLFeaturesReady = false;
+	m_bMLFeaturesStale = false;
+	m_bMLConvertSeen = false;
 
 #if TEST_SHADER
 	m_pPS_TEST.Release();
@@ -1007,9 +1013,17 @@ void CDX11VideoProcessor::SetDolbyVisionDynamicParams()
 void CDX11VideoProcessor::UpdateMLActive()
 {
 	// Native-SDR enhancement is out of scope (SDR->P5 emulation deferred):
-	// the ML grade runs only on HDR source content. Phase 0: manual mode only,
-	// AUTO is activated when feature extraction + models land.
-	const bool bActive = m_bML && SourceIsHDR() && m_iMLMode == ML_Manual;
+	// the ML grade runs only on HDR source content. Manual mode always applies;
+	// AUTO activates once the gamma model is loaded and features are produced.
+	if (m_iMLMode == ML_Auto && !m_bMLModelLoadTried) {
+		m_bMLModelLoadTried = true;
+		const std::wstring path = GetMLModelPath();
+		m_bMLGammaModelLoaded = m_MLGammaModel.Load(path.c_str());
+		DLogIf(!m_bMLGammaModelLoaded, L"CDX11VideoProcessor::UpdateMLActive() failed to load '{}'; AUTO mode unavailable", path);
+	}
+
+	const bool bAutoReady = (m_iMLMode == ML_Auto) && m_bMLGammaModelLoaded;
+	const bool bActive = m_bML && SourceIsHDR() && (m_iMLMode == ML_Manual || bAutoReady);
 
 	if (bActive == m_bMLActive) {
 		return;
@@ -1020,7 +1034,14 @@ void CDX11VideoProcessor::UpdateMLActive()
 		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLGamma, IDF_PS_11_ML_GAMMA));
 		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLShadow, IDF_PS_11_ML_SHADOW));
 		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLHighlight, IDF_PS_11_ML_HIGHLIGHT));
+		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLDownsample, IDF_PS_11_ML_DOWNSAMPLE));
 		m_lastMLParams = {};
+		m_bMLFeaturesReady = false;
+		m_bMLFeaturesStale = false;
+		m_bMLConvertSeen = false;
+		m_MLIIRGamma = 1.0f;
+		m_MLPrevL1Max = -1.0f;
+		CreateMLTextures();
 		if (!m_pMLParams) {
 			D3D11_BUFFER_DESC BufferDesc = {
 				.ByteWidth = sizeof(MLParams_t),
@@ -1030,32 +1051,63 @@ void CDX11VideoProcessor::UpdateMLActive()
 			HRESULT result = m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pMLParams);
 			EXECUTE_ASSERT(S_OK == result);
 		}
-		DLogIf(m_bMLActive, L"CDX11VideoProcessor::UpdateMLActive() ML grade shaders created");
+		DLogIf(m_bMLActive, L"CDX11VideoProcessor::UpdateMLActive() ML grade active (mode {})", m_iMLMode);
 	} else {
 		m_pPSMLGamma.Release();
 		m_pPSMLShadow.Release();
 		m_pPSMLHighlight.Release();
+		m_pPSMLDownsample.Release();
+		m_MLDownsample.Release();
+		m_MLStaging.Release();
 		m_pMLParams.Release();
 		m_lastMLParams = {};
+		m_bMLFeaturesReady = false;
 	}
 	UpdatePostScaleTexures();
 }
 
 void CDX11VideoProcessor::SetMLParams()
 {
-	// Phase 0 (manual mode): predict scalars come straight from settings.
-	// Feature-driven constants (guard/hunt/L1 max) stay at their trained defaults.
-	const float gamma = discard<float>(m_fMLGamma, 1.0f, 0.5f, 1.5f);
-	const float l1max = 0.5f; // fixed until feature extraction (Phase 1) provides the scene peak
+	float gamma   = 1.0f;
+	float shadow  = 0.0f;
+	float rolloff = 0.0f;
+	float l1max   = 0.5f;
+
+	if (m_iMLMode == ML_Manual) {
+		gamma   = discard<float>(m_fMLGamma, 1.0f, 0.5f, 1.5f);
+		shadow  = discard<float>(m_fMLShadow, 0.0f, 0.0f, 0.4f);
+		rolloff = discard<float>(m_fMLHighlight, 0.0f, -0.3f, 0.4f);
+	}
+	else if (m_iMLMode == ML_Auto && m_bMLFeaturesReady && m_bMLGammaModelLoaded) {
+		// Model inference on the (previous frame's) feature vector,
+		// IIR-smoothed with scene-cut reset on the l1 peak.
+		float pred = 1.0f;
+		if (m_MLGammaModel.Predict(m_MLFeatures, ML_FEATURE_DIM, pred)) {
+			pred = discard<float>(pred, 1.0f, 0.5f, 1.5f);
+
+			const float l1now = m_MLFeatures[0];
+			if (m_MLPrevL1Max < 0.0f || fabsf(l1now - m_MLPrevL1Max) > 0.15f) {
+				m_MLIIRGamma = pred; // scene cut: reset the accumulator
+			} else {
+				m_MLIIRGamma = 0.10f * pred + 0.90f * m_MLIIRGamma; // alpha 0.10
+			}
+			m_MLPrevL1Max = l1now;
+			gamma = m_MLIIRGamma;
+		}
+		l1max = fmaxf(0.05f, fminf(0.90f, m_MLFeatures[0]));
+	}
+
+	// Adaptive highlight guard from the scene peak (same formula as ml_render.c).
+	const float guard = (l1max > 0.6f) ? fmaxf(0.50f, 0.85f - (l1max - 0.6f) * 0.75f) : 0.85f;
 
 	const MLParams_t params = {
 		gamma,
-		discard<float>(m_fMLShadow, 0.0f, 0.0f, 0.4f),
+		shadow,
 		0.25f,                                            // shadow knee
 		0.0f,                                             // dehaze (SDR out of scope)
-		discard<float>(m_fMLHighlight, 0.0f, -0.3f, 0.4f),
+		rolloff,
 		fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(gamma, 0.5f)) * 0.20f)), // highlight knee
-		0.85f,                                            // guard (l1max <= 0.6 default)
+		guard,
 		0.10f,                                            // hunt compensation
 		l1max,
 		0.25f,                                            // highlight desaturation
@@ -1080,6 +1132,83 @@ void CDX11VideoProcessor::SetMLParams()
 		HRESULT result = m_pDevice->CreateBuffer(&BufferDesc, &InitData, &m_pMLParams);
 		EXECUTE_ASSERT(S_OK == result);
 	}
+}
+
+void CDX11VideoProcessor::ExtractMLFeatures()
+{
+	if (!m_pPSMLDownsample || !m_MLDownsample || !m_MLStaging || !m_TexConvertOutput.pTexture) {
+		return;
+	}
+
+	// 1) downsample the previous frame's convert output into the 256x144 luma cache
+	const CRect fullRect(0, 0, ML_DOWNSAMPLE_W, ML_DOWNSAMPLE_H);
+	HRESULT hr = TextureCopyRect(m_TexConvertOutput, m_MLDownsample, m_srcRect, fullRect, m_pPSMLDownsample, nullptr, 0, false);
+	if (FAILED(hr)) {
+		return;
+	}
+
+	// 2) read back
+	m_pDeviceContext->CopyResource(m_MLStaging, m_MLDownsample);
+
+	D3D11_MAPPED_SUBRESOURCE mr = {};
+	if (FAILED(m_pDeviceContext->Map(m_MLStaging, 0, D3D11_MAP_READ, 0, &mr))) {
+		return;
+	}
+
+	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures);
+	m_pDeviceContext->Unmap(m_MLStaging, 0);
+	m_bMLFeaturesReady = true;
+}
+
+void CDX11VideoProcessor::CreateMLTextures()
+{
+	if (m_MLDownsample || !m_pDevice) {
+		return;
+	}
+
+	D3D11_TEXTURE2D_DESC cache = {};
+	cache.Width = ML_DOWNSAMPLE_W;
+	cache.Height = ML_DOWNSAMPLE_H;
+	cache.MipLevels = 1;
+	cache.ArraySize = 1;
+	cache.Format = DXGI_FORMAT_R16_UNORM;
+	cache.SampleDesc.Count = 1;
+	cache.Usage = D3D11_USAGE_DEFAULT;
+	cache.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	HRESULT hr = m_pDevice->CreateTexture2D(&cache, nullptr, &m_MLDownsample);
+	if (FAILED(hr)) {
+		DLog(L"CDX11VideoProcessor::CreateMLTextures() failed to create the luma cache: {}", hr);
+		return;
+	}
+
+	D3D11_TEXTURE2D_DESC staging = cache;
+	staging.Usage = D3D11_USAGE_STAGING;
+	staging.BindFlags = 0;
+	staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	hr = m_pDevice->CreateTexture2D(&staging, nullptr, &m_MLStaging);
+	if (FAILED(hr)) {
+		DLog(L"CDX11VideoProcessor::CreateMLTextures() failed to create the staging texture: {}", hr);
+		m_MLDownsample.Release();
+	}
+}
+
+// Anchor used by GetModuleHandleExW to resolve this DLL's own module handle
+// (model files ship next to the filter, like the install cmds).
+static void MLModulePathAnchor() {}
+
+std::wstring CDX11VideoProcessor::GetMLModelPath()
+{
+	wchar_t filename[MAX_PATH] = {};
+	HMODULE hModule = nullptr;
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)&MLModulePathAnchor, &hModule) && hModule
+		&& GetModuleFileNameW(hModule, filename, MAX_PATH) != 0 && filename[0]) {
+		wchar_t* p = wcsrchr(filename, L'\\');
+		if (p) {
+			*p = 0;
+		}
+		return std::wstring(filename) + L"\\xgb_gamma_model.plxgb";
+	}
+	return L"xgb_gamma_model.plxgb";
 }
 
 HRESULT CDX11VideoProcessor::SetShaderDoviCurvesPoly()
@@ -2254,6 +2383,10 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 		return hr;
 	}
 
+	if (m_bMLActive) {
+		m_bMLFeaturesStale = true; // re-analyze on the next render
+	}
+
 	// always Render(1) a frame after CopySample()
 	hr = Render(1, rtStart);
 	m_pFilter->m_DrawStats.Add(GetPreciseTick());
@@ -2830,7 +2963,11 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			}
 		}
 
-		if (m_bMLActive && m_pPSMLGamma) {
+		if (m_bMLActive && m_pPSMLGamma && m_pPSMLDownsample) {
+			if (m_bMLFeaturesStale && m_bMLConvertSeen && m_TexConvertOutput.pTexture) {
+				ExtractMLFeatures();
+				m_bMLFeaturesStale = false;
+			}
 			SetMLParams();
 		}
 	}
@@ -3535,6 +3672,10 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 	}
 	else {
 		hr = ResizeShaderPass(*pInputTexture, pRenderTarget, rSrc, dstRect, rotation);
+	}
+
+	if (m_bMLActive && m_TexConvertOutput.pTexture) {
+		m_bMLConvertSeen = true;
 	}
 
 	DLogIf(FAILED(hr), L"CDX11VideoProcessor::Process() : failed with error {}", HR2Str(hr));
