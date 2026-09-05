@@ -63,6 +63,139 @@ HRESULT CompileShader(const std::string& srcCode, const D3D_SHADER_MACRO* pDefin
 	return hr;
 }
 
+// ---- KrigBilateral (Shiandow, LGPL) inline chroma upsampling, DX11/4:2:0 ----
+// Single-pass port of ml/KrigBilateral.glsl: per output pixel it gathers the
+// 9 chroma-lattice neighbours (luma cell mean/variance + U/V), builds the
+// kriging covariance matrix and solves the 8x8 system inline.
+static const char* kKrigCoords[] = {
+	"-1,-1", "-1,0", "-1,1", "0,-1", "0,1", "1,-1", "1,0", "1,1", "0,0"
+};
+
+static void AppendKrigHelpers(std::string& code)
+{
+	code.append(
+		"float sqr(float x) { return x * x; }\n"
+		"float2 sqr(float2 x) { return dot(x, x); }\n"
+		"#define KRIG_M(i,j) Mx[min(i,j)*8 + max(i,j) - min(i,j)*(min(i,j)+1)/2]\n"
+		"float KrigC(float X0[9], float X1[9], float coords0[9], float coords1[9], float localVar, float radius, float y, int i, int j) { return rsqrt(1.0 + (X1[i] + X1[j])/localVar) * exp(-0.5 * (sqr(X0[i] - X0[j])/(localVar + X1[i] + X1[j]) + sqr((float2(coords0[i],coords1[i]) - float2(coords0[j],coords1[j]))/radius))) + (X0[i] - y) * (X0[j] - y)/localVar; }\n"
+		"float Krigc(float X0[9], float X1[9], float coords0[9], float coords1[9], float localVar, float radius, float y, float2 offset, int i) { return rsqrt(1.0 + X1[i]/localVar) * exp(-0.5 * (sqr(X0[i] - y)/(localVar + X1[i]) + sqr((float2(coords0[i],coords1[i]) - offset)/radius))); }\n"
+	);
+}
+
+// KorrigBilateral body: gathers the 9 neighbours and solves the system, sets colorUV.
+static void AppendKrigBody(std::string& code, bool bBiplanar)
+{
+	code.append(
+		"{{\n"
+		"const float2 chromaSize = wh * 0.5;\n"
+		"const float2 cidx = input.Tex * chromaSize;\n"
+		"const int2 bi = int2(round(cidx));\n"
+		"const float2 offset = cidx - float2(bi);\n"
+		"const float2 baseUV = (float2(bi) + 0.5) / chromaSize;\n"
+		"const float2 yBaseUV = (float2(bi * int2(2, 2)) + 0.5) / wh;\n"
+		"float coords0[9], coords1[9], X0[9], X1[9], X2[9], X3[9];\n"
+	);
+
+	static const int kKx[9] = { -1,-1,-1, 0, 0, 1, 1, 1, 0 };
+	static const int kKy[9] = { -1, 0, 1,-1, 1,-1, 0, 1, 0 };
+
+	for (int k = 0; k < 9; k++) {
+		const int cx = kKx[k], cy = kKy[k];
+		std::string uvSnippet;
+		if (bBiplanar) {
+			uvSnippet = std::format("float2 uv = texUV.Sample(samp, baseUV, int2({}, {})).rg;", cx, cy);
+		} else {
+			uvSnippet = std::format("float2 uv = float2(texU.Sample(samp, baseUV, int2({}, {})).r, texV.Sample(samp, baseUV, int2({}, {})).r);", cx, cy, cx, cy);
+		}
+		code += std::format(
+			"{{\n"
+			"const int cx = {}; const int cy = {};\n"
+			"float y00 = texY.Sample(samp, yBaseUV, int2(2*cx + 0, 2*cy + 0)).r;\n"
+			"float y10 = texY.Sample(samp, yBaseUV, int2(2*cx + 1, 2*cy + 0)).r;\n"
+			"float y01 = texY.Sample(samp, yBaseUV, int2(2*cx + 0, 2*cy + 1)).r;\n"
+			"float y11 = texY.Sample(samp, yBaseUV, int2(2*cx + 1, 2*cy + 1)).r;\n"
+			"float yMean = (y00 + y10 + y01 + y11) * 0.25;\n"
+			"float yVar  = max((y00*y00 + y10*y10 + y01*y01 + y11*y11) * 0.25 - yMean*yMean, 0.0);\n"
+			"{}\n"
+			"coords0[{}] = cx; coords1[{}] = cy;\n"
+			"X0[{}] = yMean; X1[{}] = yVar; X2[{}] = uv.x; X3[{}] = uv.y;\n"
+			"}}\n",
+			cx, cy,
+			uvSnippet, k, k, k, k, k, k);
+	}
+
+	code.append(
+		"const float y = X0[8];\n"
+		"float wsum = 0.0, sy = 0.0, sy2 = 0.0, svar = 0.0;\n"
+		"for (int k = 0; k < 9; k++) {\n"
+		"	float wxx = clamp(1.5 - abs(coords0[k] - offset.x), 0.0, 1.0) * clamp(1.5 - abs(coords1[k] - offset.y), 0.0, 1.0);\n"
+		"	sy += wxx * X0[k]; sy2 += wxx * X0[k] * X0[k]; svar += wxx * X1[k]; wsum += wxx;\n"
+		"}\n"
+		"sy /= wsum; sy2 /= wsum; svar /= wsum;\n"
+		"float localVar = 0.0025 + abs(sy2 - sy * sy) + svar;\n"
+		"const float radius = 1.0;\n"
+		"float Mx[36]; [unroll] for (int mi = 0; mi < 36; mi++) { Mx[mi] = 0.0; }\n"
+		"float b[8]; [unroll] for (int mk = 0; mk < 8; mk++) { b[mk] = 0.0; }\n"
+		"float4 interp = float4(X0[8], X1[8], X2[8], X3[8]);\n"
+		"#define M(i,j) KRIG_M(i,j)\n"
+		"#define C(i,j) KrigC(X0, X1, coords0, coords1, localVar, radius, y, i, j)\n"
+		"#define cc(i)  Krigc(X0, X1, coords0, coords1, localVar, radius, y, offset, i)\n"
+		"b[0] = cc(0) - cc(8) - C(0,8) + C(8,8); M(0,0) = C(0,0) - C(0,8) - C(0,8) + C(8,8); M(0,1) = C(0,1) - C(1,8) - C(0,8) + C(8,8); M(0,2) = C(0,2) - C(2,8) - C(0,8) + C(8,8); M(0,3) = C(0,3) - C(3,8) - C(0,8) + C(8,8); M(0,4) = C(0,4) - C(4,8) - C(0,8) + C(8,8); M(0,5) = C(0,5) - C(5,8) - C(0,8) + C(8,8); M(0,6) = C(0,6) - C(6,8) - C(0,8) + C(8,8); M(0,7) = C(0,7) - C(7,8) - C(0,8) + C(8,8);\n"
+		"b[1] = cc(1) - cc(8) - C(1,8) + C(8,8); M(1,1) = C(1,1) - C(1,8) - C(1,8) + C(8,8); M(1,2) = C(1,2) - C(2,8) - C(1,8) + C(8,8); M(1,3) = C(1,3) - C(3,8) - C(1,8) + C(8,8); M(1,4) = C(1,4) - C(4,8) - C(1,8) + C(8,8); M(1,5) = C(1,5) - C(5,8) - C(1,8) + C(8,8); M(1,6) = C(1,6) - C(6,8) - C(1,8) + C(8,8); M(1,7) = C(1,7) - C(7,8) - C(1,8) + C(8,8);\n"
+		"b[2] = cc(2) - cc(8) - C(2,8) + C(8,8); M(2,2) = C(2,2) - C(2,8) - C(2,8) + C(8,8); M(2,3) = C(2,3) - C(3,8) - C(2,8) + C(8,8); M(2,4) = C(2,4) - C(4,8) - C(2,8) + C(8,8); M(2,5) = C(2,5) - C(5,8) - C(2,8) + C(8,8); M(2,6) = C(2,6) - C(6,8) - C(2,8) + C(8,8); M(2,7) = C(2,7) - C(7,8) - C(2,8) + C(8,8);\n"
+		"b[3] = cc(3) - cc(8) - C(3,8) + C(8,8); M(3,3) = C(3,3) - C(3,8) - C(3,8) + C(8,8); M(3,4) = C(3,4) - C(4,8) - C(3,8) + C(8,8); M(3,5) = C(3,5) - C(5,8) - C(3,8) + C(8,8); M(3,6) = C(3,6) - C(6,8) - C(3,8) + C(8,8); M(3,7) = C(3,7) - C(7,8) - C(3,8) + C(8,8);\n"
+		"b[4] = cc(4) - cc(8) - C(4,8) + C(8,8); M(4,4) = C(4,4) - C(4,8) - C(4,8) + C(8,8); M(4,5) = C(4,5) - C(5,8) - C(4,8) + C(8,8); M(4,6) = C(4,6) - C(6,8) - C(4,8) + C(8,8); M(4,7) = C(4,7) - C(7,8) - C(4,8) + C(8,8);\n"
+		"b[5] = cc(5) - cc(8) - C(5,8) + C(8,8); M(5,5) = C(5,5) - C(5,8) - C(5,8) + C(8,8); M(5,6) = C(5,6) - C(6,8) - C(5,8) + C(8,8); M(5,7) = C(5,7) - C(7,8) - C(5,8) + C(8,8);\n"
+		"b[6] = cc(6) - cc(8) - C(6,8) + C(8,8); M(6,6) = C(6,6) - C(6,8) - C(6,8) + C(8,8); M(6,7) = C(6,7) - C(7,8) - C(6,8) + C(8,8);\n"
+		"b[7] = cc(7) - cc(8) - C(7,8) + C(8,8); M(7,7) = C(7,7) - C(7,8) - C(7,8) + C(8,8);\n"
+		"b[1] -= b[0] * M(1,0) / M(0,0); M(1,1) -= M(0,1) * M(1,0) / M(0,0); M(1,2) -= M(0,2) * M(1,0) / M(0,0); M(1,3) -= M(0,3) * M(1,0) / M(0,0); M(1,4) -= M(0,4) * M(1,0) / M(0,0); M(1,5) -= M(0,5) * M(1,0) / M(0,0); M(1,6) -= M(0,6) * M(1,0) / M(0,0); M(1,7) -= M(0,7) * M(1,0) / M(0,0);\n"
+		"b[2] -= b[0] * M(2,0) / M(0,0); M(2,2) -= M(0,2) * M(2,0) / M(0,0); M(2,3) -= M(0,3) * M(2,0) / M(0,0); M(2,4) -= M(0,4) * M(2,0) / M(0,0); M(2,5) -= M(0,5) * M(2,0) / M(0,0); M(2,6) -= M(0,6) * M(2,0) / M(0,0); M(2,7) -= M(0,7) * M(2,0) / M(0,0);\n"
+		"b[3] -= b[0] * M(3,0) / M(0,0); M(3,3) -= M(0,3) * M(3,0) / M(0,0); M(3,4) -= M(0,4) * M(3,0) / M(0,0); M(3,5) -= M(0,5) * M(3,0) / M(0,0); M(3,6) -= M(0,6) * M(3,0) / M(0,0); M(3,7) -= M(0,7) * M(3,0) / M(0,0);\n"
+		"b[4] -= b[0] * M(4,0) / M(0,0); M(4,4) -= M(0,4) * M(4,0) / M(0,0); M(4,5) -= M(0,5) * M(4,0) / M(0,0); M(4,6) -= M(0,6) * M(4,0) / M(0,0); M(4,7) -= M(0,7) * M(4,0) / M(0,0);\n"
+		"b[5] -= b[0] * M(5,0) / M(0,0); M(5,5) -= M(0,5) * M(5,0) / M(0,0); M(5,6) -= M(0,6) * M(5,0) / M(0,0); M(5,7) -= M(0,7) * M(5,0) / M(0,0);\n"
+		"b[6] -= b[0] * M(6,0) / M(0,0); M(6,6) -= M(0,6) * M(6,0) / M(0,0); M(6,7) -= M(0,7) * M(6,0) / M(0,0);\n"
+		"b[7] -= b[0] * M(7,0) / M(0,0); M(7,7) -= M(0,7) * M(7,0) / M(0,0);\n"
+		"b[2] -= b[1] * M(2,1) / M(1,1); M(2,2) -= M(1,2) * M(2,1) / M(1,1); M(2,3) -= M(1,3) * M(2,1) / M(1,1); M(2,4) -= M(1,4) * M(2,1) / M(1,1); M(2,5) -= M(1,5) * M(2,1) / M(1,1); M(2,6) -= M(1,6) * M(2,1) / M(1,1); M(2,7) -= M(1,7) * M(2,1) / M(1,1);\n"
+		"b[3] -= b[1] * M(3,1) / M(1,1); M(3,3) -= M(1,3) * M(3,1) / M(1,1); M(3,4) -= M(1,4) * M(3,1) / M(1,1); M(3,5) -= M(1,5) * M(3,1) / M(1,1); M(3,6) -= M(1,6) * M(3,1) / M(1,1); M(3,7) -= M(1,7) * M(3,1) / M(1,1);\n"
+		"b[4] -= b[1] * M(4,1) / M(1,1); M(4,4) -= M(1,4) * M(4,1) / M(1,1); M(4,5) -= M(1,5) * M(4,1) / M(1,1); M(4,6) -= M(1,6) * M(4,1) / M(1,1); M(4,7) -= M(1,7) * M(4,1) / M(1,1);\n"
+		"b[5] -= b[1] * M(5,1) / M(1,1); M(5,5) -= M(1,5) * M(5,1) / M(1,1); M(5,6) -= M(1,6) * M(5,1) / M(1,1); M(5,7) -= M(1,7) * M(5,1) / M(1,1);\n"
+		"b[6] -= b[1] * M(6,1) / M(1,1); M(6,6) -= M(1,6) * M(6,1) / M(1,1); M(6,7) -= M(1,7) * M(6,1) / M(1,1);\n"
+		"b[7] -= b[1] * M(7,1) / M(1,1); M(7,7) -= M(1,7) * M(7,1) / M(1,1);\n"
+		"b[3] -= b[2] * M(3,2) / M(2,2); M(3,3) -= M(2,3) * M(3,2) / M(2,2); M(3,4) -= M(2,4) * M(3,2) / M(2,2); M(3,5) -= M(2,5) * M(3,2) / M(2,2); M(3,6) -= M(2,6) * M(3,2) / M(2,2); M(3,7) -= M(2,7) * M(3,2) / M(2,2);\n"
+		"b[4] -= b[2] * M(4,2) / M(2,2); M(4,4) -= M(2,4) * M(4,2) / M(2,2); M(4,5) -= M(2,5) * M(4,2) / M(2,2); M(4,6) -= M(2,6) * M(4,2) / M(2,2); M(4,7) -= M(2,7) * M(4,2) / M(2,2);\n"
+		"b[5] -= b[2] * M(5,2) / M(2,2); M(5,5) -= M(2,5) * M(5,2) / M(2,2); M(5,6) -= M(2,6) * M(5,2) / M(2,2); M(5,7) -= M(2,7) * M(5,2) / M(2,2);\n"
+		"b[6] -= b[2] * M(6,2) / M(2,2); M(6,6) -= M(2,6) * M(6,2) / M(2,2); M(6,7) -= M(2,7) * M(6,2) / M(2,2);\n"
+		"b[7] -= b[2] * M(7,2) / M(2,2); M(7,7) -= M(2,7) * M(7,2) / M(2,2);\n"
+		"b[4] -= b[3] * M(4,3) / M(3,3); M(4,4) -= M(3,4) * M(4,3) / M(3,3); M(4,5) -= M(3,5) * M(4,3) / M(3,3); M(4,6) -= M(3,6) * M(4,3) / M(3,3); M(4,7) -= M(3,7) * M(4,3) / M(3,3);\n"
+		"b[5] -= b[3] * M(5,3) / M(3,3); M(5,5) -= M(3,5) * M(5,3) / M(3,3); M(5,6) -= M(3,6) * M(5,3) / M(3,3); M(5,7) -= M(3,7) * M(5,3) / M(3,3);\n"
+		"b[6] -= b[3] * M(6,3) / M(3,3); M(6,6) -= M(3,6) * M(6,3) / M(3,3); M(6,7) -= M(3,7) * M(6,3) / M(3,3);\n"
+		"b[7] -= b[3] * M(7,3) / M(3,3); M(7,7) -= M(3,7) * M(7,3) / M(3,3);\n"
+		"b[5] -= b[4] * M(5,4) / M(4,4); M(5,5) -= M(4,5) * M(5,4) / M(4,4); M(5,6) -= M(4,6) * M(5,4) / M(4,4); M(5,7) -= M(4,7) * M(5,4) / M(4,4);\n"
+		"b[6] -= b[4] * M(6,4) / M(4,4); M(6,6) -= M(4,6) * M(6,4) / M(4,4); M(6,7) -= M(4,7) * M(6,4) / M(4,4);\n"
+		"b[7] -= b[4] * M(7,4) / M(4,4); M(7,7) -= M(4,7) * M(7,4) / M(4,4);\n"
+		"b[6] -= b[5] * M(6,5) / M(5,5); M(6,6) -= M(5,6) * M(6,5) / M(5,5); M(6,7) -= M(5,7) * M(6,5) / M(5,5);\n"
+		"b[7] -= b[5] * M(7,5) / M(5,5); M(7,7) -= M(5,7) * M(7,5) / M(5,5);\n"
+		"b[7] -= b[6] * M(7,6) / M(6,6); M(7,7) -= M(6,7) * M(7,6) / M(6,6);\n"
+		"for (int i = 0; i < 8; i++) {\n"
+		"	int k = 7 - i;\n"
+		"	if (i > 6) b[k] -= M(k, 1) * b[1];\n"
+		"	if (i > 5) b[k] -= M(k, 2) * b[2];\n"
+		"	if (i > 4) b[k] -= M(k, 3) * b[3];\n"
+		"	if (i > 3) b[k] -= M(k, 4) * b[4];\n"
+		"	if (i > 2) b[k] -= M(k, 5) * b[5];\n"
+		"	if (i > 1) b[k] -= M(k, 6) * b[6];\n"
+		"	if (i > 0) b[k] -= M(k, 7) * b[7];\n"
+		"	b[k] /= M(k, k);\n"
+		"	interp += b[k] * float4(X0[k] - X0[8], X1[k] - X1[8], X2[k] - X2[8], X3[k] - X3[8]);\n"
+		"}\n"
+		"#undef M\n"
+		"#undef C\n"
+		"#undef cc\n"
+		"colorUV = float2(interp.z, interp.w);\n"
+		"}\n"
+	);
+}
+
 const char code_CatmullRom_weights[] =
 	"float2 t2 = t * t;\n"
 	"float2 t3 = t * t2;\n"
@@ -239,7 +372,7 @@ void ShaderGetPixels(
 			if (chromaScaling == CHROMA_Nearest || fmtParams.Subsampling == 444) {
 				code.append("colorUV = texUV.Sample(samp, input.Tex).rg;\n");
 			}
-			else if (chromaScaling == CHROMA_CatmullRom && fmtParams.Subsampling == 420) {
+			else if ((chromaScaling == CHROMA_CatmullRom || (chromaScaling == CHROMA_Krig && !bDX11)) && fmtParams.Subsampling == 420) {
 				code += std::format("float2 t = frac(input.Tex * (wh*0.5)){};\n", strChromaPos2); // Very strange, but it works.
 				code.append(code_CatmullRom_weights);
 				for (int y = 0; y < 4; y++) {
@@ -248,6 +381,9 @@ void ShaderGetPixels(
 					}
 				}
 				code.append(code_Bicubic_UV);
+			}
+			else if (chromaScaling == CHROMA_Krig && bDX11 && fmtParams.Subsampling == 420) {
+				AppendKrigBody(code, true); // KrigBilateral inline (biplanar UV)
 			}
 			else if (chromaScaling == CHROMA_CatmullRom && fmtParams.Subsampling == 422) {
 				code.append(
@@ -285,7 +421,7 @@ void ShaderGetPixels(
 					"colorUV[1] = texV.Sample(samp, input.Tex).r;\n"
 				);
 			}
-			else if (chromaScaling == CHROMA_CatmullRom && fmtParams.Subsampling == 420) {
+			else if ((chromaScaling == CHROMA_CatmullRom || (chromaScaling == CHROMA_Krig && !bDX11)) && fmtParams.Subsampling == 420) {
 				code += std::format("float2 t = frac(input.Tex * (wh*0.5)){};\n", strChromaPos2); // I don't know why, but it works.
 				code.append(code_CatmullRom_weights);
 				code.append("float2 c00,c10,c20,c30,c01,c11,c21,c31,c02,c12,c22,c32,c03,c13,c23,c33;\n");
@@ -296,6 +432,9 @@ void ShaderGetPixels(
 					}
 				}
 				code.append(code_Bicubic_UV);
+			}
+			else if (chromaScaling == CHROMA_Krig && bDX11 && fmtParams.Subsampling == 420) {
+				AppendKrigBody(code, false); // KrigBilateral inline (planar U/V)
 			}
 			else if (chromaScaling == CHROMA_CatmullRom && fmtParams.Subsampling == 422) {
 				code.append(
@@ -609,6 +748,11 @@ HRESULT GetShaderConvertColor(
 	HRESULT hr = S_OK;
 	LPVOID data;
 	DWORD size;
+
+	// KrigBilateral helpers are top-level functions; emit them up front (DX11/4:2:0 only)
+	if (bDX11 && chromaScaling == CHROMA_Krig) {
+		AppendKrigHelpers(code);
+	}
 
 	const bool bBT2020Primaries = (exFmt.VideoPrimaries == MFVideoPrimaries_BT2020);
 	const bool bConvertHDRtoSDR = (convertType == SHADER_CONVERT_TO_SDR && (exFmt.VideoTransferFunction == MFVideoTransFunc_2084 || exFmt.VideoTransferFunction == MFVideoTransFunc_HLG || pDoviMetadata));

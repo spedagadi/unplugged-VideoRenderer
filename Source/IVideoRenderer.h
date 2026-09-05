@@ -48,6 +48,7 @@ enum :int {
 	CHROMA_Nearest = 0,
 	CHROMA_Bilinear,
 	CHROMA_CatmullRom,
+	CHROMA_Krig, // Shiandow KrigBilateral (DX11 only; DX9 falls back to Catmull-Rom)
 	CHROMA_COUNT
 };
 

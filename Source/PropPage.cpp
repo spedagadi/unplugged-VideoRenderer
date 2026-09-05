@@ -358,6 +358,7 @@ HRESULT CVRMainPPage::OnActivate()
 	SendDlgItemMessageW(IDC_COMBO5, CB_ADDSTRING, 0, (LPARAM)L"Nearest-neighbor");
 	SendDlgItemMessageW(IDC_COMBO5, CB_ADDSTRING, 0, (LPARAM)L"Bilinear");
 	SendDlgItemMessageW(IDC_COMBO5, CB_ADDSTRING, 0, (LPARAM)L"Catmull-Rom");
+	SendDlgItemMessageW(IDC_COMBO5, CB_ADDSTRING, 0, (LPARAM)L"KrigBilateral");
 
 	SendDlgItemMessageW(IDC_COMBO2, CB_ADDSTRING, 0, (LPARAM)L"Nearest-neighbor");
 	SendDlgItemMessageW(IDC_COMBO2, CB_ADDSTRING, 0, (LPARAM)L"Mitchell-Netravali");
@@ -417,7 +418,8 @@ HRESULT CVRMainPPage::OnActivate()
 		"- Nvidia RTX (x64 only)");
 	AddHint(IDC_COMBO5,
 		L"Used for YUV 4:2:0/4:2:2 input formats\n"
-		"when the DVXA2/D3D11 Video Processor is not active.");
+		"when the DVXA2/D3D11 Video Processor is not active.\n"
+		"KrigBilateral (Shiandow) is the highest quality, DX11-only.");
 	AddHint(IDC_COMBO2,
 		L"Used to increase image size when the\n"
 		"DVXA2/D3D11 Video Processor is not used for resizing.");
