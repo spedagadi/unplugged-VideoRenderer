@@ -236,6 +236,8 @@ public:
 
 	void SetDisplayInfo(const DisplayConfig_t& dc, const bool primary, const bool exclusiveScreen);
 
+	virtual void GetMLStats(std::wstring& str) { str.clear(); }
+
 	bool GetDoubleRate() { return m_bDoubleFrames; }
 
 	virtual ISubPicAllocator* GetSubPicAllocator() { return nullptr; }

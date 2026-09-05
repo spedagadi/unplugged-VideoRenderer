@@ -141,10 +141,12 @@ struct Settings_t {
 
 	// Zion ML grade
 	bool  bMLEnabled = false;
-	int   iMLMode = ML_Disable; // ML_Disable / ML_Manual / ML_Auto (Auto reserved for feature extraction)
+	int   iMLMode = ML_Disable; // ML_Disable / ML_Manual / ML_Auto
 	float fMLGamma = 1.0f;       // manual gamma [0.5, 1.5]
 	float fMLShadow = 0.0f;      // manual shadow toe-lift [0.0, 0.4]
 	float fMLHighlight = 0.0f;   // manual highlight roll-off [-0.3, 0.4]
+	bool  bMLDebugCopy = false;  // grade steps use the plain copy shader (shader-vs-plumbing bisect)
+	bool  bMLDebugLog = false;   // per-frame diagnostic CSV next to the filter
 
 	Settings_t() {
 		SetDefault();
@@ -200,6 +202,8 @@ struct Settings_t {
 		fMLGamma                        = 1.0f;
 		fMLShadow                       = 0.0f;
 		fMLHighlight                    = 0.0f;
+		bMLDebugCopy                    = false;
+		bMLDebugLog                     = false;
 	}
 };
 
@@ -212,4 +216,6 @@ IVideoRenderer : public IUnknown {
 	STDMETHOD_(void, SetSettings(const Settings_t& setings)) PURE;
 
 	STDMETHOD(SaveSettings()) PURE;
+
+	STDMETHOD_(void, GetMLStats)(std::wstring& str) PURE;
 };

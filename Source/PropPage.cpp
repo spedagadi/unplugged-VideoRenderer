@@ -139,6 +139,8 @@ void CVRMainPPage::SetControls()
 	SetDlgItemTextW(IDC_EDIT3, std::to_wstring(m_SetsPP.fMLGamma).c_str());
 	SetDlgItemTextW(IDC_EDIT4, std::to_wstring(m_SetsPP.fMLShadow).c_str());
 	SetDlgItemTextW(IDC_EDIT5, std::to_wstring(m_SetsPP.fMLHighlight).c_str());
+	CheckDlgButton(IDC_CHECK21, m_SetsPP.bMLDebugCopy ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK22, m_SetsPP.bMLDebugLog  ? BST_CHECKED : BST_UNCHECKED);
 }
 
 void CVRMainPPage::EnableControls()
@@ -186,6 +188,9 @@ void CVRMainPPage::EnableControls()
 	GetDlgItem(IDC_EDIT3).EnableWindow(bMLManual);
 	GetDlgItem(IDC_EDIT4).EnableWindow(bMLManual);
 	GetDlgItem(IDC_EDIT5).EnableWindow(bMLManual);
+	GetDlgItem(IDC_STATIC105).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_CHECK21).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_CHECK22).EnableWindow(bMLEnable);
 }
 
 HRESULT CVRMainPPage::OnConnect(IUnknown *pUnk)
@@ -205,6 +210,8 @@ HRESULT CVRMainPPage::OnDisconnect()
 	if (m_pVideoRenderer == nullptr) {
 		return E_UNEXPECTED;
 	}
+
+	KillTimer(1001);
 
 	if (m_SetsPP.iSDRDisplayNits != m_oldSDRDisplayNits) {
 		// OK or Apply buttons were not pressed. cancel the settings.
@@ -348,11 +355,24 @@ HRESULT CVRMainPPage::OnActivate()
 
 	m_bActivated = true;
 
+	// poll the live Zion ML state for the stats box
+	SetTimer(1001, 500);
+
 	return S_OK;
 }
 
 INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
+	if (uMsg == WM_TIMER && wParam == 1001) {
+		// refresh live Zion ML values
+		if (m_pVideoRenderer) {
+			std::wstring str;
+			m_pVideoRenderer->GetMLStats(str);
+			GetDlgItem(IDC_EDIT6).SetWindowTextW(str.c_str());
+		}
+		return (LRESULT)1;
+	}
+
 	if (uMsg == WM_COMMAND) {
 		LRESULT lValue;
 		const int nID = LOWORD(wParam);
@@ -456,6 +476,19 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 			if (nID == IDC_CHECK20) {
 				m_SetsPP.bMLEnabled = IsDlgButtonChecked(IDC_CHECK20) == BST_CHECKED;
 				EnableControls();
+				m_pVideoRenderer->SetSettings(m_SetsPP); // live: apply immediately
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK21) {
+				m_SetsPP.bMLDebugCopy = IsDlgButtonChecked(IDC_CHECK21) == BST_CHECKED;
+				m_pVideoRenderer->SetSettings(m_SetsPP);
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK22) {
+				m_SetsPP.bMLDebugLog = IsDlgButtonChecked(IDC_CHECK22) == BST_CHECKED;
+				m_pVideoRenderer->SetSettings(m_SetsPP);
 				SetDirty();
 				return (LRESULT)1;
 			}
@@ -593,6 +626,7 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 				if (lValue != m_SetsPP.iMLMode) {
 					m_SetsPP.iMLMode = lValue;
 					EnableControls();
+					m_pVideoRenderer->SetSettings(m_SetsPP); // live: apply immediately
 					SetDirty();
 				}
 				return (LRESULT)1;
@@ -603,6 +637,22 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 				SetDirty();
 			}
 			if (nID == IDC_EDIT3 || nID == IDC_EDIT4 || nID == IDC_EDIT5) {
+				// Zion ML value edits: live-apply on every keystroke, clamping
+				// out-of-range entries to the valid range instead of rejecting
+				// them (so typing "3" visibly applies 1.5 rather than doing
+				// nothing).
+				float* pDst = nullptr;
+				float def = 0.f, lo = 0.f, hi = 0.f;
+				if (nID == IDC_EDIT3) { pDst = &m_SetsPP.fMLGamma; def = 1.0f; lo = 0.5f;  hi = 1.5f; }
+				if (nID == IDC_EDIT4) { pDst = &m_SetsPP.fMLShadow; def = 0.0f; lo = 0.0f;  hi = 0.4f; }
+				if (nID == IDC_EDIT5) { pDst = &m_SetsPP.fMLHighlight; def = 0.0f; lo = -0.3f; hi = 0.4f; }
+				WCHAR buffer[32];
+				::GetDlgItemTextW(m_hWnd, nID, buffer, _countof(buffer));
+				const float v = (float)_wtof(buffer);
+				if (pDst && buffer[0]) {
+					*pDst = discard<float>(v, def, lo, hi);
+					m_pVideoRenderer->SetSettings(m_SetsPP); // live: apply immediately
+				}
 				SetDirty();
 			}
 		}

@@ -24,13 +24,21 @@
 #define ML_DOWNSAMPLE_W  256
 #define ML_DOWNSAMPLE_H  144
 
+// Luma value domain carried by the readback texture.
+enum class MLLumaDomain {
+	PQ,        // true source-referred PQ (HDR passthrough frame)
+	SDRGamma22 // gamma-2.2 encoded SDR (an HDR->SDR converted frame); the
+	           // samples are remapped into source-PQ units before stats run
+};
+
 // Builds the 88-entry ML feature vector from a 256x144 R16_UNORM luma
-// readback (PQ domain). Port of libplacebo's extract_features_cpu mirrored by
-// build_model_features — the exact contract the Zion XGBoost models were
-// trained on. `rowPitch` is in uint16 elements.
+// readback in the given domain. Port of libplacebo's extract_features_cpu
+// mirrored by build_model_features — the exact contract the Zion XGBoost
+// models were trained on. `rowPitch` is in uint16 elements.
 //
 // Slots: [0] maxscl, [1] avg, [2] fraction bright, [3..8] p25..p99,
 // [9..26] 3x3 zone means+maxes, [27..76] 5x5 zone means+maxes,
 // [77..84] spline knots, [85]/[86] top/bottom bar norm, [87] compression.
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch,
-                     float features[ML_FEATURE_DIM]);
+                     float features[ML_FEATURE_DIM],
+                     MLLumaDomain domain = MLLumaDomain::PQ);

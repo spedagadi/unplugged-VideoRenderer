@@ -415,6 +415,8 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_fMLGamma              = config.fMLGamma;
 	m_fMLShadow             = config.fMLShadow;
 	m_fMLHighlight          = config.fMLHighlight;
+	m_bMLDebugCopy          = config.bMLDebugCopy;
+	m_bMLDebug              = config.bMLDebugLog;
 
 	m_nCurrentAdapter = -1;
 
@@ -740,6 +742,11 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_bMLFeaturesStale = false;
 	m_bMLConvertSeen = false;
 
+	if (m_pMLDebugFile) {
+		fclose(m_pMLDebugFile);
+		m_pMLDebugFile = nullptr;
+	}
+
 #if TEST_SHADER
 	m_pPS_TEST.Release();
 #endif
@@ -1015,6 +1022,8 @@ void CDX11VideoProcessor::UpdateMLActive()
 	// Native-SDR enhancement is out of scope (SDR->P5 emulation deferred):
 	// the ML grade runs only on HDR source content. Manual mode always applies;
 	// AUTO activates once the gamma model is loaded and features are produced.
+	InitMLDebug();
+
 	if (m_iMLMode == ML_Auto && !m_bMLModelLoadTried) {
 		m_bMLModelLoadTried = true;
 		const std::wstring path = GetMLModelPath();
@@ -1083,7 +1092,8 @@ void CDX11VideoProcessor::SetMLParams()
 		// IIR-smoothed with scene-cut reset on the l1 peak.
 		float pred = 1.0f;
 		if (m_MLGammaModel.Predict(m_MLFeatures, ML_FEATURE_DIM, pred)) {
-			pred = discard<float>(pred, 1.0f, 0.5f, 1.5f);
+			// widenable band; the model's trained range is 0.5..1.5
+			pred = discard<float>(pred, 1.0f, 0.7f, 1.3f);
 
 			const float l1now = m_MLFeatures[0];
 			if (m_MLPrevL1Max < 0.0f || fabsf(l1now - m_MLPrevL1Max) > 0.15f) {
@@ -1094,6 +1104,9 @@ void CDX11VideoProcessor::SetMLParams()
 			m_MLPrevL1Max = l1now;
 			gamma = m_MLIIRGamma;
 		}
+		m_MLDebugFeat0 = m_MLFeatures[0];
+		m_MLDebugFeat1 = m_MLFeatures[1];
+		m_MLDebugPred = gamma;
 		l1max = fmaxf(0.05f, fminf(0.90f, m_MLFeatures[0]));
 	}
 
@@ -1111,15 +1124,19 @@ void CDX11VideoProcessor::SetMLParams()
 		0.10f,                                            // hunt compensation
 		l1max,
 		0.25f,                                            // highlight desaturation
-		(m_bHdrPassthrough && m_bHdrPassthroughSupport) ? 1.0f : 0.0f, // IsPQ
+		// The grade input is PQ iff the swap chain is in the PQ color space.
+		// Testing config flags (m_bHdrPassthrough) is wrong: an HDR-capable
+		// display running convert-to-SDR keeps bHdrPassthrough set while the
+		// frame at this stage is gamma-2.2 SDR - the PQ round-trip then
+		// corrupts the whole image even at neutral settings.
+		(m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ? 1.0f : 0.0f,
 		0.0f
 	};
 
-	if (memcmp(&m_lastMLParams, &params, sizeof(params)) == 0) {
-		return;
-	}
 	m_lastMLParams = params;
 
+	// Always upload: a zero-filled buffer (from a missed update) made the
+	// gamma shader run at MLGamma=0 -> pow(y, g<1) -> washed-out image.
 	if (m_pMLParams) {
 		m_pDeviceContext->UpdateSubresource(m_pMLParams, 0, nullptr, &params, 0, 0);
 	} else {
@@ -1137,6 +1154,12 @@ void CDX11VideoProcessor::SetMLParams()
 void CDX11VideoProcessor::ExtractMLFeatures()
 {
 	if (!m_pPSMLDownsample || !m_MLDownsample || !m_MLStaging || !m_TexConvertOutput.pTexture) {
+		if (m_bMLDebug && m_pMLDebugFile) {
+			fwprintf(m_pMLDebugFile, L"EXTRACT skip (ps=%d ds=%d stag=%d tex=%d)\n",
+				(m_pPSMLDownsample ? 1 : 0), (m_MLDownsample ? 1 : 0),
+				(m_MLStaging ? 1 : 0), (m_TexConvertOutput.pTexture ? 1 : 0));
+			fflush(m_pMLDebugFile);
+		}
 		return;
 	}
 
@@ -1155,9 +1178,37 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 		return;
 	}
 
-	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures);
+	// The convert output holds true source-referred PQ only when the swap chain
+	// is actually in the PQ color space; on any SDR output path (incl. an
+	// HDR-capable display running convert-to-SDR) it is gamma-2.2 encoded and
+	// is remapped into PQ units by BuildMLFeatures.
+	const MLLumaDomain domain = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+		? MLLumaDomain::PQ : MLLumaDomain::SDRGamma22;
+	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain);
 	m_pDeviceContext->Unmap(m_MLStaging, 0);
+
 	m_bMLFeaturesReady = true;
+	m_MLDebugFeat0 = m_MLFeatures[0];
+	m_MLDebugFeat1 = m_MLFeatures[1];
+	m_MLDebugFeatReady = 1;
+	if (m_bMLDebug && m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"EXTRACT ok feat0=%.4f feat1=%.4f\n", (double)m_MLFeatures[0], (double)m_MLFeatures[1]);
+		fflush(m_pMLDebugFile);
+	}
+}
+
+void CDX11VideoProcessor::GetMLStats(std::wstring& str)
+{
+	const wchar_t* mode = (m_iMLMode == ML_Auto) ? L"Auto" : (m_iMLMode == ML_Manual ? L"Manual" : L"Off");
+	const wchar_t* domain = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ? L"PQ" : L"SDR-remap";
+	str = std::format(
+		L"mode: {}   domain: {}   active: {}\n"
+		L"gamma={:.4f}   shadow={:.3f}   highlight={:.3f}\n"
+		L"scene: peak={:.4f} avg={:.4f}   pred={:.4f}   feat={}",
+		mode, domain, (m_bMLActive ? L"yes" : L"no"),
+		m_lastMLParams.MLGamma, m_lastMLParams.MLShadowToe, m_lastMLParams.MLHighlightRolloff,
+		m_MLFeatures[0], m_MLFeatures[1], m_lastMLParams.MLGamma,
+		(m_bMLFeaturesReady ? L"ready" : L"n/a"));
 }
 
 void CDX11VideoProcessor::CreateMLTextures()
@@ -1196,7 +1247,7 @@ void CDX11VideoProcessor::CreateMLTextures()
 // (model files ship next to the filter, like the install cmds).
 static void MLModulePathAnchor() {}
 
-std::wstring CDX11VideoProcessor::GetMLModelPath()
+std::wstring CDX11VideoProcessor::GetMLModuleDir()
 {
 	wchar_t filename[MAX_PATH] = {};
 	HMODULE hModule = nullptr;
@@ -1206,9 +1257,147 @@ std::wstring CDX11VideoProcessor::GetMLModelPath()
 		if (p) {
 			*p = 0;
 		}
-		return std::wstring(filename) + L"\\xgb_gamma_model.plxgb";
+		return filename;
 	}
-	return L"xgb_gamma_model.plxgb";
+	return L".";
+}
+
+std::wstring CDX11VideoProcessor::GetMLModelPath()
+{
+	return GetMLModuleDir() + L"\\xgb_gamma_model.plxgb";
+}
+
+void CDX11VideoProcessor::InitMLDebug()
+{
+	if (m_bMLDebug && !m_pMLDebugFile) {
+		wchar_t path[MAX_PATH] = {};
+		swprintf_s(path, L"%s\\ml_debug.csv", GetMLModuleDir().c_str());
+		if (_wfopen_s(&m_pMLDebugFile, path, L"a") != 0 || !m_pMLDebugFile) {
+			// fall back to the temp dir if the filter folder is not writable
+			wchar_t temp[MAX_PATH] = {};
+			GetTempPathW(MAX_PATH, temp);
+			swprintf_s(path, L"%smpcvr_ml_debug.csv", temp);
+			_wfopen_s(&m_pMLDebugFile, path, L"a");
+		}
+		if (m_pMLDebugFile && (fseek(m_pMLDebugFile, 0, SEEK_END) == 0) && ftell(m_pMLDebugFile) == 0) {
+			fwprintf(m_pMLDebugFile,
+				L"# log open\n"
+				L"frame,time_100ns,active,mode,gamma,shadow,highlight,"
+				L"ispq,swapcs,swfmt,steps,tmactive,winW,winH,srcW,srcH,vidL,vidT,vidR,vidB,"
+				L"mlmin,mlmax,mlavg,clipfrac,edgefrac,logCOPY,"
+				L"featReady,stale,convSeen,texConv,feat0,feat1,pred\n");
+		}
+		if (m_pMLDebugFile) {
+			fwprintf(m_pMLDebugFile, L"# log open (ML enabled=%d, copy=%d)\n", (m_bML ? 1 : 0), (m_bMLDebugCopy ? 1 : 0));
+			fflush(m_pMLDebugFile);
+		}
+		m_MLDebugFrame = 0;
+		DLog(L"CDX11VideoProcessor::InitMLDebug() writing ML debug log to {}", path);
+	}
+
+	if (!m_bMLDebug && m_pMLDebugFile) {
+		fclose(m_pMLDebugFile);
+		m_pMLDebugFile = nullptr;
+	}
+}
+
+void CDX11VideoProcessor::LogMLFrame()
+{
+	if (!m_bMLDebug || !m_pMLDebugFile) {
+		return;
+	}
+	m_MLDebugFrame++;
+	m_MLDebugFeatReady = m_bMLFeaturesReady ? 1 : 0;
+
+	const float gamma = m_lastMLParams.MLGamma;
+	const float shadow = m_lastMLParams.MLShadowToe;
+	const float rolloff = m_lastMLParams.MLHighlightRolloff;
+	const bool bIsPQ = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+	const wchar_t* pColor = L"?";
+	switch (m_currentSwapChainColorSpace) {
+	case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709: pColor = L"G22P709"; break;
+	case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: pColor = L"G2084P2020"; break;
+	case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709: pColor = L"G10P709"; break;
+	default: break;
+	}
+
+	fwprintf(m_pMLDebugFile,
+		L"%llu,%lld,%d,%d,%.4f,%.4f,%.4f,%d,%s,%d,%u,%d,%d,%d,%u,%u,%d,%d,%d,%d,"
+		L"%u,%u,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f\n",
+		m_MLDebugFrame,
+		(long long)m_rtStart,
+		(m_bMLActive ? 1 : 0),
+		m_iMLMode,
+		(double)gamma, (double)shadow, (double)rolloff,
+		(bIsPQ ? 1 : 0),
+		pColor,
+		(int)m_SwapChainFmt,
+		(unsigned)m_MLDebugStepCount,
+		(m_pPSHDR10ToneMapping ? 1 : 0),
+		m_MLDebugWinW, m_MLDebugWinH,
+		(UINT)m_srcRectWidth, (UINT)m_srcRectHeight,
+		m_videoRect.left, m_videoRect.top, m_videoRect.right, m_videoRect.bottom,
+		m_MLDebugLastMin, m_MLDebugLastMax,
+		(double)m_MLDebugLastAvg, (double)m_MLDebugLastClipF, (double)m_MLDebugLastEdgeF,
+		(m_bMLDebugCopy ? 1 : 0),
+		m_MLDebugFeatReady, m_MLDebugStale, m_MLDebugConvertSeen, m_MLDebugTexConv,
+		(double)m_MLDebugFeat0, (double)m_MLDebugFeat1, (double)m_MLDebugPred);
+	fflush(m_pMLDebugFile);
+}
+
+// Downscales the given ML-output stage into the 256x144 cache and logs luma
+// stats (min/max/avg, fraction clipped >0.98, mean-abs-gradient edge metric)
+// so a corrupted frame can be diagnosed from the log alone. ~every 8 frames.
+void CDX11VideoProcessor::LogMLFrameStats(const Tex2D_t& src, const wchar_t* tag)
+{
+	if (!m_bMLDebug || !m_pMLDebugFile || !m_pPSMLDownsample || !m_MLDownsample || !m_MLStaging) {
+		return;
+	}
+
+	const CRect full(0, 0, ML_DOWNSAMPLE_W, ML_DOWNSAMPLE_H);
+	const CRect srcRect(0, 0, (int)src.desc.Width, (int)src.desc.Height);
+	if (FAILED(TextureCopyRect(src, m_MLDownsample, srcRect, full, m_pPSMLDownsample, nullptr, 0, false))) {
+		return;
+	}
+	m_pDeviceContext->CopyResource(m_MLStaging, m_MLDownsample);
+
+	D3D11_MAPPED_SUBRESOURCE mr = {};
+	if (FAILED(m_pDeviceContext->Map(m_MLStaging, 0, D3D11_MAP_READ, 0, &mr))) {
+		return;
+	}
+	const uint16_t* p = (const uint16_t*)mr.pData;
+	const int rowPitch = (int)(mr.RowPitch / 2);
+	const int w = ML_DOWNSAMPLE_W, h = ML_DOWNSAMPLE_H;
+	uint64_t sum = 0, over = 0, edge = 0;
+	uint32_t mn = 65535, mx = 0;
+	for (int y = 0; y < h; y++) {
+		const uint16_t* row = p + (size_t)y * rowPitch;
+		for (int x = 0; x < w; x++) {
+			const uint32_t v = row[x];
+			sum += v;
+			if (v < mn) mn = v;
+			if (v > mx) mx = v;
+			if (v > 65535u * 98 / 100) over++;
+			if (x > 0) {
+				const uint32_t d = (v > row[x - 1]) ? (v - row[x - 1]) : (row[x - 1] - v);
+				if (d > 3276) edge++; // ~>5% step between neighbours
+			}
+		}
+	}
+	m_pDeviceContext->Unmap(m_MLStaging, 0);
+
+	m_MLDebugLastMin = (uint16_t)mn;
+	m_MLDebugLastMax = (uint16_t)mx;
+	m_MLDebugLastAvg = (float)((double)sum / (w * h * 65535.0));
+	m_MLDebugLastClipF = (float)((double)over / (w * h));
+	m_MLDebugLastEdgeF = (float)((double)edge / (w * (h - 1) + (h - 1) * (w - 1)));
+
+	if (m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"STATS,%s,%u,%u,%.4f,%.4f,%.4f\n",
+			tag, (unsigned)mn, (unsigned)mx, (double)m_MLDebugLastAvg,
+			(double)m_MLDebugLastClipF, (double)m_MLDebugLastEdgeF);
+		fflush(m_pMLDebugFile);
+	}
 }
 
 HRESULT CDX11VideoProcessor::SetShaderDoviCurvesPoly()
@@ -2374,6 +2563,11 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 	const REFERENCE_TIME rtFrameDur = m_pFilter->m_FrameStats.GetAverageFrameDuration();
 	rtEnd = rtStart + rtFrameDur;
 
+	if (m_bMLDebug && m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"PS,%lld,%d\n", (long long)rtStart, (m_bMLActive ? 1 : 0));
+		fflush(m_pMLDebugFile);
+	}
+
 	m_rtStart = rtStart;
 	CRefTime rtClock(rtStart);
 
@@ -2836,6 +3030,33 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 
 HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTime)
 {
+	// Frame canary + params row (kept at the very top so nothing can gate it out)
+	if (m_bMLDebug && m_pMLDebugFile) {
+		m_MLDebugWinW = (int)m_windowRect.Width();
+		m_MLDebugWinH = (int)m_windowRect.Height();
+		LogMLFrame();
+	}
+
+	// ML params must be refreshed before this frame is processed; keep this
+	// unconditional (only gated by active state) so a stale or zero-filled
+	// constant buffer can never reach the grade shaders.
+	if (m_bMLActive && m_pPSMLGamma) {
+		SetMLParams();
+	}
+
+	// Feature extraction also lives here (NOT inside the swap-chain4/HDR
+	// metadata block): playback can render through a path where that block is
+	// bypassed, which silently stalled AUTO mode for a whole session.
+	if (m_bMLActive && m_pPSMLGamma && m_pPSMLDownsample) {
+		m_MLDebugStale = m_bMLFeaturesStale ? 1 : 0;
+		m_MLDebugConvertSeen = m_bMLConvertSeen ? 1 : 0;
+		m_MLDebugTexConv = m_TexConvertOutput.pTexture ? 1 : 0;
+		if (m_bMLFeaturesStale && m_bMLConvertSeen && m_TexConvertOutput.pTexture) {
+			ExtractMLFeatures();
+			m_bMLFeaturesStale = false;
+		}
+	}
+
 	CheckPointer(m_TexSrcVideo.pTexture, E_FAIL);
 	CheckPointer(m_pDXGISwapChain1, E_FAIL);
 
@@ -2963,14 +3184,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			}
 		}
 
-		if (m_bMLActive && m_pPSMLGamma && m_pPSMLDownsample) {
-			if (m_bMLFeaturesStale && m_bMLConvertSeen && m_TexConvertOutput.pTexture) {
-				ExtractMLFeatures();
-				m_bMLFeaturesStale = false;
-			}
-			SetMLParams();
 		}
-	}
 
 	if (!m_renderRect.IsRectEmpty()) {
 		hr = Process(pBackBuffer, m_srcRect, m_videoRect, m_FieldDrawn == 2);
@@ -3569,6 +3783,8 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 	}
 
 	if (numSteps) {
+		m_MLDebugStepCount = numSteps;
+
 		UINT step = 0;
 		Tex2D_t* pTex = m_TexsPostScale.GetFirstTex();
 		ID3D11Texture2D* pRT = pTex->pTexture;
@@ -3614,12 +3830,37 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 
 		if (m_bMLActive && m_pPSMLGamma && m_pMLParams) {
 			// Zion ML grade — hook order matches libplacebo: shadow -> highlight -> gamma
+			// MLDebugPassthrough: bind the proven copy shader to all three steps
+			// to bisect "bad ML shader math" vs "broken step plumbing".
+			ID3D11PixelShader* psShadow    = m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLShadow.p;
+			ID3D11PixelShader* psHighlight = m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLHighlight.p;
+			ID3D11PixelShader* psGamma     = m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLGamma.p;
+
+			HRESULT hrs[3] = {};
+			if (m_bMLDebug && m_pMLDebugFile) {
+				fwprintf(m_pMLDebugFile, L"MLPASS enter step=%u\n", (unsigned)(step + 1));
+			}
+
 			StepSetting();
-			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSMLShadow, m_pMLParams, 0, false);
+			hrs[0] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psShadow, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 			StepSetting();
-			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSMLHighlight, m_pMLParams, 0, false);
+			hrs[1] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psHighlight, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 			StepSetting();
-			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSMLGamma, m_pMLParams, 0, false);
+			hrs[2] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psGamma, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
+
+			if (m_bMLDebug && m_pMLDebugFile) {
+				fwprintf(m_pMLDebugFile, L"MLPASS draws %s %s %s (hr=%x,%x,%x)\n",
+					m_bMLDebugCopy ? L"copy" : L"shadow",
+					m_bMLDebugCopy ? L"copy" : L"highlight",
+					m_bMLDebugCopy ? L"copy" : L"gamma",
+					(unsigned)hrs[0], (unsigned)hrs[1], (unsigned)hrs[2]);
+				fflush(m_pMLDebugFile);
+			}
+
+			// log luma stats of the gamma-step INPUT (pre-grade content) every 8th frame
+			if (m_bMLDebug && m_bMLDebugCopy == false && m_MLDebugFrame % 8 == 0) {
+				LogMLFrameStats(*pInputTexture, L"IN");
+			}
 		}
 
 		if (m_pPostScaleShaders.size()) {
@@ -3676,6 +3917,12 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 
 	if (m_bMLActive && m_TexConvertOutput.pTexture) {
 		m_bMLConvertSeen = true;
+	}
+
+	// Post-grade/present proof: stats of the exact texture slot the present
+	// reads are compared against the grade INPUT (STATS IN) in the log.
+	if (m_bMLDebug && m_pMLDebugFile && pInputTexture && m_MLDebugFrame % 8 == 0) {
+		LogMLFrameStats(*pInputTexture, L"OUT");
 	}
 
 	DLogIf(FAILED(hr), L"CDX11VideoProcessor::Process() : failed with error {}", HR2Str(hr));
@@ -4214,12 +4461,15 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 
 	if (config.bMLEnabled != m_bML || config.iMLMode != m_iMLMode ||
 			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow ||
-			config.fMLHighlight != m_fMLHighlight) {
+			config.fMLHighlight != m_fMLHighlight ||
+			config.bMLDebugCopy != m_bMLDebugCopy || config.bMLDebugLog != m_bMLDebug) {
 		m_bML          = config.bMLEnabled;
 		m_iMLMode      = config.iMLMode;
 		m_fMLGamma     = config.fMLGamma;
 		m_fMLShadow    = config.fMLShadow;
 		m_fMLHighlight = config.fMLHighlight;
+		m_bMLDebugCopy = config.bMLDebugCopy;
+		m_bMLDebug     = config.bMLDebugLog;
 		UpdateMLActive();
 	}
 

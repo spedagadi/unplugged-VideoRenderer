@@ -82,9 +82,14 @@ float4 main(PS_INPUT input) : SV_Target
 			float eff = fade * (1.0 - hi);
 			y = lerp(y, pow(y, 1.0 / l2_gamma), eff);
 		} else {
+			// symmetric gamma: for l2_gamma < 1 the exponent 1/l2_gamma > 1,
+			// so darker values get pushed DOWN (midtone darken). (libplacebo's
+			// original else-branch used pow(y, lerp(1.0, l2_gamma, ...)) which
+			// also raised values - both sides brightened, making 1.5 vs 0.75
+			// visually indistinguishable.)
 			float fade2 = smoothstep(0.08, 0.45, y);
-			float g = lerp(1.0, l2_gamma, fade2 * (1.0 - hi));
-			y = pow(y, g);
+			float eff = fade2 * (1.0 - hi);
+			y = lerp(y, pow(y, 1.0 / l2_gamma), eff);
 		}
 	}
 

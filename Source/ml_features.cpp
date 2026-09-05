@@ -45,6 +45,21 @@ inline float HistogramPercentile(const uint32_t histogram[65536], int count, flo
 	return (lower_bin * (1.0f - frac) + upper_bin * frac) / 65535.0f;
 }
 
+// ST.2084 encode of a luminance in nits (ml_render.c sdr_nits_to_pq).
+inline float SdrNitsToPQ(float nits)
+{
+	if (nits <= 0.0f) return 0.0f;
+	const float n = fminf(fmaxf(nits / 10000.0f, 1e-6f), 1.0f);
+	const float m = powf(n, 0.1593017578125f);
+	return powf((0.8359375f + 18.8515625f * m) / (1.0f + 18.6875f * m), 78.84375f);
+}
+
+// gamma-2.2 SDR value (bt.1886-ish white 100 nits) -> source-referred PQ.
+inline float SdrGammaToPQ(float y_sdr)
+{
+	return SdrNitsToPQ(100.0f * powf(y_sdr, 2.2f));
+}
+
 // Summed area table with a 1-cell margin so zone queries need no bounds checks.
 float SatQuery(const std::vector<float>& sat, int stride,
                int y0, int y1, int x0, int x1)
@@ -57,7 +72,8 @@ float SatQuery(const std::vector<float>& sat, int stride,
 
 } // namespace
 
-void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[ML_FEATURE_DIM])
+void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[ML_FEATURE_DIM],
+                     MLLumaDomain domain)
 {
 	const int w = ML_DOWNSAMPLE_W;
 	const int h = ML_DOWNSAMPLE_H;
@@ -68,31 +84,40 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 	thread_local uint32_t histogram[65536] = {};
 	thread_local std::vector<float> sat((size_t)(w + 1) * (h + 1));
 	thread_local std::vector<float> rowMean(h);
+	thread_local std::vector<float> tv((size_t)w * h); // per-pixel feature-domain value
 	ZeroMemory(histogram, sizeof(histogram));
 
+	// 1) decode the readback into the feature domain (PQ, or SDR gamma -> PQ)
 	int64_t sum = 0, max_bin = 0, bright = 0;
-
-	// single pass: histogram + summed area table + row means
 	for (int y = 0; y < h; y++) {
 		const uint16_t* row = luma16 + (size_t)y * rowPitch;
+		for (int x = 0; x < w; x++) {
+			const float y16 = (float)(row[x] * scale);
+			const float fv = (domain == MLLumaDomain::SDRGamma22) ? SdrGammaToPQ(y16) : y16;
+			tv[(size_t)y * w + x] = fv;
+			const int bin = (int)(fminf(fv, 1.0f) * 65535.0f);
+			histogram[bin]++;
+			sum += bin;
+			if (bin > max_bin) max_bin = bin;
+			if (fv > 0.5f) bright++;
+		}
+	}
+
+	// 2) summed area table + row means in feature space
+	for (int y = 0; y < h; y++) {
 		const int ysat = (y + 1) * (w + 1);
 		const int ysat0 = y * (w + 1);
 		double rowSum = 0.0;
 		for (int x = 0; x < w; x++) {
-			const int v = row[x];
-			const float fv = (float)(v * scale);
-			histogram[v]++;
-			sum += v;
-			if (v > max_bin) max_bin = v;
-			if (v > 32767) bright++;
+			const float fv = tv[(size_t)y * w + x];
 			rowSum += fv;
 			sat[ysat + x + 1] = fv + sat[ysat0 + x + 1] + sat[ysat + x] - sat[ysat0 + x];
 		}
 		rowMean[y] = (float)(rowSum / w);
 	}
 
-	// [0..8] global luma stats
-	features[0] = (float)((double)max_bin * scale);
+	// 3) [0..8] global luma stats
+	features[0] = (float)((double)max_bin / 65535.0);
 	features[1] = (float)((double)sum / (65535.0 * total));
 	features[2] = (float)((double)bright / total);
 	const float targets[6] = { 0.25f, 0.50f, 0.75f, 0.90f, 0.95f, 0.99f };
@@ -112,10 +137,9 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 				const int n_rect = (y1 - y0 + 1) * (x1 - x0 + 1);
 				float max_rect = 0.0f;
 				for (int y = y0; y <= y1; y++) {
-					const uint16_t* row = luma16 + (size_t)y * rowPitch;
+					const float* row = &tv[(size_t)y * w];
 					for (int x = x0; x <= x1; x++) {
-						const float fv = (float)(row[x] * scale);
-						if (fv > max_rect) max_rect = fv;
+						if (row[x] > max_rect) max_rect = row[x];
 					}
 				}
 				features[meanBase + r * grid + c] = sum_rect / n_rect;

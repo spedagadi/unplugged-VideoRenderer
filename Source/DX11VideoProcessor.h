@@ -139,6 +139,20 @@ private:
 	CComPtr<ID3D11Texture2D> m_MLDownsample;   // 256x144 R16_UNORM luma cache
 	CComPtr<ID3D11Texture2D> m_MLStaging;      // CPU-readable copy
 	CComPtr<ID3D11PixelShader> m_pPSMLDownsample;
+
+	// Zion ML debug (registry: MLDebugLog / MLDebugPassthrough)
+	bool m_bMLDebug = false;
+	bool m_bMLDebugCopy = false; // bind ps_simple to the grade steps (bisect test)
+	FILE* m_pMLDebugFile = nullptr;
+	uint64_t m_MLDebugFrame = 0;
+	uint64_t m_MLDebugStepCount = 0;
+	uint16_t m_MLDebugLastMin = 0, m_MLDebugLastMax = 0;
+	float m_MLDebugLastAvg = 0.0f, m_MLDebugLastClipF = 0.0f, m_MLDebugLastEdgeF = 0.0f;
+	int m_MLDebugWinW = 0, m_MLDebugWinH = 0;
+	int m_MLDebugFeatReady = 0;
+	int m_MLDebugStale = 0, m_MLDebugConvertSeen = 0, m_MLDebugTexConv = 0;
+	float m_MLDebugFeat0 = 0.0f, m_MLDebugFeat1 = 0.0f;
+	float m_MLDebugPred = 0.0f;
 	bool m_bMLActive = false;
 	bool m_bMLFeaturesReady = false;
 	bool m_bMLFeaturesStale = false;
@@ -319,6 +333,10 @@ private:
 	void ExtractMLFeatures();
 	void CreateMLTextures();
 	std::wstring GetMLModelPath();
+	void InitMLDebug();
+	void LogMLFrame();
+	void LogMLFrameStats(const Tex2D_t& src, const wchar_t* tag);
+	std::wstring GetMLModuleDir();
 
 	HRESULT SetShaderDoviCurvesPoly();
 	HRESULT SetShaderDoviCurves();
@@ -371,6 +389,7 @@ public:
 
 	void SetRotation(int value) override;
 	void SetStereo3dTransform(int value) override;
+	void GetMLStats(std::wstring& str) override;
 
 	void Flush() override;
 

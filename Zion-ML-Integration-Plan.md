@@ -276,3 +276,37 @@ int  iMLHighlightMode; float fMLHighlight; // [-0.3, 0.4]
 | `history.txt` | — | changelog |
 
 **Estimated size:** ~1,100 new lines C++/HLSL across 8 files, zero new external dependencies.
+---
+
+## Phase 1b — Hunt Compensation + Chroma Vector Tuning (with trained skin guard)
+
+**Status:** Planned 2026-09-05 (user: "let plan out first"). Precedes Phase 2 (shadow/highlight AUTO).
+
+### What each feature is, from libplacebo (`ml_render.c`)
+
+- **Hunt compensation** (`l2_hook`, already partially present): `cr/cb *= (1 + MLHunt·l1max²) · pow(y_pre/y, 0.15)`. Perceptually-corrected chroma scaling that follows the gamma's luma change. Currently MPCVR hardcodes `MLHunt=0.10`. Goal: expose as a setting (default 0.10) and keep the brightness term driven by `l1max` from features.
+- **Chroma vector tuning** (`chroma_tuner_hook`, body_b): decomposes γ2.2 signal to `y/cr/cb` (cr=(r−y)/1.5748, cb=(b−y)/1.8556), looks up a **trained P(skin) LUT** for protection, applies an adaptive boost `neutral→fire` over a knee (`pow(t,1.5)`), `chroma_scalar = mix(boost,1,skin·protect)` clamped `[1,1.5]`, green-safe taper, reconstruct. Four knobs (mpv `ml-chroma`): neutral 1.20 / fire 1.35 / knee 0.55 / skin-protect 0.95.
+
+### Skin LUT asset (verified format)
+
+`Source/res/skin_chroma_lut.bin` (copied from `C:\Code\libplacebo\ml\models\skin_chroma_lut.bin`, 9236 B):
+- Header: `4×float cr0,cr1,cb0,cb1` + `2×u16 N,N` (20 B) → `cr[−0.2009,0.3295]`, `cb[−0.2494,0.1967]`, **N=96**
+- Payload: 96×96 uint8 `P(skin)` (0..239 observed), row-major
+- Shader mapping: `u=(cr−cr0)/(cr1−cr0)`, `v=(cb−cb0)/(cb1−cb0)` → bilinear, clamp; **half-texel offset** must be cross-validated vs the `np.linspace` bake (the one fidelity risk)
+- Ship embedded (RCDATA-style `FILE` resource, like `dither32x32float16.bin`); nothing extra for `make_dist`.
+
+### Build plan (ordered)
+
+| # | Task | Files | Notes |
+|---|---|---|---|
+| 1 | Extend `MLParams_t` cbuffer 12→24 floats & all 4 shader cbuffer decls & `SetMLParams` | DX11VideoProcessor.h/.cpp, ps_ml_*.hlsl ×4 | new: MLHunt(real), chroma neutral/fire/knee/skin, LUT cr0/cr1/cb0/cb1 |
+| 2 | `ps_ml_chroma.hlsl` (port body_b, IsPQ wrap like siblings) | Shaders/d3d11 + compile.cmd + vcxproj + rc2 (ID 887) | 4th step **after gamma** (matches libplacebo chroma-last) |
+| 3 | Skin LUT: copy bin → `Source/res/`, resource ID, D3D11 R8 texture + bounds parse at load | Source/res/*, resource.h, rc2, DX11 load fn | 96×96 immutable; per-frame bind at t1+s1 (_FinalPass dither texture precedent) |
+| 4 | Process: 4 ML steps + LUT binding for the chroma pass; copy-mode covers all 4 | DX11VideoProcessor.cpp | GetPostScaleSteps +3→+4 |
+| 5 | Settings: `fMLHunt`, `fMLChromaNeutral/Fire/Knee/SkinProtect` (+ defaults matching mpv) + registry + dialog row(s) + live-apply + stats line | IVideoRenderer.h, VideoRenderer.cpp, MpcVideoRenderer.rc, resource.h, PropPage | AUTO keeps the mpv defaults; manual boxes override |
+| 6 | Validation: Python cross-check of LUT sampling mapping; visual A/B on skin vs fire content; debug log MLPASS→4 draws | ml_test harness + manual | target ≤1 LSB on LUT lookup |
+
+### Interplay notes
+- Chroma runs in the same γ2.2 space after gamma — additive to DV too (skin guard still protects under DoVi).
+- `l1max` feeds both hunt brightness term (Auto) and `SetMLParams` guard; Manual uses 0.5 default (unchanged).
+- Effort ≈ 600–700 lines + one asset file.

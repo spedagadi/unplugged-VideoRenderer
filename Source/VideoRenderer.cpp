@@ -73,6 +73,8 @@
 #define OPT_MLGamma                        L"MLGamma"
 #define OPT_MLShadow                       L"MLShadow"
 #define OPT_MLHighlight                    L"MLHighlight"
+#define OPT_MLDebugCopy                    L"MLDebugPassthrough" // legacy registry name
+#define OPT_MLDebugLog                     L"MLDebugLog"
 
 static std::atomic_int g_nInstance = 0;
 static const wchar_t g_szClassName[] = L"VRWindow";
@@ -300,6 +302,12 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLHighlight, str, &nChars)) {
 				m_Sets.fMLHighlight = discard<float>((float)_wtof(str), 0.0f, -0.3f, 0.4f);
 			}
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLDebugCopy, dw)) {
+			m_Sets.bMLDebugCopy = !!dw;
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLDebugLog, dw)) {
+			m_Sets.bMLDebugLog = !!dw;
 		}
 	}
 
@@ -1282,6 +1290,15 @@ STDMETHODIMP_(void) CMpcVideoRenderer::GetSettings(Settings_t& setings)
 	setings = m_Sets;
 }
 
+STDMETHODIMP_(void) CMpcVideoRenderer::GetMLStats(std::wstring& str)
+{
+	if (m_VideoProcessor) {
+		m_VideoProcessor->GetMLStats(str);
+	} else {
+		str.clear();
+	}
+}
+
 STDMETHODIMP_(void) CMpcVideoRenderer::SetSettings(const Settings_t& setings)
 {
 	CAutoLock cRendererLock(&m_RendererLock);
@@ -1343,6 +1360,8 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 		key.SetStringValue(OPT_MLGamma,            std::to_wstring(m_Sets.fMLGamma).c_str());
 		key.SetStringValue(OPT_MLShadow,           std::to_wstring(m_Sets.fMLShadow).c_str());
 		key.SetStringValue(OPT_MLHighlight,        std::to_wstring(m_Sets.fMLHighlight).c_str());
+		key.SetDWORDValue(OPT_MLDebugCopy,         m_Sets.bMLDebugCopy);
+		key.SetDWORDValue(OPT_MLDebugLog,          m_Sets.bMLDebugLog);
 	}
 
 	return S_OK;
