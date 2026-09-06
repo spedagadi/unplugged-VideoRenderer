@@ -424,6 +424,11 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_fMLChromaFire         = config.fMLChromaFire;
 	m_fMLChromaKnee         = config.fMLChromaKnee;
 	m_fMLChromaSkinProtect  = config.fMLChromaSkinProtect;
+	m_bMLCREnabled          = config.bMLCREnabled;
+	m_fMLCRStrength         = config.fMLCRStrength;
+	m_bMLRadiEnabled        = config.bMLRadiEnabled;
+	m_fMLRadiKnee           = config.fMLRadiKnee;
+	m_fMLRadiStrength       = config.fMLRadiStrength;
 
 	m_nCurrentAdapter = -1;
 
@@ -740,6 +745,8 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_pPSMLShadow.Release();
 	m_pPSMLHighlight.Release();
 	m_pPSMLChroma.Release();
+	m_pPSMLCR.Release();
+	m_pPSMLRadi.Release();
 	m_SkinLUT.Release();
 	m_SkinLUTSRV.Release();
 	m_pSamplerSkin.Release();
@@ -828,6 +835,12 @@ UINT CDX11VideoProcessor::GetPostScaleSteps()
 	}
 	if (m_bMLActive && m_pPSMLChroma) {
 		nSteps++; // chroma vector tuning (skin-guarded)
+	}
+	if (m_bMLActive && m_pPSMLCR) {
+		nSteps++; // Construct CR
+	}
+	if (m_bMLActive && m_pPSMLRadi) {
+		nSteps++; // Resonance
 	}
 	if (m_pPSHalfOUtoInterlace) {
 		nSteps++;
@@ -1038,7 +1051,11 @@ void CDX11VideoProcessor::UpdateMLActive()
 	// AUTO activates once the gamma model is loaded and features are produced.
 	InitMLDebug();
 
-	if (m_iMLMode == ML_Auto && !m_bMLModelLoadTried) {
+	// Preload all ML models once, whenever ML is enabled — regardless of mode,
+	// active state, or whether the models are currently used. Never load or
+	// unload during playback (avoid playback hiccups); the full set stays
+	// resident for the processor's lifetime.
+	if (m_bML && !m_bMLModelLoadTried) {
 		m_bMLModelLoadTried = true;
 		m_bMLGammaModelLoaded     = m_MLGammaModel.Load(GetMLModelPath(L"xgb_gamma_model.plxgb").c_str());
 		m_bMLShadowModelLoaded    = m_MLShadowModel.Load(GetMLModelPath(L"xgb_shadow_recovery.plxgb").c_str());
@@ -1049,15 +1066,9 @@ void CDX11VideoProcessor::UpdateMLActive()
 			(m_bMLHighlightModelLoaded ? L"ok" : L"missing"));
 	}
 
-	const bool bAutoReady = (m_iMLMode == ML_Auto) && m_bMLGammaModelLoaded;
-	const bool bActive = m_bML && SourceIsHDR() && (m_iMLMode == ML_Manual || bAutoReady);
-
-	if (bActive == m_bMLActive) {
-		return;
-	}
-	m_bMLActive = bActive;
-
-	if (m_bMLActive) {
+	// Preload the full ML compute set (shaders, textures, skin LUT, params)
+	// once, independent of the active flag.
+	if (m_bML && !m_bMLResourcesReady) {
 		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLGamma, IDF_PS_11_ML_GAMMA));
 		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLShadow, IDF_PS_11_ML_SHADOW));
 		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLHighlight, IDF_PS_11_ML_HIGHLIGHT));
@@ -1065,15 +1076,11 @@ void CDX11VideoProcessor::UpdateMLActive()
 		// chroma pass exists only when the trained skin LUT is available
 		if (SUCCEEDED(LoadSkinLUT())) {
 			EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLChroma, IDF_PS_11_ML_CHROMA));
+			EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLCR, IDF_PS_11_ML_CR));
+			EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLRadi, IDF_PS_11_ML_RADIANCE));
 		} else {
 			DLog(L"CDX11VideoProcessor::UpdateMLActive() skin LUT missing; chroma tuning disabled");
 		}
-		m_lastMLParams = {};
-		m_bMLFeaturesReady = false;
-		m_bMLFeaturesStale = false;
-		m_bMLConvertSeen = false;
-		m_MLIIRGamma = 1.0f;
-		m_MLPrevL1Max = -1.0f;
 		CreateMLTextures();
 		if (!m_pMLParams) {
 			D3D11_BUFFER_DESC BufferDesc = {
@@ -1084,22 +1091,26 @@ void CDX11VideoProcessor::UpdateMLActive()
 			HRESULT result = m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pMLParams);
 			EXECUTE_ASSERT(S_OK == result);
 		}
-		DLogIf(m_bMLActive, L"CDX11VideoProcessor::UpdateMLActive() ML grade active (mode {})", m_iMLMode);
-	} else {
-		m_pPSMLGamma.Release();
-		m_pPSMLShadow.Release();
-		m_pPSMLHighlight.Release();
-		m_pPSMLChroma.Release();
-		m_SkinLUT.Release();
-		m_SkinLUTSRV.Release();
-		m_pSamplerSkin.Release();
-		m_pPSMLDownsample.Release();
-		m_MLDownsample.Release();
-		m_MLStaging.Release();
-		m_pMLParams.Release();
-		m_lastMLParams = {};
-		m_bMLFeaturesReady = false;
+		m_bMLResourcesReady = true;
 	}
+
+	const bool bAutoReady = (m_iMLMode == ML_Auto) && m_bMLGammaModelLoaded;
+	const bool bActive = m_bML && SourceIsHDR() && (m_iMLMode == ML_Manual || bAutoReady);
+
+	// Only the ACTIVE flag toggles; the preloaded resources persist.
+	if (bActive == m_bMLActive) {
+		return;
+	}
+	m_bMLActive = bActive;
+
+	// Transition: reset per-activation state, not resources.
+	m_lastMLParams = {};
+	m_bMLFeaturesReady = false;
+	m_bMLFeaturesStale = false;
+	m_bMLConvertSeen = false;
+	m_MLIIRGamma = 1.0f;
+	m_MLPrevL1Max = -1.0f;
+	DLogIf(m_bMLActive, L"CDX11VideoProcessor::UpdateMLActive() ML grade active (mode {})", m_iMLMode);
 	UpdatePostScaleTexures();
 }
 
@@ -1119,7 +1130,9 @@ void CDX11VideoProcessor::SetMLParams()
 		// Model inference on the (previous frame's) feature vector,
 		// IIR-smoothed with scene-cut reset on the l1 peak.
 		float pred = 1.0f;
-		if (m_MLGammaModel.Predict(m_MLFeatures, ML_FEATURE_DIM, pred)) {
+		m_bMLGammaPredictOk = (m_bMLToneCurveEnabled && m_bMLGammaEnabled)
+			&& m_MLGammaModel.Predict(m_MLFeatures, ML_FEATURE_DIM, pred);
+		if (m_bMLGammaPredictOk) {
 			// widenable band; the model's trained range is 0.5..1.5
 			pred = discard<float>(pred, 1.0f, 0.7f, 1.3f);
 
@@ -1156,7 +1169,39 @@ void CDX11VideoProcessor::SetMLParams()
 
 	const float hunt = m_bMLHuntEnabled
 		? discard<float>(m_fMLHunt, 0.80f, 0.0f, 1.0f) : 0.0f;
-	const bool bChromaActive = m_bMLChromaEnabled && !m_bHdrPreferDoVi; // user decision: defer DoVi
+	// all Zion features apply regardless of DoVi/HDR10 source (user decision)
+	const bool bChromaActive = m_bMLChromaEnabled;
+
+	// Construct CR (log-space unsharp): AUTO strength from the gamma prediction,
+	// manual override otherwise; DoVi-gated for now (like chroma).
+	const bool bCREn = m_bMLCREnabled;
+	float crStr = 0.0f;
+	if (bCREn) {
+		if (m_iMLMode == ML_Auto && m_bMLFeaturesReady) {
+			const float base = fmaxf(0.10f, fminf(0.50f, 0.25f + (1.20f - gamma) * 0.15f));
+			const float tap  = 1.0f - fmaxf(0.0f, (l1max - 0.7f) / 0.3f) * 0.8f;
+			crStr = base * tap;
+		} else {
+			crStr = discard<float>(m_fMLCRStrength, 0.30f, 0.0f, 0.5f);
+		}
+	}
+
+	// Resonance (radiance lift): AUTO from the scene average/peak features.
+	const bool bRadiE = m_bMLRadiEnabled;
+	float radiKnee = 0.60f, radiStr = 0.0f;
+	if (bRadiE) {
+		if (m_iMLMode == ML_Auto && m_bMLFeaturesReady) {
+			const float avg = fmaxf(0.05f, fminf(0.40f, m_MLFeatures[1]));
+			radiKnee = 0.34f + avg;                               // lower knee: wider lift band
+			radiStr = fmaxf(0.20f, 0.85f * (1.0f - 1.3f * avg));  // punchier mid-highlight lift
+			const float peak_damp = fmaxf(0.0f, 1.0f - fmaxf(0.0f, (l1max - 0.5f) / 0.5f) * 0.5f);
+			radiStr *= peak_damp;
+		} else {
+			radiKnee = discard<float>(m_fMLRadiKnee, 0.60f, 0.40f, 0.90f);
+			radiStr  = discard<float>(m_fMLRadiStrength, 0.30f, 0.0f, 0.60f);
+		}
+	}
+	const float radiShoulder = fminf(0.97f, radiKnee + 0.30f);
 
 	const MLParams_t params = {
 		gamma,
@@ -1184,7 +1229,13 @@ void CDX11VideoProcessor::SetMLParams()
 		m_fSkinLUTCR0, m_fSkinLUTCR1, m_fSkinLUTCB0, m_fSkinLUTCB1,
 		bChromaActive ? 1.0f : 0.0f,
 		m_bMLHuntEnabled ? 1.0f : 0.0f,
-		0.0f, 0.0f
+		// Phase 1c — Construct CR + Resonance (DoVi-gated like chroma)
+		crStr,
+		bCREn ? 1.0f : 0.0f,
+		radiKnee,
+		radiStr,
+		radiShoulder,
+		bRadiE ? 1.0f : 0.0f
 	};
 
 	m_lastMLParams = params;
@@ -1258,16 +1309,24 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 	str = std::format(
 		L"mode: {}   domain: {}   active: {}\n"
 		L"gamma={:.4f}   shadow={:.3f}   highlight={:.3f}\n"
+		L"gates: tone={} gammaEnable={} gammaModel={} features={} gammaPredict={}\n"
 		L"scene: peak={:.4f} avg={:.4f}   pred={:.4f}   feat={}\n"
-		L"hunt={:.3f}{}   chroma={:.2f}/{:.2f} knee={:.2f} skin={:.2f}{}",
+		L"hunt={:.3f}{}   chroma={:.2f}/{:.2f} knee={:.2f} skin={:.2f}{}\n"
+		L"cr={:.3f}{}   radiance={:.3f}@{:.2f}{}",
 		mode, domain, (m_bMLActive ? L"yes" : L"no"),
 		m_lastMLParams.MLGamma, m_lastMLParams.MLShadowToe, m_lastMLParams.MLHighlightRolloff,
+		(m_bMLToneCurveEnabled ? L"1" : L"0"), (m_bMLGammaEnabled ? L"1" : L"0"),
+		(m_bMLGammaModelLoaded ? L"ok" : L"no"), (m_bMLFeaturesReady ? L"ready" : L"n/a"),
+		(m_bMLGammaPredictOk ? L"ok" : L"FAIL"),
 		m_MLFeatures[0], m_MLFeatures[1], m_lastMLParams.MLGamma,
 		(m_bMLFeaturesReady ? L"ready" : L"n/a"),
 		m_lastMLParams.MLHunt, (m_lastMLParams.MLHuntGate > 0.5f ? L"" : L"(off)"),
 		m_lastMLParams.MLChromaNeutral, m_lastMLParams.MLChromaFire,
 		m_lastMLParams.MLChromaKnee, m_lastMLParams.MLChromaSkinProtect,
-		(m_lastMLParams.MLChromaGate > 0.5f ? L"" : L"(off)"));
+		(m_lastMLParams.MLChromaGate > 0.5f ? L"" : L"(off)"),
+		m_lastMLParams.MLCRStrength, (m_lastMLParams.MLCRGate > 0.5f ? L"" : L"(off)"),
+		m_lastMLParams.MLRadiStrength, m_lastMLParams.MLRadiKnee,
+		(m_lastMLParams.MLRadiGate > 0.5f ? L"" : L"(off)"));
 }
 
 HRESULT CDX11VideoProcessor::LoadSkinLUT()
@@ -3159,7 +3218,9 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 	// Feature extraction also lives here (NOT inside the swap-chain4/HDR
 	// metadata block): playback can render through a path where that block is
 	// bypassed, which silently stalled AUTO mode for a whole session.
-	if (m_bMLActive && m_pPSMLGamma && m_pPSMLDownsample) {
+	// Feature extraction runs while ML is armed — active OR auto-pending — so the
+// AUTO path warms from the preloaded pipeline instead of waiting on activation.
+	if (m_pPSMLGamma && m_pPSMLDownsample && (m_bMLActive || (m_bML && m_iMLMode == ML_Auto))) {
 		m_MLDebugStale = m_bMLFeaturesStale ? 1 : 0;
 		m_MLDebugConvertSeen = m_bMLConvertSeen ? 1 : 0;
 		m_MLDebugTexConv = m_TexConvertOutput.pTexture ? 1 : 0;
@@ -3948,7 +4009,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			ID3D11PixelShader* psHighlight = m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLHighlight.p;
 			ID3D11PixelShader* psGamma     = m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLGamma.p;
 
-			HRESULT hrs[3] = {};
+			HRESULT hrs[6] = {};
 			if (m_bMLDebug && m_pMLDebugFile) {
 				fwprintf(m_pMLDebugFile, L"MLPASS enter step=%u\n", (unsigned)(step + 1));
 			}
@@ -3960,18 +4021,35 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			StepSetting();
 			hrs[2] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psGamma, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 
+			// 4. Construct CR (after gamma, before chroma) — grain-free
+			hrs[3] = S_OK;
+			if (m_pPSMLCR) {
+				StepSetting();
+				hrs[3] = TextureCopyRect(*pInputTexture, pRT, rect, rect,
+					m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLCR.p,
+					m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
+			}
+			// 5. Resonance (radiance lift)
+			hrs[4] = S_OK;
+			if (m_pPSMLRadi) {
+				StepSetting();
+				hrs[4] = TextureCopyRect(*pInputTexture, pRT, rect, rect,
+					m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLRadi.p,
+					m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
+			}
+
 			// log luma stats of the gamma-step INPUT (pre-grade content) every 8th frame
 			if (m_bMLDebug && m_bMLDebugCopy == false && m_MLDebugFrame % 8 == 0) {
 				LogMLFrameStats(*pInputTexture, L"IN");
 			}
 
 			// 4. chroma vector tuning (skin-guarded) — LUT on t1 + s1 like FinalPass
-			hrs[3] = S_OK;
+			hrs[5] = S_OK;
 			if (m_pPSMLChroma && m_SkinLUTSRV) {
 				StepSetting();
 				m_pDeviceContext->PSSetShaderResources(1, 1, &m_SkinLUTSRV.p);
 				m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerSkin.p);
-				hrs[3] = TextureCopyRect(*pInputTexture, pRT, rect, rect,
+				hrs[5] = TextureCopyRect(*pInputTexture, pRT, rect, rect,
 					m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLChroma.p,
 					m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 				ID3D11ShaderResourceView* nullSRVs[1] = {};
@@ -3979,12 +4057,14 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			}
 
 			if (m_bMLDebug && m_pMLDebugFile) {
-				fwprintf(m_pMLDebugFile, L"MLPASS draws %s %s %s %s (hr=%x,%x,%x,%x)\n",
+				fwprintf(m_pMLDebugFile, L"MLPASS draws %s %s %s %s %s %s (hr=%x,%x,%x,%x,%x,%x)\n",
 					m_bMLDebugCopy ? L"copy" : L"shadow",
 					m_bMLDebugCopy ? L"copy" : L"highlight",
 					m_bMLDebugCopy ? L"copy" : L"gamma",
+					(m_pPSMLCR ? (m_bMLDebugCopy ? L"copy" : L"cr") : L"none"),
+					(m_pPSMLRadi ? (m_bMLDebugCopy ? L"copy" : L"radiance") : L"none"),
 					(m_pPSMLChroma ? (m_bMLDebugCopy ? L"copy" : L"chroma") : L"none"),
-					(unsigned)hrs[0], (unsigned)hrs[1], (unsigned)hrs[2], (unsigned)hrs[3]);
+					(unsigned)hrs[0], (unsigned)hrs[1], (unsigned)hrs[2], (unsigned)hrs[3], (unsigned)hrs[4], (unsigned)hrs[5]);
 				fflush(m_pMLDebugFile);
 			}
 		}
@@ -4601,7 +4681,10 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			config.bMLChromaKneeEnabled != m_bMLChromaKneeEnabled ||
 			config.fMLChromaKnee != m_fMLChromaKnee ||
 			config.bMLChromaSkinEnabled != m_bMLChromaSkinEnabled ||
-			config.fMLChromaSkinProtect != m_fMLChromaSkinProtect) {
+			config.fMLChromaSkinProtect != m_fMLChromaSkinProtect ||
+			config.bMLCREnabled != m_bMLCREnabled || config.fMLCRStrength != m_fMLCRStrength ||
+			config.bMLRadiEnabled != m_bMLRadiEnabled || config.fMLRadiKnee != m_fMLRadiKnee ||
+			config.fMLRadiStrength != m_fMLRadiStrength) {
 		m_bML          = config.bMLEnabled;
 		m_iMLMode      = config.iMLMode;
 		m_fMLGamma     = config.fMLGamma;
@@ -4624,6 +4707,11 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_fMLChromaKnee    = config.fMLChromaKnee;
 		m_bMLChromaSkinEnabled = config.bMLChromaSkinEnabled;
 		m_fMLChromaSkinProtect = config.fMLChromaSkinProtect;
+		m_bMLCREnabled = config.bMLCREnabled;
+		m_fMLCRStrength = config.fMLCRStrength;
+		m_bMLRadiEnabled = config.bMLRadiEnabled;
+		m_fMLRadiKnee = config.fMLRadiKnee;
+		m_fMLRadiStrength = config.fMLRadiStrength;
 		UpdateMLActive();
 	}
 

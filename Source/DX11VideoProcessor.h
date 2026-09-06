@@ -137,10 +137,15 @@ private:
 		float MLSkinLUTCR1;
 		float MLSkinLUTCB0;
 		float MLSkinLUTCB1;
-		float MLChromaGate;        // 1.0 = chroma pass active (enabled && !bHdrPreferDoVi)
+		float MLChromaGate;        // 1.0 = chroma pass active
 		float MLHuntGate;          // 1.0 = hunt active
-		float MLPad1;
-		float MLPad2;
+		// Phase 1c — Construct CR (log-space unsharp) + Resonance (radiance lift)
+		float MLCRStrength;        // [0, 0.5], 0 = off
+		float MLCRGate;            // 1.0 = CR active
+		float MLRadiKnee;
+		float MLRadiStrength;      // [0, 0.6]
+		float MLRadiShoulder;
+		float MLRadiGate;          // 1.0 = Resonance active
 	};
 	MLParams_t m_lastMLParams = {};
 	CComPtr<ID3D11Buffer> m_pMLParams;
@@ -148,6 +153,8 @@ private:
 	CComPtr<ID3D11PixelShader> m_pPSMLShadow;
 	CComPtr<ID3D11PixelShader> m_pPSMLHighlight;
 	CComPtr<ID3D11PixelShader> m_pPSMLChroma;
+	CComPtr<ID3D11PixelShader> m_pPSMLCR;
+	CComPtr<ID3D11PixelShader> m_pPSMLRadi;
 
 	// Zion ML feature extraction (Phase 1: AUTO gamma)
 	CComPtr<ID3D11Texture2D> m_MLDownsample;   // 256x144 R16_UNORM luma cache
@@ -178,6 +185,11 @@ private:
 	float m_fMLChromaKnee = 0.55f;
 	bool  m_bMLChromaSkinEnabled = true;
 	float m_fMLChromaSkinProtect = 0.95f;
+	bool  m_bMLCREnabled = false;  // Construct CR
+	float m_fMLCRStrength = 0.30f;
+	bool  m_bMLRadiEnabled = false; // Resonance
+	float m_fMLRadiKnee = 0.60f;
+	float m_fMLRadiStrength = 0.30f;
 	float m_fSkinLUTCR0 = -0.2009f, m_fSkinLUTCR1 = 0.3295f;
 	float m_fSkinLUTCB0 = -0.2494f, m_fSkinLUTCB1 = 0.1967f;
 	CComPtr<ID3D11Texture2D> m_SkinLUT;
@@ -187,6 +199,7 @@ private:
 
 	int m_MLDebugWinW = 0, m_MLDebugWinH = 0;
 	int m_MLDebugFeatReady = 0;
+	bool m_bMLGammaPredictOk = false;   // last auto-frame gamma Predict() result
 	int m_MLDebugStale = 0, m_MLDebugConvertSeen = 0, m_MLDebugTexConv = 0;
 	float m_MLDebugFeat0 = 0.0f, m_MLDebugFeat1 = 0.0f;
 	float m_MLDebugPred = 0.0f;
@@ -195,6 +208,7 @@ private:
 	bool m_bMLFeaturesStale = false;
 	bool m_bMLConvertSeen = false; // a previous frame's convert output exists
 	bool m_bMLModelLoadTried = false;
+	bool m_bMLResourcesReady = false;   // full ML compute set preloaded (no runtime load/unload)
 	bool m_bMLGammaModelLoaded = false;
 	bool m_bMLShadowModelLoaded = false;
 	bool m_bMLHighlightModelLoaded = false;
