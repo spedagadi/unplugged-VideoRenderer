@@ -1133,8 +1133,12 @@ void CDX11VideoProcessor::SetMLParams()
 		m_bMLGammaPredictOk = (m_bMLToneCurveEnabled && m_bMLGammaEnabled)
 			&& m_MLGammaModel.Predict(m_MLFeatures, ML_FEATURE_DIM, pred);
 		if (m_bMLGammaPredictOk) {
-			// widenable band; the model's trained range is 0.5..1.5
-			pred = discard<float>(pred, 1.0f, 0.7f, 1.3f);
+			// Clamp to the model's trained range (0.5..1.5). Do NOT use
+			// discard(): an out-of-band prediction would be replaced with the
+			// neutral 1.0 and gamma would appear dead while shadow/highlight
+			// keep moving (HTPC repro).
+			m_MLGammaRawPred = pred;
+			pred = fminf(1.5f, fmaxf(0.5f, pred));
 
 			const float l1now = m_MLFeatures[0];
 			if (m_MLPrevL1Max < 0.0f || fabsf(l1now - m_MLPrevL1Max) > 0.15f) {
@@ -1310,7 +1314,7 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		L"mode: {}   domain: {}   active: {}\n"
 		L"gamma={:.4f}   shadow={:.3f}   highlight={:.3f}\n"
 		L"gates: tone={} gammaEnable={} gammaModel={} features={} gammaPredict={}\n"
-		L"scene: peak={:.4f} avg={:.4f}   pred={:.4f}   feat={}\n"
+		L"scene: peak={:.4f} avg={:.4f}   pred={:.4f} raw={:.4f}   feat={}\n"
 		L"hunt={:.3f}{}   chroma={:.2f}/{:.2f} knee={:.2f} skin={:.2f}{}\n"
 		L"cr={:.3f}{}   radiance={:.3f}@{:.2f}{}",
 		mode, domain, (m_bMLActive ? L"yes" : L"no"),
@@ -1318,7 +1322,7 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		(m_bMLToneCurveEnabled ? L"1" : L"0"), (m_bMLGammaEnabled ? L"1" : L"0"),
 		(m_bMLGammaModelLoaded ? L"ok" : L"no"), (m_bMLFeaturesReady ? L"ready" : L"n/a"),
 		(m_bMLGammaPredictOk ? L"ok" : L"FAIL"),
-		m_MLFeatures[0], m_MLFeatures[1], m_lastMLParams.MLGamma,
+		m_MLFeatures[0], m_MLFeatures[1], m_lastMLParams.MLGamma, m_MLGammaRawPred,
 		(m_bMLFeaturesReady ? L"ready" : L"n/a"),
 		m_lastMLParams.MLHunt, (m_lastMLParams.MLHuntGate > 0.5f ? L"" : L"(off)"),
 		m_lastMLParams.MLChromaNeutral, m_lastMLParams.MLChromaFire,

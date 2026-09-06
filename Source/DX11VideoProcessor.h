@@ -200,6 +200,7 @@ private:
 	int m_MLDebugWinW = 0, m_MLDebugWinH = 0;
 	int m_MLDebugFeatReady = 0;
 	bool m_bMLGammaPredictOk = false;   // last auto-frame gamma Predict() result
+	float m_MLGammaRawPred = 1.0f;      // raw model output before range clamping
 	int m_MLDebugStale = 0, m_MLDebugConvertSeen = 0, m_MLDebugTexConv = 0;
 	float m_MLDebugFeat0 = 0.0f, m_MLDebugFeat1 = 0.0f;
 	float m_MLDebugPred = 0.0f;
