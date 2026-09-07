@@ -6,6 +6,7 @@
 #define IDD_INFOPROPPAGE                103
 #define IDS_MAINPROPPAGE_TITLE          104
 #define IDS_INFOPROPPAGE_TITLE          105
+#define IDI_MPCVR_TRAY                  106
 #define IDF_DITHER_32X32_FLOAT16        401
 #define IDF_SKIN_LUT                    402
 #define IDF_HLSL_ST2084                 501
@@ -92,6 +93,8 @@
 #define IDF_PS_11_ML_HIGHLIGHT          885
 #define IDF_PS_11_ML_DOWNSAMPLE         886
 #define IDF_PS_11_ML_CHROMA             887
+#define IDF_PS_11_ML_CR                 888
+#define IDF_PS_11_ML_RADIANCE           889
 #define IDF_PS_11_TEST                  900
 #define IDC_EDIT1                       1001
 #define IDC_EDIT2                       1002
@@ -181,6 +184,15 @@
 #define IDC_CHECK30                     1105
 #define IDC_CHECK31                     1106
 #define IDC_CHECK32                     1107
+#define IDC_SLIDER11                    1108
+#define IDC_SLIDER12                    1109
+#define IDC_SLIDER13                    1110
+#define IDC_CHECK33                     1111
+#define IDC_CHECK34                     1112
+#define IDC_CHECK35                     1116
+#define IDC_EDIT15                      1113
+#define IDC_EDIT16                      1114
+#define IDC_EDIT17                      1115
 
 // Next default values for new objects
 // 

@@ -82,19 +82,20 @@ static void AppendKrigHelpers(std::string& code)
 	);
 }
 
-// KorrigBilateral body: gathers the 9 neighbours and solves the system, sets colorUV.
-static void AppendKrigBody(std::string& code, bool bBiplanar)
+// KrigBilateral body: gathers the 9 neighbours and solves the system, sets colorUV.
+// cellX/cellY = luma texels covered by one chroma texel (2,2 for 4:2:0, 2,1 for 4:2:2).
+static void AppendKrigBody(std::string& code, bool bBiplanar, int cellX, int cellY)
 {
-	code.append(
+	code += std::format(
 		"{{\n"
-		"const float2 chromaSize = wh * 0.5;\n"
+		"const float2 chromaSize = wh / float2({}, {});\n"
 		"const float2 cidx = input.Tex * chromaSize;\n"
 		"const int2 bi = int2(round(cidx));\n"
 		"const float2 offset = cidx - float2(bi);\n"
 		"const float2 baseUV = (float2(bi) + 0.5) / chromaSize;\n"
-		"const float2 yBaseUV = (float2(bi * int2(2, 2)) + 0.5) / wh;\n"
-		"float coords0[9], coords1[9], X0[9], X1[9], X2[9], X3[9];\n"
-	);
+		"const float2 yBaseUV = (float2(bi) * float2({}, {}) + 0.5) / wh;\n"
+		"float coords0[9], coords1[9], X0[9], X1[9], X2[9], X3[9];\n",
+		cellX, cellY, cellX, cellY);
 
 	static const int kKx[9] = { -1,-1,-1, 0, 0, 1, 1, 1, 0 };
 	static const int kKy[9] = { -1, 0, 1,-1, 1,-1, 0, 1, 0 };
@@ -107,20 +108,25 @@ static void AppendKrigBody(std::string& code, bool bBiplanar)
 		} else {
 			uvSnippet = std::format("float2 uv = float2(texU.Sample(samp, baseUV, int2({}, {})).r, texV.Sample(samp, baseUV, int2({}, {})).r);", cx, cy, cx, cy);
 		}
+		// Y cell taps: cellX*cellY texels starting at (cellX*cx, cellY*cy)
+		code += std::format("{{\nconst int cx = {}; const int cy = {};\n", cx, cy);
+		std::string ySum, ySq;
+		for (int dy = 0; dy < cellY; dy++) {
+			for (int dx = 0; dx < cellX; dx++) {
+				code += std::format("float y{}{} = texY.Sample(samp, yBaseUV, int2({}*cx + {}, {}*cy + {})).r;\n",
+					dx, dy, cellX, dx, cellY, dy);
+				ySum += std::format(" + y{}{}", dx, dy);
+				ySq  += std::format(" + y{}{}*y{}{}", dx, dy, dx, dy);
+			}
+		}
 		code += std::format(
-			"{{\n"
-			"const int cx = {}; const int cy = {};\n"
-			"float y00 = texY.Sample(samp, yBaseUV, int2(2*cx + 0, 2*cy + 0)).r;\n"
-			"float y10 = texY.Sample(samp, yBaseUV, int2(2*cx + 1, 2*cy + 0)).r;\n"
-			"float y01 = texY.Sample(samp, yBaseUV, int2(2*cx + 0, 2*cy + 1)).r;\n"
-			"float y11 = texY.Sample(samp, yBaseUV, int2(2*cx + 1, 2*cy + 1)).r;\n"
-			"float yMean = (y00 + y10 + y01 + y11) * 0.25;\n"
-			"float yVar  = max((y00*y00 + y10*y10 + y01*y01 + y11*y11) * 0.25 - yMean*yMean, 0.0);\n"
+			"float yMean = ({}) / {};\n"
+			"float yVar = max(({}) / {} - yMean*yMean, 0.0);\n"
 			"{}\n"
 			"coords0[{}] = cx; coords1[{}] = cy;\n"
 			"X0[{}] = yMean; X1[{}] = yVar; X2[{}] = uv.x; X3[{}] = uv.y;\n"
 			"}}\n",
-			cx, cy,
+			ySum, cellX * cellY, ySq, cellX * cellY,
 			uvSnippet, k, k, k, k, k, k);
 	}
 
@@ -383,9 +389,12 @@ void ShaderGetPixels(
 				code.append(code_Bicubic_UV);
 			}
 			else if (chromaScaling == CHROMA_Krig && bDX11 && fmtParams.Subsampling == 420) {
-				AppendKrigBody(code, true); // KrigBilateral inline (biplanar UV)
+				AppendKrigBody(code, true, 2, 2); // KrigBilateral inline (biplanar UV)
 			}
-			else if (chromaScaling == CHROMA_CatmullRom && fmtParams.Subsampling == 422) {
+			else if (chromaScaling == CHROMA_Krig && bDX11 && fmtParams.Subsampling == 422) {
+				AppendKrigBody(code, true, 2, 1); // 4:2:2: chroma is half-w x full-h
+			}
+			else if ((chromaScaling == CHROMA_CatmullRom || (chromaScaling == CHROMA_Krig && !bDX11)) && fmtParams.Subsampling == 422) {
 				code.append(
 					"if (fmod(input.Tex.x*w, 2) < 1.0) {\n"
 						"colorUV = texUV.Sample(samp, input.Tex).rg;\n"
@@ -434,9 +443,12 @@ void ShaderGetPixels(
 				code.append(code_Bicubic_UV);
 			}
 			else if (chromaScaling == CHROMA_Krig && bDX11 && fmtParams.Subsampling == 420) {
-				AppendKrigBody(code, false); // KrigBilateral inline (planar U/V)
+				AppendKrigBody(code, false, 2, 2); // KrigBilateral inline (planar U/V)
 			}
-			else if (chromaScaling == CHROMA_CatmullRom && fmtParams.Subsampling == 422) {
+			else if (chromaScaling == CHROMA_Krig && bDX11 && fmtParams.Subsampling == 422) {
+				AppendKrigBody(code, false, 2, 1); // 4:2:2 planar
+			}
+			else if ((chromaScaling == CHROMA_CatmullRom || (chromaScaling == CHROMA_Krig && !bDX11)) && fmtParams.Subsampling == 422) {
 				code.append(
 					"if (fmod(input.Tex.x*w, 2) < 1.0) {\n"
 						"colorUV[0] = texU.Sample(samp, input.Tex).r;\n"

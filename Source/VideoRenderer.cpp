@@ -23,6 +23,8 @@
 #include <optional>
 #include <evr.h> // for MR_VIDEO_ACCELERATION_SERVICE, because the <mfapi.h> does not contain it
 #include <Mferror.h>
+#include <shellapi.h> // Shell_NotifyIcon
+#include "resource.h" // IDI_MPCVR_TRAY
 #include "Helper.h"
 #include "PropPage.h"
 #include "VideoRendererInputPin.h"
@@ -32,10 +34,13 @@
 #include "SubPic/XySubPicQueueImpl.h"
 
 #define WM_SWITCH_FULLSCREEN (WM_APP + 0x1000)
+#define WM_MPCVR_TRAY_MSG     (WM_APP + 0x1001)
+#define MPCVR_TRAY_ICON_ID    0x51
 
 #define OPT_REGKEY_VIDEORENDERER           L"Software\\MPC-BE Filters\\MPC Video Renderer"
 #define OPT_UseD3D11                       L"UseD3D11"
 #define OPT_ShowStatistics                 L"ShowStatistics"
+#define OPT_TrayIcon                       L"TrayIcon"
 #define OPT_ResizeStatistics               L"ResizeStatistics"
 #define OPT_TextureFormat                  L"TextureFormat"
 #define OPT_VPEnableNV12                   L"VPEnableNV12"
@@ -90,9 +95,24 @@
 #define OPT_MLChromaFireEnabled            L"MLChromaFireEnabled"
 #define OPT_MLChromaKneeEnabled            L"MLChromaKneeEnabled"
 #define OPT_MLChromaSkinEnabled            L"MLChromaSkinEnabled"
+#define OPT_MLCREnabled                    L"MLCREnabled"
+#define OPT_MLCRStrength                   L"MLCRStrength"
+#define OPT_MLRadiEnabled                  L"MLRadiEnabled"
+#define OPT_MLRadiKnee                     L"MLRadiKnee"
+#define OPT_MLRadiStrength                 L"MLRadiStrength"
 
 static std::atomic_int g_nInstance = 0;
 static const wchar_t g_szClassName[] = L"VRWindow";
+
+// Tray diagnostic trace (always active, temp-only — remove after debugging)
+static void TrayTrace(const wchar_t* msg, HRESULT hr = S_OK)
+{
+	FILE* f = nullptr;
+	if (_wfopen_s(&f, L"C:\\Users\\Public\\mpcvr_tray.log", L"a, ccs=UTF-8") == 0 && f) {
+		fwprintf(f, L"%s hr=0x%08X\n", msg, hr);
+		fclose(f);
+	}
+}
 
 LPCWSTR g_pszOldParentWndProc = L"OldParentWndProc";
 LPCWSTR g_pszThis = L"This";
@@ -189,6 +209,9 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_ShowStatistics, dw)) {
 			m_Sets.bShowStats = !!dw;
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_TrayIcon, dw)) {
+			m_Sets.bTrayIcon = !!dw;
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_ResizeStatistics, dw)) {
 			m_Sets.iResizeStats = discard<int>(dw, 0, 0, 1);
@@ -338,6 +361,8 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLChromaFireEnabled, dw)) m_Sets.bMLChromaFireEnabled = !!dw;
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLChromaKneeEnabled, dw)) m_Sets.bMLChromaKneeEnabled = !!dw;
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLChromaSkinEnabled, dw)) m_Sets.bMLChromaSkinEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLCREnabled, dw)) m_Sets.bMLCREnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLRadiEnabled, dw)) m_Sets.bMLRadiEnabled = !!dw;
 		{
 			WCHAR str[32];
 			ULONG nChars = _countof(str);
@@ -360,12 +385,23 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLChromaSkinProtect, str, &nChars)) {
 				m_Sets.fMLChromaSkinProtect = discard<float>((float)_wtof(str), 0.95f, 0.5f, 1.0f);
 			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLCRStrength, str, &nChars)) m_Sets.fMLCRStrength = discard<float>((float)_wtof(str), 0.30f, 0.0f, 0.5f);
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLRadiKnee, str, &nChars)) m_Sets.fMLRadiKnee = discard<float>((float)_wtof(str), 0.60f, 0.40f, 0.90f);
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLRadiStrength, str, &nChars)) m_Sets.fMLRadiStrength = discard<float>((float)_wtof(str), 0.30f, 0.0f, 0.60f);
 		}
 	}
 
 	if (!IsWindows10OrGreater()) {
 		m_Sets.bHdrPassthrough = false;
 		m_Sets.iHdrToggleDisplay = HDRTD_Disabled;
+	}
+
+	CreateTrayWindow();
+	if (m_Sets.bTrayIcon) {
+		AddTrayIcon();
 	}
 
 	HRESULT hr = S_FALSE;
@@ -399,6 +435,9 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 CMpcVideoRenderer::~CMpcVideoRenderer()
 {
 	DLog(L"CMpcVideoRenderer::~CMpcVideoRenderer()");
+
+	RemoveTrayIcon();
+	DestroyTrayWindow();
 
 	UnregisterClassW(g_szClassName, g_hInst);
 
@@ -1175,6 +1214,11 @@ HRESULT CMpcVideoRenderer::Init(const bool bCreateWindow/* = false*/)
 		}
 	}
 
+	// Safety net: the icon may have been removed by the shell or a window recreate
+	if (m_Sets.bTrayIcon) {
+		AddTrayIcon();
+	}
+
 	m_hWnd = m_bExclusiveScreen && m_VideoProcessor->Type() == VP_DX9 ? m_hWndParentMain : m_hWndWindow;
 	if (m_bIsD3DFullscreen) {
 		m_hWnd = m_hWndParent;
@@ -1351,15 +1395,206 @@ STDMETHODIMP_(void) CMpcVideoRenderer::GetMLStats(std::wstring& str)
 	}
 }
 
+// Dedicated message-only window class for the tray icon. Anchor the icon here
+// rather than on m_hWndWindow so tray lifetime is not coupled to the video
+// window (which may never be created, or be destroyed/recreated).
+static const wchar_t g_pszTrayClassName[] = L"MPCVR Tray Window";
+static const wchar_t g_pszTrayThis[]   = L"MPCVR Tray This";
+
+static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	if (uMsg == WM_NCCREATE) {
+		const auto pcs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+		const auto pRenderer = static_cast<CMpcVideoRenderer*>(pcs->lpCreateParams);
+		SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pRenderer));
+		return TRUE;
+	}
+
+	if (auto pRenderer = reinterpret_cast<CMpcVideoRenderer*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA))) {
+		return pRenderer->OnTrayMessage(hwnd, uMsg, wParam, lParam);
+	}
+
+	return ::DefWindowProcW(hwnd, uMsg, wParam, lParam);
+}
+
+void CMpcVideoRenderer::CreateTrayWindow()
+{
+	TrayTrace(L"CreateTrayWindow entered");
+	if (m_hTrayWnd) {
+		return;
+	}
+
+	WNDCLASSEXW wc = { sizeof(wc) };
+	if (!GetClassInfoExW(g_hInst, g_pszTrayClassName, &wc)) {
+		wc.lpfnWndProc = TrayWndProc;
+		wc.hInstance = g_hInst;
+		wc.lpszClassName = g_pszTrayClassName;
+		if (!RegisterClassExW(&wc)) {
+			TrayTrace(L"CreateTrayWindow: RegisterClassExW failed", (HRESULT)GetLastError());
+			return;
+		}
+	}
+
+	m_hTrayWnd = CreateWindowExW(
+		0,
+		g_pszTrayClassName,
+		nullptr,
+		0,
+		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+		nullptr,
+		nullptr,
+		g_hInst,
+		this
+	);
+
+	if (!m_hTrayWnd) {
+		TrayTrace(L"CreateTrayWindow: CreateWindowExW failed", (HRESULT)GetLastError());
+	}
+}
+
+void CMpcVideoRenderer::DestroyTrayWindow()
+{
+	if (m_hTrayWnd) {
+		::DestroyWindow(m_hTrayWnd);
+		m_hTrayWnd = nullptr;
+	}
+}
+
+void CMpcVideoRenderer::AddTrayIcon()
+{
+	TrayTrace(L"AddTrayIcon entered");
+	if (m_bTrayIconVisible) {
+		TrayTrace(L"AddTrayIcon already visible");
+		return;
+	}
+	if (!m_hTrayWnd) {
+		TrayTrace(L"AddTrayIcon: m_hTrayWnd is NULL");
+		return;
+	}
+
+	NOTIFYICONDATAW nid = {};
+	nid.cbSize = sizeof(nid);
+	nid.hWnd = m_hTrayWnd;
+	nid.uID = MPCVR_TRAY_ICON_ID;
+	nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+	nid.uCallbackMessage = WM_MPCVR_TRAY_MSG;
+	wcscpy_s(nid.szTip, L"MPC Video Renderer");
+	nid.hIcon = (HICON)::LoadImageW(g_hInst, MAKEINTRESOURCE(IDI_MPCVR_TRAY), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+
+	if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
+		TrayTrace(L"AddTrayIcon: Shell_NotifyIcon NIM_ADD FAILED", (HRESULT)GetLastError());
+		return;
+	}
+
+	TrayTrace(L"AddTrayIcon: NIM_ADD OK");
+	m_bTrayIconVisible = true;
+	// Modern notifications: left-button double-click arrives as WM_LBUTTONDBLCLK on the callback message
+	nid.uVersion = NOTIFYICON_VERSION_4;
+	Shell_NotifyIconW(NIM_SETVERSION, &nid);
+}
+
+void CMpcVideoRenderer::RemoveTrayIcon()
+{
+	TrayTrace(L"RemoveTrayIcon entered");
+	if (!m_bTrayIconVisible) {
+		return;
+	}
+
+	if (m_hTrayWnd) {
+		NOTIFYICONDATAW nid = {};
+		nid.cbSize = sizeof(nid);
+		nid.hWnd = m_hTrayWnd;
+		nid.uID = MPCVR_TRAY_ICON_ID;
+		Shell_NotifyIconW(NIM_DELETE, &nid);
+		TrayTrace(L"RemoveTrayIcon: NIM_DELETE sent");
+	}
+
+	m_bTrayIconVisible = false;
+}
+
+LRESULT CMpcVideoRenderer::OnTrayMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	if (uMsg == WM_MPCVR_TRAY_MSG && wParam == MPCVR_TRAY_ICON_ID) {
+		switch (lParam) {
+			case WM_LBUTTONDBLCLK:
+			case WM_LBUTTONUP:
+			case WM_RBUTTONUP:
+			case WM_CONTEXTMENU:
+				ShowConfigDialog();
+				return 0L;
+		}
+		return 0L;
+	}
+
+	if (uMsg == WM_DESTROY) {
+		// Window is going away (graph teardown); make sure the icon is gone with it.
+		m_bTrayIconVisible = false;
+	}
+
+	return ::DefWindowProcW(hwnd, uMsg, wParam, lParam);
+}
+
+void CMpcVideoRenderer::ShowConfigDialog()
+{
+	// Reuses the same property-frame dialog the players show via Filters->Configure,
+	// but bound to this (live) instance so changes apply to the running graph.
+	TrayTrace(L"ShowConfigDialog entered");
+
+	IUnknown* pFilterUnk = nullptr;
+	if (FAILED(NonDelegatingQueryInterface(IID_IUnknown, (void**)&pFilterUnk)) || !pFilterUnk) {
+		return;
+	}
+
+	ISpecifyPropertyPages* pProp = nullptr;
+	HRESULT hr = pFilterUnk->QueryInterface(IID_ISpecifyPropertyPages, (void**)&pProp);
+	if (SUCCEEDED(hr) && pProp) {
+		CAUUID caGUID;
+		FILTER_INFO fi = {};
+		hr = QueryFilterInfo(&fi); // provides the display name; pGraph is unused/released here
+		if (fi.pGraph) {
+			fi.pGraph->Release();
+			fi.pGraph = nullptr;
+		}
+
+		if (SUCCEEDED(pProp->GetPages(&caGUID))) {
+			OleCreatePropertyFrame(
+				m_hTrayWnd, 0, 0,
+				fi.achName[0] ? fi.achName : L"MPC Video Renderer",
+				1, &pFilterUnk,
+				caGUID.cElems, caGUID.pElems,
+				0,                    // Locale identifier
+				0, nullptr            // Reserved
+			);
+
+			CoTaskMemFree(caGUID.pElems);
+		}
+
+		pProp->Release();
+	}
+
+	pFilterUnk->Release();
+}
+
 STDMETHODIMP_(void) CMpcVideoRenderer::SetSettings(const Settings_t& setings)
 {
 	CAutoLock cRendererLock(&m_RendererLock);
+
+	if (m_Sets.bTrayIcon != setings.bTrayIcon) {
+		if (setings.bTrayIcon) {
+			AddTrayIcon();
+		} else {
+			RemoveTrayIcon();
+		}
+	}
 
 	m_Sets = setings;
 	m_VideoProcessor->Configure(m_Sets);
 
 	if (m_State == State_Paused) {
-		if (!m_bValidBuffer && m_pMediaSample) {
+		if (m_pMediaSample) {
+			// Re-process the held frame so settings (e.g. ML grade) apply live
+			// while paused — the previous code only did this when the buffer was
+			// invalid, leaving grade changes invisible on a still frame.
 			m_bInReceive = FALSE;
 
 			DoRenderSample(m_pMediaSample);
@@ -1374,6 +1609,7 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 	if (ERROR_SUCCESS == key.Create(HKEY_CURRENT_USER, OPT_REGKEY_VIDEORENDERER)) {
 		key.SetDWORDValue(OPT_UseD3D11,            m_Sets.bUseD3D11);
 		key.SetDWORDValue(OPT_ShowStatistics,      m_Sets.bShowStats);
+		key.SetDWORDValue(OPT_TrayIcon,            m_Sets.bTrayIcon);
 		key.SetDWORDValue(OPT_ResizeStatistics,    m_Sets.iResizeStats);
 		key.SetDWORDValue(OPT_TextureFormat,       m_Sets.iTexFormat);
 		key.SetDWORDValue(OPT_VPEnableNV12,        m_Sets.VPFmts.bNV12);
@@ -1424,6 +1660,11 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 		key.SetDWORDValue(OPT_MLChromaFireEnabled,   m_Sets.bMLChromaFireEnabled);
 		key.SetDWORDValue(OPT_MLChromaKneeEnabled,   m_Sets.bMLChromaKneeEnabled);
 		key.SetDWORDValue(OPT_MLChromaSkinEnabled,   m_Sets.bMLChromaSkinEnabled);
+		key.SetDWORDValue(OPT_MLCREnabled,          m_Sets.bMLCREnabled);
+		key.SetDWORDValue(OPT_MLRadiEnabled,        m_Sets.bMLRadiEnabled);
+		key.SetStringValue(OPT_MLCRStrength,        std::to_wstring(m_Sets.fMLCRStrength).c_str());
+		key.SetStringValue(OPT_MLRadiKnee,          std::to_wstring(m_Sets.fMLRadiKnee).c_str());
+		key.SetStringValue(OPT_MLRadiStrength,      std::to_wstring(m_Sets.fMLRadiStrength).c_str());
 		key.SetStringValue(OPT_MLHunt,             std::to_wstring(m_Sets.fMLHunt).c_str());
 		key.SetStringValue(OPT_MLChromaNeutral,    std::to_wstring(m_Sets.fMLChromaNeutral).c_str());
 		key.SetStringValue(OPT_MLChromaFire,       std::to_wstring(m_Sets.fMLChromaFire).c_str());

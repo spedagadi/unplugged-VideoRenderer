@@ -152,6 +152,7 @@ struct Settings_t {
 	float fMLHighlight = 0.0f;   // manual highlight roll-off [-0.3, 0.4]
 	bool  bMLDebugCopy = false;  // grade steps use the plain copy shader (shader-vs-plumbing bisect)
 	bool  bMLDebugLog = false;   // per-frame diagnostic CSV next to the filter
+	bool  bTrayIcon = true;      // system tray icon when the renderer is active (opens the property page)
 	// Phase 1b — chroma vector tuning / hunt compensation
 	bool  bMLHuntEnabled = true;         // default preset: enabled
 	float fMLHunt = 0.80f;  // libplacebo default (ml_render.h)
@@ -164,6 +165,12 @@ struct Settings_t {
 	float fMLChromaKnee = 0.55f;
 	bool  bMLChromaSkinEnabled = true;
 	float fMLChromaSkinProtect = 0.95f;
+	// Phase 1c
+	bool  bMLCREnabled = false;  // Construct CR (log-space unsharp)
+	float fMLCRStrength = 0.30f;
+	bool  bMLRadiEnabled = false; // Resonance (radiance lift)
+	float fMLRadiKnee = 0.60f;
+	float fMLRadiStrength = 0.30f;
 
 	Settings_t() {
 		SetDefault();
@@ -236,6 +243,11 @@ struct Settings_t {
 		fMLChromaKnee                   = 0.55f;
 		bMLChromaSkinEnabled            = true;
 		fMLChromaSkinProtect            = 0.95f;
+		bMLCREnabled                    = false;
+		fMLCRStrength                   = 0.30f;
+		bMLRadiEnabled                  = false;
+		fMLRadiKnee                     = 0.60f;
+		fMLRadiStrength                 = 0.30f;
 	}
 };
 

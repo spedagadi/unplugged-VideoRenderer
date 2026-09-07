@@ -42,8 +42,12 @@ cbuffer MLParams : register(b0)
 	float MLSkinLUTCB1;
 	float MLChromaGate;
 	float MLHuntGate;
-	float MLPad1;
-	float MLPad2;
+	float MLCRStrength;
+	float MLCRGate;
+	float MLRadiKnee;
+	float MLRadiStrength;
+	float MLRadiShoulder;
+	float MLRadiGate;
 };
 
 static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);

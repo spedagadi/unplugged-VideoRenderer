@@ -99,6 +99,9 @@ const MLSliderRange kMLSliders[] = {
 	{ IDC_SLIDER8,  IDC_EDIT9,  1.0f,  1.50f, &Settings_t::fMLChromaFire },
 	{ IDC_SLIDER9,  IDC_EDIT10, 0.10f, 0.90f, &Settings_t::fMLChromaKnee },
 	{ IDC_SLIDER10, IDC_EDIT11, 0.50f, 1.00f, &Settings_t::fMLChromaSkinProtect },
+	{ IDC_SLIDER11, IDC_EDIT15, 0.0f,  0.50f, &Settings_t::fMLCRStrength },
+	{ IDC_SLIDER12, IDC_EDIT16, 0.40f, 0.90f, &Settings_t::fMLRadiKnee },
+	{ IDC_SLIDER13, IDC_EDIT17, 0.0f,  0.60f, &Settings_t::fMLRadiStrength },
 };
 
 constexpr int kMLSlideRange(const MLSliderRange& r) { return (int)((r.hi - r.lo) * 100.0f + 0.5f); }
@@ -184,6 +187,7 @@ void CVRMainPPage::SetControls()
 	SetMLSliders();
 	CheckDlgButton(IDC_CHECK21, m_SetsPP.bMLDebugCopy ? BST_CHECKED : BST_UNCHECKED);
 	CheckDlgButton(IDC_CHECK22, m_SetsPP.bMLDebugLog  ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK35, m_SetsPP.bTrayIcon     ? BST_CHECKED : BST_UNCHECKED);
 	CheckDlgButton(IDC_CHECK23, m_SetsPP.bMLHuntEnabled   ? BST_CHECKED : BST_UNCHECKED);
 	CheckDlgButton(IDC_CHECK24, m_SetsPP.bMLChromaEnabled ? BST_CHECKED : BST_UNCHECKED);
 	CheckDlgButton(IDC_CHECK32, m_SetsPP.bMLToneCurveEnabled   ? BST_CHECKED : BST_UNCHECKED);
@@ -194,6 +198,8 @@ void CVRMainPPage::SetControls()
 	CheckDlgButton(IDC_CHECK29, m_SetsPP.bMLChromaFireEnabled   ? BST_CHECKED : BST_UNCHECKED);
 	CheckDlgButton(IDC_CHECK30, m_SetsPP.bMLChromaKneeEnabled   ? BST_CHECKED : BST_UNCHECKED);
 	CheckDlgButton(IDC_CHECK31, m_SetsPP.bMLChromaSkinEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK33, m_SetsPP.bMLCREnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK34, m_SetsPP.bMLRadiEnabled ? BST_CHECKED : BST_UNCHECKED);
 }
 
 void CVRMainPPage::EnableControls()
@@ -250,6 +256,14 @@ void CVRMainPPage::EnableControls()
 	GetDlgItem(IDC_CHECK23).EnableWindow(bMLEnable);                       // hunt row
 	GetDlgItem(IDC_SLIDER6).EnableWindow(bMLEnable && m_SetsPP.bMLHuntEnabled);
 	GetDlgItem(IDC_EDIT7).EnableWindow(bMLEnable && m_SetsPP.bMLHuntEnabled);
+	GetDlgItem(IDC_CHECK33).EnableWindow(bMLEnable);                       // CR master
+	GetDlgItem(IDC_SLIDER11).EnableWindow(bMLEnable && m_SetsPP.bMLCREnabled);
+	GetDlgItem(IDC_EDIT15).EnableWindow(bMLEnable && m_SetsPP.bMLCREnabled);
+	GetDlgItem(IDC_CHECK34).EnableWindow(bMLEnable);                       // Resonance master
+	GetDlgItem(IDC_SLIDER12).EnableWindow(bMLEnable && m_SetsPP.bMLRadiEnabled);
+	GetDlgItem(IDC_EDIT16).EnableWindow(bMLEnable && m_SetsPP.bMLRadiEnabled);
+	GetDlgItem(IDC_SLIDER13).EnableWindow(bMLEnable && m_SetsPP.bMLRadiEnabled);
+	GetDlgItem(IDC_EDIT17).EnableWindow(bMLEnable && m_SetsPP.bMLRadiEnabled);
 	GetDlgItem(IDC_CHECK28).EnableWindow(bMLEnable);                       // ch-neutral row
 	GetDlgItem(IDC_SLIDER7).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaNeutralEnabled);
 	GetDlgItem(IDC_EDIT8).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaNeutralEnabled);
@@ -266,6 +280,8 @@ void CVRMainPPage::EnableControls()
 	GetDlgItem(IDC_CHECK21).EnableWindow(bMLEnable);
 	GetDlgItem(IDC_CHECK22).EnableWindow(bMLEnable);
 	GetDlgItem(IDC_CHECK24).EnableWindow(bMLEnable);                       // chroma master
+	// Tray icon is renderer-wide, not ML-gated
+	GetDlgItem(IDC_CHECK35).EnableWindow(TRUE);
 }
 
 HRESULT CVRMainPPage::OnConnect(IUnknown *pUnk)
@@ -571,6 +587,12 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 				SetDirty();
 				return (LRESULT)1;
 			}
+			if (nID == IDC_CHECK35) {
+				m_SetsPP.bTrayIcon = IsDlgButtonChecked(IDC_CHECK35) == BST_CHECKED;
+				m_pVideoRenderer->SetSettings(m_SetsPP);
+				SetDirty();
+				return (LRESULT)1;
+			}
 			if (nID == IDC_CHECK23) {
 				m_SetsPP.bMLHuntEnabled = IsDlgButtonChecked(IDC_CHECK23) == BST_CHECKED;
 				EnableControls();
@@ -587,6 +609,20 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 			}
 			if (nID == IDC_CHECK32) {
 				m_SetsPP.bMLToneCurveEnabled = IsDlgButtonChecked(IDC_CHECK32) == BST_CHECKED;
+				EnableControls();
+				m_pVideoRenderer->SetSettings(m_SetsPP);
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK33) {
+				m_SetsPP.bMLCREnabled = IsDlgButtonChecked(IDC_CHECK33) == BST_CHECKED;
+				EnableControls();
+				m_pVideoRenderer->SetSettings(m_SetsPP);
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK34) {
+				m_SetsPP.bMLRadiEnabled = IsDlgButtonChecked(IDC_CHECK34) == BST_CHECKED;
 				EnableControls();
 				m_pVideoRenderer->SetSettings(m_SetsPP);
 				SetDirty();

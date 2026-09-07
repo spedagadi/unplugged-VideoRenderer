@@ -93,6 +93,7 @@ private:
 	friend class CVideoProcessor;
 	friend class CDX9VideoProcessor;
 	friend class CDX11VideoProcessor;
+	friend LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
 	// Options
 	Settings_t m_Sets;
@@ -106,6 +107,19 @@ private:
 	HWND m_hWndParent     = nullptr;
 	HWND m_hWndDrain      = nullptr;
 	HWND m_hWndParentMain = nullptr;
+
+	// System tray icon (opens the property page; see ShowConfigDialog)
+	// Anchored to a dedicated message-only window so it is independent of
+	// the video window (m_hWndWindow) and of Init()'s early returns.
+	bool m_bTrayIconVisible = false;
+	HWND m_hTrayWnd        = nullptr;
+
+	void CreateTrayWindow();
+	void DestroyTrayWindow();
+	void AddTrayIcon();
+	void RemoveTrayIcon();
+	void ShowConfigDialog();
+	LRESULT OnTrayMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
 	HMONITOR m_hMon = nullptr;
 	bool m_bPrimaryDisplay = false;

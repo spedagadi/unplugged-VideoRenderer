@@ -311,3 +311,9 @@ int  iMLHighlightMode; float fMLHighlight; // [-0.3, 0.4]
 - Control model: chroma + hunt each get a **Default preset + enable checkbox** in the settings window (user decision, in place of mpv-style manual/auto split).
 - `l1max` feeds both hunt brightness term and `SetMLParams` guard; Manual uses 0.5 default (unchanged).
 - Effort ≈ 600–700 lines + one asset file.
+
+### Phase 1c — Construct CR + Resonance decisions (2026-09-05)
+- Ported WITHOUT any grain detection (user: "dont use any grain detection as it is very buggy"); existing gamma/shadow/highlight passes keep their grain gates.
+- **Both DoVi-gated** alongside chroma (off while `bHdrPreferDoVi`) until the DV-as-a-whole work.
+- Resonance shoulder stays derived (auto); knobs = enable + knee + strength.
+- Build order: CR first, then Resonance. Order in chain: shadow→highlight→gamma→CR→Radiance→chroma.
