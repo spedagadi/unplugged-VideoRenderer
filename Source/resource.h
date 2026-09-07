@@ -93,8 +93,7 @@
 #define IDF_PS_11_ML_HIGHLIGHT          885
 #define IDF_PS_11_ML_DOWNSAMPLE         886
 #define IDF_PS_11_ML_CHROMA             887
-#define IDF_PS_11_ML_CR                 888
-#define IDF_PS_11_ML_RADIANCE           889
+#define IDF_PS_11_ML_BARS               890
 #define IDF_PS_11_TEST                  900
 #define IDC_EDIT1                       1001
 #define IDC_EDIT2                       1002

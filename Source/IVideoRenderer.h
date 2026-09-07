@@ -165,12 +165,11 @@ struct Settings_t {
 	float fMLChromaKnee = 0.55f;
 	bool  bMLChromaSkinEnabled = true;
 	float fMLChromaSkinProtect = 0.95f;
-	// Phase 1c
-	bool  bMLCREnabled = false;  // Construct CR (log-space unsharp)
-	float fMLCRStrength = 0.30f;
-	bool  bMLRadiEnabled = false; // Resonance (radiance lift)
-	float fMLRadiKnee = 0.60f;
-	float fMLRadiStrength = 0.30f;
+	// P0 black bars
+	bool  bMLBars = true;           // repaint detected letterbox bars
+	bool  bMLBarsHighlight = false; // red debug overlay
+	// diagnostic: monotonic config-change counter shared by s3_shell and MPCVR
+	uint32_t configSeq = 0;
 
 	Settings_t() {
 		SetDefault();
@@ -243,11 +242,9 @@ struct Settings_t {
 		fMLChromaKnee                   = 0.55f;
 		bMLChromaSkinEnabled            = true;
 		fMLChromaSkinProtect            = 0.95f;
-		bMLCREnabled                    = false;
-		fMLCRStrength                   = 0.30f;
-		bMLRadiEnabled                  = false;
-		fMLRadiKnee                     = 0.60f;
-		fMLRadiStrength                 = 0.30f;
+		bMLBars                         = true;
+		bMLBarsHighlight                = false;
+		configSeq                       = 0;
 	}
 };
 

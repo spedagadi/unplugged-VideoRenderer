@@ -95,11 +95,8 @@
 #define OPT_MLChromaFireEnabled            L"MLChromaFireEnabled"
 #define OPT_MLChromaKneeEnabled            L"MLChromaKneeEnabled"
 #define OPT_MLChromaSkinEnabled            L"MLChromaSkinEnabled"
-#define OPT_MLCREnabled                    L"MLCREnabled"
-#define OPT_MLCRStrength                   L"MLCRStrength"
-#define OPT_MLRadiEnabled                  L"MLRadiEnabled"
-#define OPT_MLRadiKnee                     L"MLRadiKnee"
-#define OPT_MLRadiStrength                 L"MLRadiStrength"
+#define OPT_MLBars                         L"MLBars"
+#define OPT_MLBarsHighlight                L"MLBarsHighlight"
 
 static std::atomic_int g_nInstance = 0;
 static const wchar_t g_szClassName[] = L"VRWindow";
@@ -361,8 +358,8 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLChromaFireEnabled, dw)) m_Sets.bMLChromaFireEnabled = !!dw;
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLChromaKneeEnabled, dw)) m_Sets.bMLChromaKneeEnabled = !!dw;
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLChromaSkinEnabled, dw)) m_Sets.bMLChromaSkinEnabled = !!dw;
-		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLCREnabled, dw)) m_Sets.bMLCREnabled = !!dw;
-		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLRadiEnabled, dw)) m_Sets.bMLRadiEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLBars, dw)) m_Sets.bMLBars = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLBarsHighlight, dw)) m_Sets.bMLBarsHighlight = !!dw;
 		{
 			WCHAR str[32];
 			ULONG nChars = _countof(str);
@@ -385,12 +382,6 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLChromaSkinProtect, str, &nChars)) {
 				m_Sets.fMLChromaSkinProtect = discard<float>((float)_wtof(str), 0.95f, 0.5f, 1.0f);
 			}
-			nChars = _countof(str);
-			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLCRStrength, str, &nChars)) m_Sets.fMLCRStrength = discard<float>((float)_wtof(str), 0.30f, 0.0f, 0.5f);
-			nChars = _countof(str);
-			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLRadiKnee, str, &nChars)) m_Sets.fMLRadiKnee = discard<float>((float)_wtof(str), 0.60f, 0.40f, 0.90f);
-			nChars = _countof(str);
-			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLRadiStrength, str, &nChars)) m_Sets.fMLRadiStrength = discard<float>((float)_wtof(str), 0.30f, 0.0f, 0.60f);
 		}
 	}
 
@@ -1660,11 +1651,8 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 		key.SetDWORDValue(OPT_MLChromaFireEnabled,   m_Sets.bMLChromaFireEnabled);
 		key.SetDWORDValue(OPT_MLChromaKneeEnabled,   m_Sets.bMLChromaKneeEnabled);
 		key.SetDWORDValue(OPT_MLChromaSkinEnabled,   m_Sets.bMLChromaSkinEnabled);
-		key.SetDWORDValue(OPT_MLCREnabled,          m_Sets.bMLCREnabled);
-		key.SetDWORDValue(OPT_MLRadiEnabled,        m_Sets.bMLRadiEnabled);
-		key.SetStringValue(OPT_MLCRStrength,        std::to_wstring(m_Sets.fMLCRStrength).c_str());
-		key.SetStringValue(OPT_MLRadiKnee,          std::to_wstring(m_Sets.fMLRadiKnee).c_str());
-		key.SetStringValue(OPT_MLRadiStrength,      std::to_wstring(m_Sets.fMLRadiStrength).c_str());
+		key.SetDWORDValue(OPT_MLBars,               m_Sets.bMLBars);
+		key.SetDWORDValue(OPT_MLBarsHighlight,      m_Sets.bMLBarsHighlight);
 		key.SetStringValue(OPT_MLHunt,             std::to_wstring(m_Sets.fMLHunt).c_str());
 		key.SetStringValue(OPT_MLChromaNeutral,    std::to_wstring(m_Sets.fMLChromaNeutral).c_str());
 		key.SetStringValue(OPT_MLChromaFire,       std::to_wstring(m_Sets.fMLChromaFire).c_str());

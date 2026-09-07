@@ -70,10 +70,12 @@ float SatQuery(const std::vector<float>& sat, int stride,
 		+ sat[y0 * stride + x0];
 }
 
+constexpr float kCropLimit = 0.01f;
+
 } // namespace
 
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[ML_FEATURE_DIM],
-                     MLLumaDomain domain)
+                     MLLumaDomain domain, MLBarBounds* bars)
 {
 	const int w = ML_DOWNSAMPLE_W;
 	const int h = ML_DOWNSAMPLE_H;
@@ -89,12 +91,17 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 
 	// 1) decode the readback into the feature domain (PQ, or SDR gamma -> PQ)
 	int64_t sum = 0, max_bin = 0, bright = 0;
+	int contentTop = h, contentBottom = -1;
 	for (int y = 0; y < h; y++) {
 		const uint16_t* row = luma16 + (size_t)y * rowPitch;
 		for (int x = 0; x < w; x++) {
 			const float y16 = (float)(row[x] * scale);
 			const float fv = (domain == MLLumaDomain::SDRGamma22) ? SdrGammaToPQ(y16) : y16;
 			tv[(size_t)y * w + x] = fv;
+			if (y16 >= kCropLimit) {
+				if (contentTop > y) contentTop = y;
+				contentBottom = y;
+			}
 			const int bin = (int)(fminf(fv, 1.0f) * 65535.0f);
 			histogram[bin]++;
 			sum += bin;
@@ -169,6 +176,12 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 	}
 	features[85] = (float)top_bars / h;
 	features[86] = (float)bottom_bars / h;
+
+	if (bars) {
+		bars->contentTop = contentTop;
+		bars->contentBottom = contentBottom;
+		bars->threshold = kCropLimit;
+	}
 
 	// [87] compression_strength = output_max / scene peak (HDR branch)
 	const float f0_den = std::min(0.90f, std::max(features[0], 1e-6f));

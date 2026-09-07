@@ -139,13 +139,16 @@ private:
 		float MLSkinLUTCB1;
 		float MLChromaGate;        // 1.0 = chroma pass active
 		float MLHuntGate;          // 1.0 = hunt active
-		// Phase 1c — Construct CR (log-space unsharp) + Resonance (radiance lift)
-		float MLCRStrength;        // [0, 0.5], 0 = off
-		float MLCRGate;            // 1.0 = CR active
-		float MLRadiKnee;
-		float MLRadiStrength;      // [0, 0.6]
-		float MLRadiShoulder;
-		float MLRadiGate;          // 1.0 = Resonance active
+		float _reserved[6];
+		// P0 — black bars repaint
+		float uBarTop;
+		float uBarBottom;
+		float uBarV0;
+		float uBarSpan;
+		float uBarFeather;
+		float uBarBlack;
+		float uBarHighlight;
+		float _padBar;             // align to 16-byte boundary (D3D11 cbuffer requirement)
 	};
 	MLParams_t m_lastMLParams = {};
 	CComPtr<ID3D11Buffer> m_pMLParams;
@@ -153,8 +156,17 @@ private:
 	CComPtr<ID3D11PixelShader> m_pPSMLShadow;
 	CComPtr<ID3D11PixelShader> m_pPSMLHighlight;
 	CComPtr<ID3D11PixelShader> m_pPSMLChroma;
-	CComPtr<ID3D11PixelShader> m_pPSMLCR;
-	CComPtr<ID3D11PixelShader> m_pPSMLRadi;
+	CComPtr<ID3D11PixelShader> m_pPSMLBars;
+
+	// P0 black-bars temporal state
+	bool m_bMLBarsEnabled = true;      // repaint bars to display black (registry: MLBars)
+	bool m_bMLBarsHighlight = false;   // red debug fill (registry: MLBarsHighlight)
+	MLBarBounds m_MLBarDetected = {};
+	uint16_t m_MLCropTop = 0;
+	uint16_t m_MLCropBot = ML_DOWNSAMPLE_H - 1;
+	uint32_t m_MLCropAge = 0;
+	float m_fMLBarTop = 0.0f;
+	float m_fMLBarBot = 1.0f;
 
 	// Zion ML feature extraction (Phase 1: AUTO gamma)
 	CComPtr<ID3D11Texture2D> m_MLDownsample;   // 256x144 R16_UNORM luma cache
@@ -185,11 +197,6 @@ private:
 	float m_fMLChromaKnee = 0.55f;
 	bool  m_bMLChromaSkinEnabled = true;
 	float m_fMLChromaSkinProtect = 0.95f;
-	bool  m_bMLCREnabled = false;  // Construct CR
-	float m_fMLCRStrength = 0.30f;
-	bool  m_bMLRadiEnabled = false; // Resonance
-	float m_fMLRadiKnee = 0.60f;
-	float m_fMLRadiStrength = 0.30f;
 	float m_fSkinLUTCR0 = -0.2009f, m_fSkinLUTCR1 = 0.3295f;
 	float m_fSkinLUTCB0 = -0.2494f, m_fSkinLUTCB1 = 0.1967f;
 	CComPtr<ID3D11Texture2D> m_SkinLUT;
@@ -387,6 +394,7 @@ private:
 	void UpdateMLActive();
 	void SetMLParams();
 	void ExtractMLFeatures();
+	void UpdateMLBarsFromDetected();
 	void CreateMLTextures();
 	std::wstring GetMLModelPath(const wchar_t* fileName);
 	void InitMLDebug();

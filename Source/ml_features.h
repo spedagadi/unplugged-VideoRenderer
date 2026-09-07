@@ -31,6 +31,12 @@ enum class MLLumaDomain {
 	           // samples are remapped into source-PQ units before stats run
 };
 
+struct MLBarBounds {
+	int   contentTop = 0;      // first content row (0-based); h if blank
+	int   contentBottom = -1;  // last content row (0-based); -1 if blank
+	float threshold = 0.0f;
+};
+
 // Builds the 88-entry ML feature vector from a 256x144 R16_UNORM luma
 // readback in the given domain. Port of libplacebo's extract_features_cpu
 // mirrored by build_model_features — the exact contract the Zion XGBoost
@@ -41,4 +47,5 @@ enum class MLLumaDomain {
 // [77..84] spline knots, [85]/[86] top/bottom bar norm, [87] compression.
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch,
                      float features[ML_FEATURE_DIM],
-                     MLLumaDomain domain = MLLumaDomain::PQ);
+                     MLLumaDomain domain = MLLumaDomain::PQ,
+                     MLBarBounds* bars = nullptr);
