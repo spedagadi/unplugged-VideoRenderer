@@ -1209,7 +1209,7 @@ void CDX11VideoProcessor::SetMLParams()
 		(m_bMLFeaturesReady ? m_fMLBarBot : 1.0f),
 		(m_bMLFeaturesReady ? (float)m_videoRect.top / std::max((int)m_windowRect.Height(), 1) : 0.0f),
 		(m_bMLFeaturesReady ? (float)m_videoRect.Height() / std::max((int)m_windowRect.Height(), 1) : 1.0f),
-		(m_bMLFeaturesReady ? 2.0f : 0.0f),
+		0.0f,
 		0.0f,                                     // uBarBlack (P4 display-model constant)
 		(m_bMLFeaturesReady && m_bMLBarsHighlight) ? 1.0f : 0.0f,
 		0.0f // _padBar
@@ -1322,8 +1322,8 @@ void CDX11VideoProcessor::UpdateMLBarsFromDetected()
 	if (m_MLCropAge >= kCropWindow)
 		m_MLCropAge = 0;
 
-	const int barTop = std::max((int)m_MLCropTop - 1, 0);
-	const int barBot = std::max((h - 1) - (int)m_MLCropBot - 1, 0);
+	const int barTop = (int)m_MLCropTop;
+	const int barBot = (h - 1) - (int)m_MLCropBot;
 	const bool armed = (barTop >= kArmRows || barBot >= kArmRows);
 
 	if (armed) {
@@ -4097,9 +4097,24 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			StepSetting();
 			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSMLBars, m_pMLParams, 0, false);
 			if (m_bMLDebug && m_pMLDebugFile) {
-				fwprintf(m_pMLDebugFile, L"BARS_DRAW step=%u hr=%x fTop=%.4f fBot=%.4f\n",
+				D3D11_TEXTURE2D_DESC rtDesc = {};
+				pRT->GetDesc(&rtDesc);
+				fwprintf(m_pMLDebugFile,
+					L"BARS_DRAW step=%u hr=%x fTop=%.4f fBot=%.4f "
+					L"rect=[%d,%d,%d,%d] inTex=%ux%u rtTex=%ux%u "
+					L"videoRect=[%d,%d,%d,%d] winRect=[%d,%d,%d,%d] "
+					L"uBarV0=%.4f uBarSpan=%.4f uBarFeather=%.1f uBarHL=%.0f "
+					L"cropTop=%d cropBot=%d barAge=%u\n",
 					(unsigned)step, (unsigned)hr,
-					(double)m_lastMLParams.uBarTop, (double)m_lastMLParams.uBarBottom);
+					(double)m_lastMLParams.uBarTop, (double)m_lastMLParams.uBarBottom,
+					rect.left, rect.top, rect.right, rect.bottom,
+					pInputTexture->desc.Width, pInputTexture->desc.Height,
+					rtDesc.Width, rtDesc.Height,
+					m_videoRect.left, m_videoRect.top, m_videoRect.right, m_videoRect.bottom,
+					m_windowRect.left, m_windowRect.top, m_windowRect.right, m_windowRect.bottom,
+					(double)m_lastMLParams.uBarV0, (double)m_lastMLParams.uBarSpan,
+					(double)m_lastMLParams.uBarFeather, (double)m_lastMLParams.uBarHighlight,
+					(int)m_MLCropTop, (int)m_MLCropBot, m_MLCropAge);
 				fflush(m_pMLDebugFile);
 			}
 		}

@@ -10,16 +10,14 @@ repaint them to display-black for improved perceived contrast on projectors.
 - **Input**: 256x144 R16_UNORM readback (luma only, post-tonemap)
 - **Row scan**: per-row mean luma, threshold at `kCropLimit = 0.01f`
 - **Output**: `MLBarBounds { contentTop, contentBottom, threshold }`
-- **Temporal union**: 90-frame sliding window; 2-row arming threshold;
-  1-row guard margin subtracted from detected bounds to avoid painting
-  into active image area
+- **Temporal union**: 90-frame sliding window; 2-row arming threshold
 
 ### Render step (`ps_ml_bars.hlsl`)
 - Constant-buffer driven: `uBarTop`, `uBarBot`, `uBarV0`, `uBarSpan`,
   `uBarFeather`, `uBarBlack`, `uBarHL`
 - Normal mode: paints bars to `uBarBlack` (display black, 0.0)
 - Highlight mode: paints bars red (debug overlay)
-- Feathered edge (2-texel) to avoid hard seam at bar boundary
+- Hard edge at bar boundary (no feathering — letterbox bars are hard transitions)
 
 ### Control flow
 ```
@@ -105,3 +103,19 @@ reflects the last-used state. No separate s3_shell config file.
 - `g_mlMasterEnable` now synced from `zion.enabled` row state in BuildRows()
 - Removed hardcoded "demo defaults" override; UI trusts MPCVR's persisted settings
 - Added PullMl/Hdr/OutFromRenderer after file-picker open
+
+### Fixed: bar overlay gap at bar boundary
+- Removed 1-row guard margin in `UpdateMLBarsFromDetected()` — it mapped to
+  10 display pixels at 1440p, creating a visible unpainted strip between the
+  overlay and the frame edge. `kCropLimit=0.01` already provides sufficient
+  conservatism; no additional inward offset needed.
+
+### Fixed: unnecessary feather on hard letterbox edge
+- Set `uBarFeather` to 0.0 unconditionally in `SetMLParams()`. Letterbox bars
+  are hard transitions in the encode; the 2-texel smoothstep was softening what
+  should be a sharp boundary.
+
+### Added: verbose BARS_DRAW logging
+- `ml_debug.csv` BARS_DRAW now includes rect, input/RT texture dimensions,
+  videoRect, windowRect, uBarV0, uBarSpan, uBarFeather, uBarHL, cropTop,
+  cropBot, and barAge for full per-frame diagnosis.
