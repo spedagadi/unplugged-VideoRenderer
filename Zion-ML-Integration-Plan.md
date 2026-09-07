@@ -317,3 +317,23 @@ int  iMLHighlightMode; float fMLHighlight; // [-0.3, 0.4]
 - **Both DoVi-gated** alongside chroma (off while `bHdrPreferDoVi`) until the DV-as-a-whole work.
 - Resonance shoulder stays derived (auto); knobs = enable + knee + strength.
 - Build order: CR first, then Resonance. Order in chain: shadow→highlight→gamma→CR→Radiance→chroma.
+
+### Phase 2 ideation — VP-parity, black bars, PQ micro-contrast, display model (2026-09-07)
+
+**Contract rule (VP-parity — LOCKED intent).** VP mode (live DeckLink/HDMI) has NO upstream metadata (no DV RPU, no MaxFALL). Therefore: **models consume only renderer-computed features** (luma(+chroma) downsample → BuildMLFeatures → XGBoost); upstream metadata is a **pre-model refinement** (overwrites/refines a computed statistic when present), never a model input. Same code path for VP and media; zero metadata dependency. Feature vector versioning: extending the contract (e.g. 88→96) retrains only the *new* models; existing 88-dim gamma/shadow/highlight models stay.
+
+**Feature mapping (all renderer-computed):**
+- Surround compensation: peak≈maxscl[0], avg[1], midtone slope from spline knots [77..84], compression[87]. **No new extraction.**
+- Dehaze/ink-blacks: + **one low-side feature** (histogram mass <5% of peak, or p0.5/p1). Spline low-knots give shadow slope. P5-poly metadata = optional refinement only.
+- HK chroma boost: needs a **computed chroma-stats pass** (frame saturation mean/percentiles/histogram in CbCr/ICtCp) — the one real new extraction; apply ICtCp/Jzazbz, hue-safe.
+- Local-contrast detail: frame-level windowed-luma STD summary features feeding a single global CR-strength blend (madVR-style micro-contrast; no per-pixel inference).
+
+**ML strength modulation (post-inference, memoryless; NOT a retrain).** Single user dial 0→1→2, default 1.0 = identity. tanh-normalized per-channel exponents (pass-through at 1.0, self-limiting asymptote): α_mid≈1.0, α_shd≈0.65, α_hlt≈0.45. Applied after SetMLParams inference, before params packing/cbuffer. Highlight knee (derived from gamma) must key off the **modulated** gamma. Strength is a brightness/assertiveness dial, not quality — quality comes from the models; scene-adaptive exponents are the later quality refinement (gated on the reference-corpus).
+
+**Black bars (projector haze fix).** Decision: **grade full frame, repaint bars post-grade** to the display black floor (excludes would perturb the trained full-frame features). Bar detection already latent — slots **[85]/[86] bar norm** in the 88-dim; repurpose as a mask. Feather the content|bars seam a few px. Target = same display-black constant as the display model.
+
+**PQ micro-contrast (madVR crispness).** CR today is log-space unsharp, not PQ. Ladder: (1) single mid-band DoG in PQ (±σ 2px/4px ≈ 4–16px acuity band) scaled by ML `crStr` — 2 extra passes; (2) full 3-band Laplacian pyramid only if insufficient. Do CR in PQ before final EOTF; with micro-contrast landed, radiance/absolute-lift can back off (brightness from contrast).
+
+**Display model.** Verify `sdrDisplayNits` actually drives tone-curve construction (target peak, not a hardcoded 100). Add a **display black floor** param (default 0 → 0.02–0.1 nits): content-black maps to display black (code-range reclamation → shadow separation → perceived contrast); same constant feeds the bar repaint.
+
+**Gating (unchanged):** all training needs the reference-grade corpus question answered first (synthetic labels via unplugged/libplacebo render vs hand-graded frames vs DV-derived heuristics).
