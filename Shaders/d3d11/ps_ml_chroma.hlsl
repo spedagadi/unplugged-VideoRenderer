@@ -81,13 +81,17 @@ float4 main(PS_INPUT input) : SV_Target
 		(cb - MLSkinLUTCB0) / (MLSkinLUTCB1 - MLSkinLUTCB0)));
 	float skin_weight = skin_lut.Sample(sampSkin, skin_uv).r;
 
-	// Chroma boost ramp: neutral below knee, fire above
+	// Chroma boost curve: 1.0 at black → neutral at knee → fire at peak.
+	// Monotonic ramp matches tone-mapping desaturation profile (highlights
+	// lose more saturation than shadows). No boost on near-black noise.
 	float I_peak = (IsPQ > 0.5) ? max(MLL1Max, 0.01) : SDR_I_PEAK_PQ;
 	float I_norm = ictcp.x / I_peak;
-	float luma_boost = MLChromaNeutral;
-	float denom = 1.0 - MLChromaKnee;
-	if (I_norm > MLChromaKnee && denom > 0.001) {
-		float t = saturate((I_norm - MLChromaKnee) / denom);
+	float luma_boost;
+	if (I_norm <= MLChromaKnee) {
+		float t = I_norm / max(MLChromaKnee, 0.01);
+		luma_boost = lerp(1.0, MLChromaNeutral, t);
+	} else {
+		float t = saturate((I_norm - MLChromaKnee) / max(1.0 - MLChromaKnee, 0.01));
 		luma_boost = lerp(MLChromaNeutral, MLChromaFire, pow(t, 1.5));
 	}
 

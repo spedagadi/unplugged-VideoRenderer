@@ -1189,6 +1189,7 @@ void CDX11VideoProcessor::SetMLParams()
 
 	if (m_iMLMode == ML_Manual) {
 		gamma   = (m_bMLToneCurveEnabled && m_bMLGammaEnabled) ? discard<float>(m_fMLGamma, 1.0f, 0.5f, 1.5f) : 1.0f;
+		shadow  = (m_bMLToneCurveEnabled && m_bMLShadowEnabled) ? discard<float>(m_fMLShadow, 0.0f, 0.0f, 0.4f) : 0.0f;
 		rolloff = (m_bMLToneCurveEnabled && m_bMLHighlightEnabled) ? discard<float>(m_fMLHighlight, 0.0f, -0.3f, 0.4f) : 0.0f;
 	}
 	else if (m_iMLMode == ML_Auto && m_bMLFeaturesReady && m_bMLGammaModelLoaded) {
@@ -1239,7 +1240,7 @@ void CDX11VideoProcessor::SetMLParams()
 	// all Zion features apply regardless of DoVi/HDR10 source (user decision)
 	const bool bChromaActive = m_bMLChromaEnabled;
 
-	const float shadowStrength = m_bMLShadowEnabled ? fmaxf(0.0f, m_fMLShadow) : 0.0f;
+	const float shadowStrength = 0.0f;
 	const float contrastStrength = m_bMLContrastEnabled ? fmaxf(0.0f, m_fMLContrast) : 0.0f;
 
 	// Scene cut detection: L2 distance across multiple histogram features
@@ -1317,9 +1318,9 @@ void CDX11VideoProcessor::SetMLParams()
 		(m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ? 1.0f : 0.0f,
 		0.0f,
 		// Phase 1b — chroma vector tuning (per-row enables)
-		(bChromaActive && m_bMLChromaNeutralEnabled) ? discard<float>(m_fMLChromaNeutral, 1.20f, 1.0f, 1.5f) : 1.0f,
-		(bChromaActive && m_bMLChromaFireEnabled) ? discard<float>(m_fMLChromaFire, 1.35f, 1.0f, 1.5f) : 1.0f,
-		(bChromaActive && m_bMLChromaKneeEnabled) ? discard<float>(m_fMLChromaKnee, 0.55f, 0.1f, 0.9f) : 0.55f,
+		(bChromaActive && m_bMLChromaNeutralEnabled) ? discard<float>(m_fMLChromaNeutral, 1.08f, 1.0f, 1.3f) : 1.0f,
+		(bChromaActive && m_bMLChromaFireEnabled) ? discard<float>(m_fMLChromaFire, 1.15f, 1.0f, 1.3f) : 1.0f,
+		(bChromaActive && m_bMLChromaKneeEnabled) ? discard<float>(m_fMLChromaKnee, 0.45f, 0.1f, 0.9f) : 0.45f,
 		(bChromaActive && m_bMLChromaSkinEnabled) ? discard<float>(m_fMLChromaSkinProtect, 0.95f, 0.5f, 1.0f) : 0.95f,
 		m_fSkinLUTCR0, m_fSkinLUTCR1, m_fSkinLUTCB0, m_fSkinLUTCB1,
 		bChromaActive ? 1.0f : 0.0f,
