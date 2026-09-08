@@ -147,11 +147,15 @@ struct Settings_t {
 	bool  bMLGammaEnabled = true;
 	float fMLGamma = 1.0f;       // manual gamma [0.5, 1.5]
 	bool  bMLShadowEnabled = true;
-	float fMLShadow = 0.0f;      // manual shadow toe-lift [0.0, 0.5]
+	float fMLShadow = 2.0f;      // shadow strength: 0=Off 1=Low 2=Med 3=High 4=VHi 5=Saturate
 	bool  bMLHighlightEnabled = true;
 	float fMLHighlight = 0.0f;   // manual highlight roll-off [-0.3, 0.4]
 	bool  bMLDebugCopy = false;  // grade steps use the plain copy shader (shader-vs-plumbing bisect)
 	bool  bMLDebugLog = false;   // per-frame diagnostic CSV next to the filter
+	bool  bMLShadowDebugVis = false; // heatmap overlay showing shadow enhancement zones
+	float fMLShadowZoneCeil = 0.20f;
+	float fMLShadowSkinProtect = 0.65f;
+	float fMLShadowRatioCap = 1.40f;
 	bool  bTrayIcon = true;      // system tray icon when the renderer is active (opens the property page)
 	// Phase 1b — chroma vector tuning / hunt compensation
 	bool  bMLHuntEnabled = true;         // default preset: enabled
@@ -226,11 +230,15 @@ struct Settings_t {
 		bMLGammaEnabled                 = true;
 		fMLGamma                        = 1.0f;
 		bMLShadowEnabled                = true;
-		fMLShadow                       = 0.0f;
+		fMLShadow                       = 2.0f;
 		bMLHighlightEnabled             = true;
 		fMLHighlight                    = 0.0f;
 		bMLDebugCopy                    = false;
 		bMLDebugLog                     = false;
+		bMLShadowDebugVis               = false;
+		fMLShadowZoneCeil               = 0.20f;
+		fMLShadowSkinProtect            = 0.65f;
+		fMLShadowRatioCap               = 1.40f;
 		bMLHuntEnabled                  = true;
 		fMLHunt                         = 0.80f;
 		bMLChromaEnabled                = true;

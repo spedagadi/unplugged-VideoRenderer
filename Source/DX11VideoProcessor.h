@@ -119,7 +119,7 @@ private:
 		float MLGamma;            // [0.5, 1.5], 1.0 = neutral
 		float MLShadowToe;        // [0.0, 0.4]
 		float MLShadowKnee;       // 0.25
-		float MLShadowDehaze;     // 0.0 (SDR out of scope)
+		float MLShadowStrength;   // DoG detail multiplier (0=off, from strength tier)
 		float MLHighlightRolloff; // [-0.3, 0.4]
 		float MLHighlightKnee;    // adaptive on gamma
 		float MLGuard;            // highlight guard, 0.85 default
@@ -176,6 +176,10 @@ private:
 	// Zion ML debug (registry: MLDebugLog / MLDebugPassthrough)
 	bool m_bMLDebug = false;
 	bool m_bMLDebugCopy = false; // bind ps_simple to the grade steps (bisect test)
+	bool m_bMLShadowDebugVis = false;
+	float m_fMLShadowZoneCeil = 0.20f;
+	float m_fMLShadowSkinProtect = 0.65f;
+	float m_fMLShadowRatioCap = 1.40f;
 	FILE* m_pMLDebugFile = nullptr;
 	uint64_t m_MLDebugFrame = 0;
 	uint64_t m_MLDebugStepCount = 0;

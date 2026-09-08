@@ -418,6 +418,10 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_fMLHighlight          = config.fMLHighlight;
 	m_bMLDebugCopy          = config.bMLDebugCopy;
 	m_bMLDebug              = config.bMLDebugLog;
+	m_bMLShadowDebugVis    = config.bMLShadowDebugVis;
+	m_fMLShadowZoneCeil    = config.fMLShadowZoneCeil;
+	m_fMLShadowSkinProtect = config.fMLShadowSkinProtect;
+	m_fMLShadowRatioCap    = config.fMLShadowRatioCap;
 	m_bMLHuntEnabled        = config.bMLHuntEnabled;
 	m_fMLHunt               = config.fMLHunt;
 	m_bMLChromaEnabled      = config.bMLChromaEnabled;
@@ -1124,49 +1128,46 @@ void CDX11VideoProcessor::SetMLParams()
 
 	if (m_iMLMode == ML_Manual) {
 		gamma   = (m_bMLToneCurveEnabled && m_bMLGammaEnabled) ? discard<float>(m_fMLGamma, 1.0f, 0.5f, 1.5f) : 1.0f;
-		shadow  = (m_bMLToneCurveEnabled && m_bMLShadowEnabled) ? discard<float>(m_fMLShadow, 0.0f, 0.0f, 0.5f) : 0.0f;
 		rolloff = (m_bMLToneCurveEnabled && m_bMLHighlightEnabled) ? discard<float>(m_fMLHighlight, 0.0f, -0.3f, 0.4f) : 0.0f;
 	}
 	else if (m_iMLMode == ML_Auto && m_bMLFeaturesReady && m_bMLGammaModelLoaded) {
-		// Model inference on the (previous frame's) feature vector,
-		// IIR-smoothed with scene-cut reset on the l1 peak.
 		float pred = 1.0f;
 		m_bMLGammaPredictOk = (m_bMLToneCurveEnabled && m_bMLGammaEnabled)
 			&& m_MLGammaModel.Predict(m_MLFeatures, ML_FEATURE_DIM, pred);
 		if (m_bMLGammaPredictOk) {
-			// Clamp to the model's trained range (0.5..1.5). Do NOT use
-			// discard(): an out-of-band prediction would be replaced with the
-			// neutral 1.0 and gamma would appear dead while shadow/highlight
-			// keep moving (HTPC repro).
 			m_MLGammaRawPred = pred;
 			pred = fminf(1.5f, fmaxf(0.5f, pred));
 
 			const float l1now = m_MLFeatures[0];
 			if (m_MLPrevL1Max < 0.0f || fabsf(l1now - m_MLPrevL1Max) > 0.15f) {
-				m_MLIIRGamma = pred; // scene cut: reset the accumulator
+				m_MLIIRGamma = pred;
 			} else {
-				m_MLIIRGamma = 0.10f * pred + 0.90f * m_MLIIRGamma; // alpha 0.10
+				m_MLIIRGamma = 0.10f * pred + 0.90f * m_MLIIRGamma;
 			}
 			m_MLPrevL1Max = l1now;
 			gamma = m_MLIIRGamma;
 		}
-		// Shadow toe-lift + highlight roll-off: raw predictions, clamped to the
-		// libplacebo output ranges (ml_render evaluate). Gated by the same
-		// per-row enables as the manual values.
-		float shadowPred = 0.0f, highlightPred = 0.0f;
-		if (m_bMLShadowModelLoaded && m_MLShadowModel.Predict(m_MLFeatures, ML_FEATURE_DIM, shadowPred)) {
-			shadowPred = fmaxf(0.0f, fminf(0.5f, shadowPred));
-		}
+		float highlightPred = 0.0f;
 		if (m_bMLHighlightModelLoaded && m_MLHighlightModel.Predict(m_MLFeatures, ML_FEATURE_DIM, highlightPred)) {
 			highlightPred = fmaxf(-0.30f, fminf(0.40f, highlightPred));
 		}
-		shadow  = (m_bMLToneCurveEnabled && m_bMLShadowEnabled) ? shadowPred : 0.0f;
 		rolloff = (m_bMLToneCurveEnabled && m_bMLHighlightEnabled) ? highlightPred : 0.0f;
 
 		m_MLDebugFeat0 = m_MLFeatures[0];
 		m_MLDebugFeat1 = m_MLFeatures[1];
 		m_MLDebugPred = gamma;
 		l1max = fmaxf(0.05f, fminf(0.90f, m_MLFeatures[0]));
+	}
+
+	// Shadow gate: model MUST run whenever shadow is enabled.
+	// No model = no enhancement. The prediction is the backstop that
+	// prevents enhancement on scenes that don't need it.
+	// Shadow is independent of the tone-curve master (it's DoG detail, not tone mapping).
+	if (m_bMLShadowEnabled && m_bMLShadowModelLoaded && m_bMLFeaturesReady) {
+		float shadowPred = 0.0f;
+		if (m_MLShadowModel.Predict(m_MLFeatures, ML_FEATURE_DIM, shadowPred)) {
+			shadow = fmaxf(0.0f, fminf(0.5f, shadowPred));
+		}
 	}
 
 	// Adaptive highlight guard from the scene peak (same formula as ml_render.c).
@@ -1177,11 +1178,13 @@ void CDX11VideoProcessor::SetMLParams()
 	// all Zion features apply regardless of DoVi/HDR10 source (user decision)
 	const bool bChromaActive = m_bMLChromaEnabled;
 
+	const float shadowStrength = m_bMLShadowEnabled ? fmaxf(0.0f, m_fMLShadow) : 0.0f;
+
 	const MLParams_t params = {
 		gamma,
 		shadow,
 		0.25f,                                            // shadow knee
-		0.0f,                                             // dehaze (SDR out of scope)
+		shadowStrength,                                   // DoG detail multiplier
 		rolloff,
 		fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(gamma, 0.5f)) * 0.20f)), // highlight knee
 		guard,
@@ -1203,7 +1206,7 @@ void CDX11VideoProcessor::SetMLParams()
 		m_fSkinLUTCR0, m_fSkinLUTCR1, m_fSkinLUTCB0, m_fSkinLUTCB1,
 		bChromaActive ? 1.0f : 0.0f,
 		m_bMLHuntEnabled ? 1.0f : 0.0f,
-		0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, // _reserved (was CR/Resonance)
+		m_bMLShadowDebugVis ? 1.0f : 0.0f, m_fMLShadowZoneCeil, m_fMLShadowSkinProtect, m_fMLShadowRatioCap, 0.0f, 0.0f,
 		// P0 — black bars repaint
 		(m_bMLFeaturesReady ? m_fMLBarTop : 0.0f),
 		(m_bMLFeaturesReady ? m_fMLBarBot : 1.0f),
@@ -4058,7 +4061,15 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			}
 
 			StepSetting();
+			if (m_SkinLUTSRV) {
+				m_pDeviceContext->PSSetShaderResources(1, 1, &m_SkinLUTSRV.p);
+				m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerSkin.p);
+			}
 			hrs[0] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psShadow, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
+			if (m_SkinLUTSRV) {
+				ID3D11ShaderResourceView* nullSRVs[1] = {};
+				m_pDeviceContext->PSSetShaderResources(1, 1, nullSRVs);
+			}
 			StepSetting();
 			hrs[1] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psHighlight, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 			StepSetting();
@@ -4721,7 +4732,8 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			config.bMLGammaEnabled != m_bMLGammaEnabled ||
 			config.bMLShadowEnabled != m_bMLShadowEnabled ||
 			config.bMLHighlightEnabled != m_bMLHighlightEnabled ||
-			config.bMLDebugCopy != m_bMLDebugCopy || config.bMLDebugLog != m_bMLDebug ||
+			config.bMLDebugCopy != m_bMLDebugCopy || config.bMLDebugLog != m_bMLDebug || config.bMLShadowDebugVis != m_bMLShadowDebugVis ||
+			config.fMLShadowZoneCeil != m_fMLShadowZoneCeil || config.fMLShadowSkinProtect != m_fMLShadowSkinProtect || config.fMLShadowRatioCap != m_fMLShadowRatioCap ||
 			config.bMLHuntEnabled != m_bMLHuntEnabled || config.fMLHunt != m_fMLHunt ||
 			config.bMLChromaEnabled != m_bMLChromaEnabled ||
 			config.bMLChromaNeutralEnabled != m_bMLChromaNeutralEnabled ||
@@ -4745,6 +4757,10 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_bMLHighlightEnabled = config.bMLHighlightEnabled;
 		m_bMLDebugCopy = config.bMLDebugCopy;
 		m_bMLDebug     = config.bMLDebugLog;
+		m_bMLShadowDebugVis = config.bMLShadowDebugVis;
+		m_fMLShadowZoneCeil    = config.fMLShadowZoneCeil;
+		m_fMLShadowSkinProtect = config.fMLShadowSkinProtect;
+		m_fMLShadowRatioCap    = config.fMLShadowRatioCap;
 		m_bMLHuntEnabled = config.bMLHuntEnabled;
 		m_fMLHunt        = config.fMLHunt;
 		m_bMLChromaEnabled = config.bMLChromaEnabled;
