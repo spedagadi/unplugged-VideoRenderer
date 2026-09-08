@@ -149,6 +149,11 @@ private:
 		float uBarBlack;
 		float uBarHighlight;
 		float _padBar;             // align to 16-byte boundary (D3D11 cbuffer requirement)
+		// Contrast recovery (dual-band detail enhancement)
+		float MCStrength;          // contrast band gain (0 = off)
+		float MCZoneLo;            // zone floor where contrast fades in
+		float MCSkinProtect;       // skin protection for contrast band
+		float MCRatioCap;          // ratio cap for contrast band
 	};
 	MLParams_t m_lastMLParams = {};
 	CComPtr<ID3D11Buffer> m_pMLParams;
@@ -177,9 +182,15 @@ private:
 	bool m_bMLDebug = false;
 	bool m_bMLDebugCopy = false; // bind ps_simple to the grade steps (bisect test)
 	bool m_bMLShadowDebugVis = false;
+	bool m_bMLContrastDebugVis = false;
 	float m_fMLShadowZoneCeil = 0.20f;
 	float m_fMLShadowSkinProtect = 0.65f;
 	float m_fMLShadowRatioCap = 1.40f;
+	bool  m_bMLContrastEnabled = true;
+	float m_fMLContrast = 3.0f;
+	float m_fMLContrastZoneLo = 0.15f;
+	float m_fMLContrastSkinProtect = 0.65f;
+	float m_fMLContrastRatioCap = 1.40f;
 	FILE* m_pMLDebugFile = nullptr;
 	uint64_t m_MLDebugFrame = 0;
 	uint64_t m_MLDebugStepCount = 0;

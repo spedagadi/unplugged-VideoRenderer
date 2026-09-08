@@ -321,7 +321,7 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 			m_Sets.iMLMode = discard<int>(dw, ML_Disable, ML_Disable, ML_Auto);
 		}
 		m_Sets.fMLGamma    = discard<float>(m_Sets.fMLGamma,    1.0f, 0.5f, 1.5f);
-		m_Sets.fMLShadow   = discard<float>(m_Sets.fMLShadow,   0.0f, 0.0f, 0.4f);
+		m_Sets.fMLShadow   = discard<float>(m_Sets.fMLShadow,   2.0f, 0.0f, 5.0f);
 		m_Sets.fMLHighlight = discard<float>(m_Sets.fMLHighlight, 0.0f, -0.3f, 0.4f);
 		{
 			WCHAR str[32];
@@ -331,7 +331,7 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 			}
 			nChars = _countof(str);
 			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLShadow, str, &nChars)) {
-				m_Sets.fMLShadow = discard<float>((float)_wtof(str), 0.0f, 0.0f, 0.5f);
+				m_Sets.fMLShadow = discard<float>((float)_wtof(str), 2.0f, 0.0f, 5.0f);
 			}
 			nChars = _countof(str);
 			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLHighlight, str, &nChars)) {

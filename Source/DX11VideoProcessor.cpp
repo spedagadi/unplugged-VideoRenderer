@@ -419,9 +419,15 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_bMLDebugCopy          = config.bMLDebugCopy;
 	m_bMLDebug              = config.bMLDebugLog;
 	m_bMLShadowDebugVis    = config.bMLShadowDebugVis;
+	m_bMLContrastDebugVis  = config.bMLContrastDebugVis;
 	m_fMLShadowZoneCeil    = config.fMLShadowZoneCeil;
 	m_fMLShadowSkinProtect = config.fMLShadowSkinProtect;
 	m_fMLShadowRatioCap    = config.fMLShadowRatioCap;
+	m_bMLContrastEnabled   = config.bMLContrastEnabled;
+	m_fMLContrast          = config.fMLContrast;
+	m_fMLContrastZoneLo    = config.fMLContrastZoneLo;
+	m_fMLContrastSkinProtect = config.fMLContrastSkinProtect;
+	m_fMLContrastRatioCap  = config.fMLContrastRatioCap;
 	m_bMLHuntEnabled        = config.bMLHuntEnabled;
 	m_fMLHunt               = config.fMLHunt;
 	m_bMLChromaEnabled      = config.bMLChromaEnabled;
@@ -1179,6 +1185,7 @@ void CDX11VideoProcessor::SetMLParams()
 	const bool bChromaActive = m_bMLChromaEnabled;
 
 	const float shadowStrength = m_bMLShadowEnabled ? fmaxf(0.0f, m_fMLShadow) : 0.0f;
+	const float contrastStrength = m_bMLContrastEnabled ? fmaxf(0.0f, m_fMLContrast) : 0.0f;
 
 	const MLParams_t params = {
 		gamma,
@@ -1206,7 +1213,7 @@ void CDX11VideoProcessor::SetMLParams()
 		m_fSkinLUTCR0, m_fSkinLUTCR1, m_fSkinLUTCB0, m_fSkinLUTCB1,
 		bChromaActive ? 1.0f : 0.0f,
 		m_bMLHuntEnabled ? 1.0f : 0.0f,
-		m_bMLShadowDebugVis ? 1.0f : 0.0f, m_fMLShadowZoneCeil, m_fMLShadowSkinProtect, m_fMLShadowRatioCap, 0.0f, 0.0f,
+		m_bMLShadowDebugVis ? 1.0f : 0.0f, m_fMLShadowZoneCeil, m_fMLShadowSkinProtect, m_fMLShadowRatioCap, m_bMLContrastDebugVis ? 1.0f : 0.0f, 0.0f,
 		// P0 — black bars repaint
 		(m_bMLFeaturesReady ? m_fMLBarTop : 0.0f),
 		(m_bMLFeaturesReady ? m_fMLBarBot : 1.0f),
@@ -1215,7 +1222,12 @@ void CDX11VideoProcessor::SetMLParams()
 		0.0f,
 		0.0f,                                     // uBarBlack (P4 display-model constant)
 		(m_bMLFeaturesReady && m_bMLBarsHighlight) ? 1.0f : 0.0f,
-		0.0f // _padBar
+		0.0f, // _padBar
+		// Contrast recovery
+		contrastStrength,
+		m_fMLContrastZoneLo,
+		m_fMLContrastSkinProtect,
+		m_fMLContrastRatioCap,
 	};
 
 	m_lastMLParams = params;
@@ -4732,8 +4744,10 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			config.bMLGammaEnabled != m_bMLGammaEnabled ||
 			config.bMLShadowEnabled != m_bMLShadowEnabled ||
 			config.bMLHighlightEnabled != m_bMLHighlightEnabled ||
-			config.bMLDebugCopy != m_bMLDebugCopy || config.bMLDebugLog != m_bMLDebug || config.bMLShadowDebugVis != m_bMLShadowDebugVis ||
+			config.bMLDebugCopy != m_bMLDebugCopy || config.bMLDebugLog != m_bMLDebug || config.bMLShadowDebugVis != m_bMLShadowDebugVis || config.bMLContrastDebugVis != m_bMLContrastDebugVis ||
 			config.fMLShadowZoneCeil != m_fMLShadowZoneCeil || config.fMLShadowSkinProtect != m_fMLShadowSkinProtect || config.fMLShadowRatioCap != m_fMLShadowRatioCap ||
+			config.bMLContrastEnabled != m_bMLContrastEnabled || config.fMLContrast != m_fMLContrast ||
+			config.fMLContrastZoneLo != m_fMLContrastZoneLo || config.fMLContrastSkinProtect != m_fMLContrastSkinProtect || config.fMLContrastRatioCap != m_fMLContrastRatioCap ||
 			config.bMLHuntEnabled != m_bMLHuntEnabled || config.fMLHunt != m_fMLHunt ||
 			config.bMLChromaEnabled != m_bMLChromaEnabled ||
 			config.bMLChromaNeutralEnabled != m_bMLChromaNeutralEnabled ||
@@ -4758,9 +4772,15 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_bMLDebugCopy = config.bMLDebugCopy;
 		m_bMLDebug     = config.bMLDebugLog;
 		m_bMLShadowDebugVis = config.bMLShadowDebugVis;
+		m_bMLContrastDebugVis = config.bMLContrastDebugVis;
 		m_fMLShadowZoneCeil    = config.fMLShadowZoneCeil;
 		m_fMLShadowSkinProtect = config.fMLShadowSkinProtect;
 		m_fMLShadowRatioCap    = config.fMLShadowRatioCap;
+		m_bMLContrastEnabled   = config.bMLContrastEnabled;
+		m_fMLContrast          = config.fMLContrast;
+		m_fMLContrastZoneLo    = config.fMLContrastZoneLo;
+		m_fMLContrastSkinProtect = config.fMLContrastSkinProtect;
+		m_fMLContrastRatioCap  = config.fMLContrastRatioCap;
 		m_bMLHuntEnabled = config.bMLHuntEnabled;
 		m_fMLHunt        = config.fMLHunt;
 		m_bMLChromaEnabled = config.bMLChromaEnabled;

@@ -51,22 +51,6 @@ cbuffer MLParams : register(b0)
 
 static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
 
-float GrainGate(float y_c, float2 texsz, float2 uv)
-{
-	float2 pt = 1.0 / texsz;
-	const float g_eps = 1e-4;
-	float g_lc = log(max(y_c, g_eps));
-	float g_sum = g_lc;
-	float g_sq = g_lc * g_lc;
-	float gl1 = log(max(dot(tex.Sample(samp, uv + float2(-2.0, 0.0) * pt).rgb, luma_w), g_eps)); g_sum += gl1; g_sq += gl1 * gl1;
-	float gl2 = log(max(dot(tex.Sample(samp, uv + float2( 2.0, 0.0) * pt).rgb, luma_w), g_eps)); g_sum += gl2; g_sq += gl2 * gl2;
-	float gl3 = log(max(dot(tex.Sample(samp, uv + float2(0.0, -2.0) * pt).rgb, luma_w), g_eps)); g_sum += gl3; g_sq += gl3 * gl3;
-	float gl4 = log(max(dot(tex.Sample(samp, uv + float2(0.0,  2.0) * pt).rgb, luma_w), g_eps)); g_sum += gl4; g_sq += gl4 * gl4;
-	float g_mean = g_sum / 5.0;
-	float g_var = max(g_sq / 5.0 - g_mean * g_mean, 0.0);
-	return smoothstep(0.003, 0.02, g_var);
-}
-
 float4 main(PS_INPUT input) : SV_Target
 {
 	float4 csrc = tex.Sample(samp, input.Tex);
@@ -82,8 +66,7 @@ float4 main(PS_INPUT input) : SV_Target
 
 	float3 center = csrc.rgb;
 	float y_c = dot(center, luma_w);
-	float grain = GrainGate(y_c, texsz, input.Tex);
-	float rolloff_eff = MLHighlightRolloff * (1.0 - grain);
+	float rolloff_eff = MLHighlightRolloff;
 	float3 out_rgb = center;
 
 	if (abs(rolloff_eff) > 0.005 && y_c > MLHighlightKnee && y_c < 0.995) {

@@ -92,7 +92,7 @@ struct MLSliderRange {
 // libplacebo-authoritative ranges (ml_render.h + manifest clips)
 const MLSliderRange kMLSliders[] = {
 	{ IDC_SLIDER3,  IDC_EDIT3,  0.50f, 1.50f, &Settings_t::fMLGamma },
-	{ IDC_SLIDER4,  IDC_EDIT4,  0.0f,  0.50f, &Settings_t::fMLShadow },
+	{ IDC_SLIDER4,  IDC_EDIT4,  0.0f,  5.0f,  &Settings_t::fMLShadow },
 	{ IDC_SLIDER5,  IDC_EDIT5, -0.30f, 0.40f, &Settings_t::fMLHighlight },
 	{ IDC_SLIDER6,  IDC_EDIT7,  0.0f,  1.00f, &Settings_t::fMLHunt },
 	{ IDC_SLIDER7,  IDC_EDIT8,  1.0f,  1.50f, &Settings_t::fMLChromaNeutral },
@@ -243,8 +243,8 @@ void CVRMainPPage::EnableControls()
 	GetDlgItem(IDC_SLIDER3).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLGammaEnabled);
 	GetDlgItem(IDC_EDIT3).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLGammaEnabled);
 	GetDlgItem(IDC_CHECK26).EnableWindow(bMLEnable);                       // shadow row
-	GetDlgItem(IDC_SLIDER4).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLShadowEnabled);
-	GetDlgItem(IDC_EDIT4).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLShadowEnabled);
+	GetDlgItem(IDC_SLIDER4).EnableWindow(bMLEnable && m_SetsPP.bMLShadowEnabled);
+	GetDlgItem(IDC_EDIT4).EnableWindow(bMLEnable && m_SetsPP.bMLShadowEnabled);
 	GetDlgItem(IDC_CHECK27).EnableWindow(bMLEnable);                       // highlight row
 	GetDlgItem(IDC_SLIDER5).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLHighlightEnabled);
 	GetDlgItem(IDC_EDIT5).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLHighlightEnabled);
@@ -772,7 +772,7 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 				float* pDst = nullptr;
 				float def = 0.f, lo = 0.f, hi = 0.f;
 				if (nID == IDC_EDIT3) { pDst = &m_SetsPP.fMLGamma; def = 1.0f; lo = 0.5f;  hi = 1.5f; }
-				if (nID == IDC_EDIT4) { pDst = &m_SetsPP.fMLShadow; def = 0.0f; lo = 0.0f;  hi = 0.5f; }
+				if (nID == IDC_EDIT4) { pDst = &m_SetsPP.fMLShadow; def = 2.0f; lo = 0.0f;  hi = 5.0f; }
 				if (nID == IDC_EDIT5) { pDst = &m_SetsPP.fMLHighlight; def = 0.0f; lo = -0.3f; hi = 0.4f; }
 				if (nID == IDC_EDIT7) { pDst = &m_SetsPP.fMLHunt; def = 0.80f; lo = 0.0f; hi = 1.0f; }
 				if (nID == IDC_EDIT8) { pDst = &m_SetsPP.fMLChromaNeutral; def = 1.20f; lo = 1.0f; hi = 1.5f; }
@@ -857,7 +857,7 @@ HRESULT CVRMainPPage::OnApplyChanges()
 		}
 	};
 	readFloat(m_hWnd, IDC_EDIT3, m_SetsPP.fMLGamma, 1.0f, 0.5f, 1.5f);
-	readFloat(m_hWnd, IDC_EDIT4, m_SetsPP.fMLShadow, 0.0f, 0.0f, 0.4f);
+	readFloat(m_hWnd, IDC_EDIT4, m_SetsPP.fMLShadow, 2.0f, 0.0f, 5.0f);
 	readFloat(m_hWnd, IDC_EDIT5, m_SetsPP.fMLHighlight, 0.0f, -0.3f, 0.4f);
 
 	m_pVideoRenderer->SetSettings(m_SetsPP);

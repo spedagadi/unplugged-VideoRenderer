@@ -154,8 +154,14 @@ struct Settings_t {
 	bool  bMLDebugLog = false;   // per-frame diagnostic CSV next to the filter
 	bool  bMLShadowDebugVis = false; // heatmap overlay showing shadow enhancement zones
 	float fMLShadowZoneCeil = 0.20f;
-	float fMLShadowSkinProtect = 0.65f;
+	float fMLShadowSkinProtect = 1.0f;
 	float fMLShadowRatioCap = 1.40f;
+	bool  bMLContrastEnabled = true;
+	float fMLContrast = 1.5f;
+	float fMLContrastZoneLo = 0.15f;
+	float fMLContrastSkinProtect = 1.0f;
+	float fMLContrastRatioCap = 1.40f;
+	bool  bMLContrastDebugVis = false;
 	bool  bTrayIcon = true;      // system tray icon when the renderer is active (opens the property page)
 	// Phase 1b — chroma vector tuning / hunt compensation
 	bool  bMLHuntEnabled = true;         // default preset: enabled
@@ -237,8 +243,14 @@ struct Settings_t {
 		bMLDebugLog                     = false;
 		bMLShadowDebugVis               = false;
 		fMLShadowZoneCeil               = 0.20f;
-		fMLShadowSkinProtect            = 0.65f;
+		fMLShadowSkinProtect            = 1.0f;
 		fMLShadowRatioCap               = 1.40f;
+		bMLContrastEnabled              = true;
+		fMLContrast                     = 1.5f;
+		fMLContrastZoneLo               = 0.15f;
+		fMLContrastSkinProtect          = 1.0f;
+		fMLContrastRatioCap             = 1.40f;
+		bMLContrastDebugVis             = false;
 		bMLHuntEnabled                  = true;
 		fMLHunt                         = 0.80f;
 		bMLChromaEnabled                = true;
