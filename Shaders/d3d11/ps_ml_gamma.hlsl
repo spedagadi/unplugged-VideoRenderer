@@ -1,6 +1,9 @@
-// Zion ML grade — ICtCp midtone gamma ("The Oracle v2").
-// Gamma adjustments on the I (intensity) channel in ICtCp perceptual space
-// do not shift Ct/Cp (chrominance), preserving skin tones and hues by design.
+// Zion ML grade — unified ICtCp tone curve ("The Oracle v3").
+// Three XGBoost models define a single tone curve on the I (intensity) channel:
+//   Shadow toe  [0, 0.4]  — DV L2 offset pedestal lift, anchors the black point
+//   Gamma       [0.5, 1.5] — DV L2 power midtone contrast, lifts/lowers midrange
+//   Highlight   [-0.3, 0.5] — DV gold curve shoulder deviation, shapes the rolloff
+// Operating in ICtCp preserves Ct/Cp (chrominance) — no skin tone or hue shift.
 #include "../convert/st2084.hlsl"
 #include "../convert/ictcp.hlsl"
 
@@ -79,12 +82,20 @@ float4 main(PS_INPUT input) : SV_Target
 	float3 ictcp = linear_to_ictcp(lin);
 
 	float I = ictcp.x;
-	float I_pre = I;
 	float I_peak = (IsPQ > 0.5) ? max(MLL1Max, 0.01) : SDR_I_PEAK_PQ;
 	float I_norm = I / I_peak;
-	float l2_gamma = MLGamma;
 
-	// Gamma grade on I channel
+	// === UNIFIED TONE CURVE (shadow toe → gamma → highlight rolloff) ===
+
+	// 1. Shadow toe: DV L2 offset pedestal lift — raises dark end toward knee
+	if (MLShadowToe > 0.005 && I_norm < MLShadowKnee && I_norm > 0.0) {
+		float t = 1.0 - I_norm / max(MLShadowKnee, 0.01);
+		I_norm += MLShadowToe * I_norm * t * t;
+		I_norm = saturate(I_norm);
+	}
+
+	// 2. Gamma: DV L2 power midtone lift/lower between the two anchors
+	float l2_gamma = MLGamma;
 	if (l2_gamma != 1.0 && I_norm > 0.001 && I_norm < 0.999) {
 		float hi = smoothstep(MLGuard, 0.98, I_norm);
 		float fade = smoothstep(0.08, 0.45, I_norm);
@@ -92,12 +103,18 @@ float4 main(PS_INPUT input) : SV_Target
 		I_norm = lerp(I_norm, pow(I_norm, 1.0 / l2_gamma), eff);
 	}
 
-	I = I_norm * I_peak;
+	// 3. Highlight rolloff: DV gold curve shoulder shaping above highlight knee
+	if (abs(MLHighlightRolloff) > 0.005 && I_norm > MLHighlightKnee && I_norm < 0.995) {
+		float span = max(1.0 - MLHighlightKnee, 0.01);
+		float t = (I_norm - MLHighlightKnee) / span;
+		float shoulder = MLHighlightRolloff * t * t * (1.0 - I_norm);
+		I_norm = saturate(I_norm + shoulder);
+	}
 
 	// Face blending disabled — testing pure ICtCp output
 	float skin_blend = 0.0;
 
-	ictcp.x = I;
+	ictcp.x = I_norm * I_peak;
 
 	// Inverse: ICtCp → linear nits → output encoding
 	float3 rgb_out = ictcp_to_linear(ictcp);

@@ -1220,11 +1220,11 @@ void CDX11VideoProcessor::SetMLParams()
 		l1max = fmaxf(0.05f, fminf(0.90f, m_MLFeatures[0]));
 	}
 
-	// Shadow gate: model MUST run whenever shadow is enabled.
-	// No model = no enhancement. The prediction is the backstop that
-	// prevents enhancement on scenes that don't need it.
-	// Shadow is independent of the tone-curve master (it's DoG detail, not tone mapping).
-	if (m_bMLShadowEnabled && m_bMLShadowModelLoaded && m_bMLFeaturesReady) {
+	// Shadow model: feeds both the unified tone curve toe (MLShadowToe) and the
+	// DoG detail gate. Runs when either the tone curve or DoG shadow is active.
+	const bool bNeedShadowPred = (m_iMLMode == ML_Auto && m_bMLToneCurveEnabled)
+	                           || m_bMLShadowEnabled;
+	if (bNeedShadowPred && m_bMLShadowModelLoaded && m_bMLFeaturesReady) {
 		float shadowPred = 0.0f;
 		if (m_MLShadowModel.Predict(m_MLFeatures, ML_FEATURE_DIM, shadowPred)) {
 			shadow = fmaxf(0.0f, fminf(0.5f, shadowPred));
