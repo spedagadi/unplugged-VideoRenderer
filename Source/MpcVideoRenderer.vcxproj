@@ -49,7 +49,9 @@
     <Link>
       <ModuleDefinitionFile>MpcVideoRenderer.def</ModuleDefinitionFile>
       <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
-      <DelayLoadDLLs>d3d9.dll;dxva2.dll;dxgi.dll;d3d11.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+      <DelayLoadDLLs>d3d9.dll;dxva2.dll;dxgi.dll;d3d11.dll;onnxruntime.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+      <AdditionalDependencies>onnxruntime.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)onnxrt;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <PreBuildEvent>
       <Command>..\update_revision.cmd</Command>
@@ -59,7 +61,8 @@
       <Message>Assembling the distributable filter folder (_bin\MpcVideoRenderer-&lt;version&gt;)</Message>
     </PostBuildEvent>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(ProjectDir)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);C:\Code\byte-track-eigen\include;C:\Code\byte-track-eigen\external\eigen</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>BUILDING_BYTE_TRACK_EIGEN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>stdafx.h</PrecompiledHeaderFile>
     </ClCompile>
@@ -81,6 +84,7 @@
     <ClCompile Include="DXVA2VP.cpp" />
     <ClCompile Include="Helper.cpp" />
     <ClCompile Include="MediaSampleSideData.cpp" />
+    <ClCompile Include="face_detect.cpp" />
     <ClCompile Include="ml_features.cpp" />
     <ClCompile Include="ml_model.cpp" />
     <ClCompile Include="tone_spline.cpp" />
@@ -103,6 +107,30 @@
     <ClCompile Include="VideoProcessor.cpp" />
     <ClCompile Include="VideoRenderer.cpp" />
     <ClCompile Include="VideoRendererInputPin.cpp" />
+    <ClCompile Include="C:\Code\byte-track-eigen\src\BaseTrack.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="C:\Code\byte-track-eigen\src\BYTETracker.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="C:\Code\byte-track-eigen\src\BoundingBoxIoUMatching.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="C:\Code\byte-track-eigen\src\BoundingBoxTrackUtils.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="C:\Code\byte-track-eigen\src\HungarianAlgorithmEigen.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="C:\Code\byte-track-eigen\src\KalmanBBoxTrack.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="C:\Code\byte-track-eigen\src\KalmanFilter.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="C:\Code\byte-track-eigen\src\LinearAssignment.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="csputils.h" />
@@ -124,6 +152,7 @@
     <ClInclude Include="Helper.h" />
     <ClInclude Include="IVideoRenderer.h" />
     <ClInclude Include="MediaSampleSideData.h" />
+    <ClInclude Include="face_detect.h" />
     <ClInclude Include="ml_features.h" />
     <ClInclude Include="ml_model.h" />
     <ClInclude Include="tone_spline.h" />

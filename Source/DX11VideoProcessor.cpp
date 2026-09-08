@@ -462,6 +462,55 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 
 	MH_EnableHook(MH_ALL_HOOKS);
 
+	// ML log file: always open at construction so every init step is captured.
+	// The m_bMLDebug flag gates per-frame verbosity, not file existence.
+	{
+		wchar_t logPath[MAX_PATH] = {};
+		swprintf_s(logPath, L"%s\\ml_debug.csv", GetMLModuleDir().c_str());
+		if (_wfopen_s(&m_pMLDebugFile, logPath, L"a") != 0 || !m_pMLDebugFile) {
+			wchar_t temp[MAX_PATH] = {};
+			GetTempPathW(MAX_PATH, temp);
+			swprintf_s(logPath, L"%smpcvr_ml_debug.csv", temp);
+			_wfopen_s(&m_pMLDebugFile, logPath, L"a");
+		}
+		if (m_pMLDebugFile) {
+			if (fseek(m_pMLDebugFile, 0, SEEK_END) == 0 && ftell(m_pMLDebugFile) == 0) {
+				fwprintf(m_pMLDebugFile, L"# ml_debug.csv — MPCVR ML diagnostic log\n");
+			}
+			fwprintf(m_pMLDebugFile, L"# init (bMLEnabled=%d bMLDebug=%d)\n", (int)m_bML, (int)m_bMLDebug);
+			fflush(m_pMLDebugFile);
+		}
+	}
+
+	// Deterministic ML init: load all models and face detection at construction
+	// time. No lazy/deferred loading — the .ax pays the cost upfront so that
+	// enabling ML grade or switching video processors incurs zero delay.
+	m_bMLModelLoadTried = true;
+	m_bMLGammaModelLoaded     = m_MLGammaModel.Load(GetMLModelPath(L"xgb_gamma_model.plxgb").c_str());
+	m_bMLShadowModelLoaded    = m_MLShadowModel.Load(GetMLModelPath(L"xgb_shadow_recovery.plxgb").c_str());
+	m_bMLHighlightModelLoaded = m_MLHighlightModel.Load(GetMLModelPath(L"xgb_highlight_rolloff.plxgb").c_str());
+	if (m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"INIT_MODELS gamma=%s shadow=%s highlight=%s\n",
+			(m_bMLGammaModelLoaded ? L"ok" : L"missing"),
+			(m_bMLShadowModelLoaded ? L"ok" : L"missing"),
+			(m_bMLHighlightModelLoaded ? L"ok" : L"missing"));
+		fflush(m_pMLDebugFile);
+	}
+	EXECUTE_ASSERT(m_bMLGammaModelLoaded);
+	EXECUTE_ASSERT(m_bMLShadowModelLoaded);
+	EXECUTE_ASSERT(m_bMLHighlightModelLoaded);
+
+	m_pFaceDetect = std::make_unique<CFaceDetect>();
+	m_pFaceDetect->SetLogFile(m_pMLDebugFile);
+	HRESULT hrFace = m_pFaceDetect->Init(GetMLModelPath(L"face_detection_yunet.onnx"));
+	if (m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"INIT_FACE hr=0x%08X ready=%d err=%s\n",
+			(unsigned)hrFace, (int)m_pFaceDetect->IsReady(),
+			m_pFaceDetect->GetLastError().c_str());
+		fflush(m_pMLDebugFile);
+	}
+	EXECUTE_ASSERT(SUCCEEDED(hrFace) && m_pFaceDetect->IsReady());
+
 	CComPtr<IDXGIAdapter> pDXGIAdapter;
 	for (UINT adapter = 0; m_pDXGIFactory1->EnumAdapters(adapter, &pDXGIAdapter) != DXGI_ERROR_NOT_FOUND; ++adapter) {
 		CComPtr<IDXGIOutput> pDXGIOutput;
@@ -500,6 +549,14 @@ CDX11VideoProcessor::~CDX11VideoProcessor()
 	m_pDXGIFactory2.Release();
 
 	ReleaseDevice();
+
+	if (m_pFaceDetect) m_pFaceDetect->Shutdown();
+	m_pFaceDetect.reset();
+
+	if (m_pMLDebugFile) {
+		fclose(m_pMLDebugFile);
+		m_pMLDebugFile = nullptr;
+	}
 
 	m_pDXGIFactory1.Release();
 
@@ -760,19 +817,19 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_SkinLUTSRV.Release();
 	m_pSamplerSkin.Release();
 	m_pPSMLDownsample.Release();
+	m_pPSFaceDown.Release();
+	m_pFaceDownParams.Release();
 	m_MLDownsample.Release();
 	m_MLStaging.Release();
+	m_FaceDownsample.Release();
+	m_FaceStaging.Release();
 	m_pMLParams.Release();
 	m_lastMLParams = {};
 	m_bMLActive = false;
+	m_bMLResourcesReady = false;
 	m_bMLFeaturesReady = false;
 	m_bMLFeaturesStale = false;
 	m_bMLConvertSeen = false;
-
-	if (m_pMLDebugFile) {
-		fclose(m_pMLDebugFile);
-		m_pMLDebugFile = nullptr;
-	}
 
 #if TEST_SHADER
 	m_pPS_TEST.Release();
@@ -1050,54 +1107,52 @@ void CDX11VideoProcessor::SetDolbyVisionDynamicParams()
 #endif
 }
 
+void CDX11VideoProcessor::InitMLResources()
+{
+	if (m_bMLResourcesReady || !m_pDevice) return;
+
+	DLog(L"CDX11VideoProcessor::InitMLResources() creating shaders...");
+	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLGamma, IDF_PS_11_ML_GAMMA));
+	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLShadow, IDF_PS_11_ML_SHADOW));
+	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLHighlight, IDF_PS_11_ML_HIGHLIGHT));
+	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLDownsample, IDF_PS_11_ML_DOWNSAMPLE));
+	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLBars, IDF_PS_11_ML_BARS));
+	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSFaceDown, IDF_PS_11_ML_FACE_DOWN));
+	{
+		struct { float IsPQ; float pad[3]; } faceDownInit = {};
+		D3D11_BUFFER_DESC bd = { sizeof(faceDownInit), D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE };
+		D3D11_SUBRESOURCE_DATA sd = { &faceDownInit };
+		m_pDevice->CreateBuffer(&bd, &sd, &m_pFaceDownParams);
+	}
+	DLog(L"CDX11VideoProcessor::InitMLResources() shaders OK");
+
+	if (SUCCEEDED(LoadSkinLUT())) {
+		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLChroma, IDF_PS_11_ML_CHROMA));
+	} else {
+		DLog(L"CDX11VideoProcessor::InitMLResources() skin LUT missing; chroma tuning disabled");
+	}
+
+	DLog(L"CDX11VideoProcessor::InitMLResources() creating textures...");
+	CreateMLTextures();
+
+	if (!m_pMLParams) {
+		D3D11_BUFFER_DESC BufferDesc = {
+			.ByteWidth = sizeof(MLParams_t),
+			.Usage = D3D11_USAGE_DEFAULT,
+			.BindFlags = D3D11_BIND_CONSTANT_BUFFER,
+		};
+		EXECUTE_ASSERT(S_OK == m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pMLParams));
+	}
+
+	m_bMLResourcesReady = true;
+	DLog(L"CDX11VideoProcessor::InitMLResources() all ML GPU resources ready");
+}
+
 void CDX11VideoProcessor::UpdateMLActive()
 {
-	// Native-SDR enhancement is out of scope (SDR->P5 emulation deferred):
-	// the ML grade runs only on HDR source content. Manual mode always applies;
-	// AUTO activates once the gamma model is loaded and features are produced.
+	// Models and GPU resources are loaded at construction / SetDevice time.
+	// This method only toggles the active flag based on source and settings.
 	InitMLDebug();
-
-	// Preload all ML models once, whenever ML is enabled — regardless of mode,
-	// active state, or whether the models are currently used. Never load or
-	// unload during playback (avoid playback hiccups); the full set stays
-	// resident for the processor's lifetime.
-	if (m_bML && !m_bMLModelLoadTried) {
-		m_bMLModelLoadTried = true;
-		m_bMLGammaModelLoaded     = m_MLGammaModel.Load(GetMLModelPath(L"xgb_gamma_model.plxgb").c_str());
-		m_bMLShadowModelLoaded    = m_MLShadowModel.Load(GetMLModelPath(L"xgb_shadow_recovery.plxgb").c_str());
-		m_bMLHighlightModelLoaded = m_MLHighlightModel.Load(GetMLModelPath(L"xgb_highlight_rolloff.plxgb").c_str());
-		DLog(L"CDX11VideoProcessor::UpdateMLActive() models: gamma={} shadow={} highlight={}",
-			(m_bMLGammaModelLoaded ? L"ok" : L"missing"),
-			(m_bMLShadowModelLoaded ? L"ok" : L"missing"),
-			(m_bMLHighlightModelLoaded ? L"ok" : L"missing"));
-	}
-
-	// Preload the full ML compute set (shaders, textures, skin LUT, params)
-	// once, independent of the active flag.
-	if (m_bML && !m_bMLResourcesReady) {
-		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLGamma, IDF_PS_11_ML_GAMMA));
-		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLShadow, IDF_PS_11_ML_SHADOW));
-		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLHighlight, IDF_PS_11_ML_HIGHLIGHT));
-		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLDownsample, IDF_PS_11_ML_DOWNSAMPLE));
-		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLBars, IDF_PS_11_ML_BARS));
-		// chroma pass exists only when the trained skin LUT is available
-		if (SUCCEEDED(LoadSkinLUT())) {
-			EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLChroma, IDF_PS_11_ML_CHROMA));
-		} else {
-			DLog(L"CDX11VideoProcessor::UpdateMLActive() skin LUT missing; chroma tuning disabled");
-		}
-		CreateMLTextures();
-		if (!m_pMLParams) {
-			D3D11_BUFFER_DESC BufferDesc = {
-				.ByteWidth = sizeof(MLParams_t),
-				.Usage = D3D11_USAGE_DEFAULT,
-				.BindFlags = D3D11_BIND_CONSTANT_BUFFER,
-			};
-			HRESULT result = m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pMLParams);
-			EXECUTE_ASSERT(S_OK == result);
-		}
-		m_bMLResourcesReady = true;
-	}
 
 	const bool bAutoReady = (m_iMLMode == ML_Auto) && m_bMLGammaModelLoaded;
 	const bool bActive = m_bML && SourceIsHDR() && (m_iMLMode == ML_Manual || bAutoReady);
@@ -1187,7 +1242,68 @@ void CDX11VideoProcessor::SetMLParams()
 	const float shadowStrength = m_bMLShadowEnabled ? fmaxf(0.0f, m_fMLShadow) : 0.0f;
 	const float contrastStrength = m_bMLContrastEnabled ? fmaxf(0.0f, m_fMLContrast) : 0.0f;
 
-	const MLParams_t params = {
+	// Scene cut detection: L2 distance across multiple histogram features
+	float sceneDelta2 = 0.0f;
+	bool hasPrev = m_fPrevSceneFeat[0] >= 0.0f;
+	for (int i = 0; i < SCENE_CUT_N; i++) {
+		const float cur = m_MLFeatures[SCENE_CUT_FEATS[i]];
+		if (hasPrev) {
+			const float d = cur - m_fPrevSceneFeat[i];
+			sceneDelta2 += d * d;
+		}
+		m_fPrevSceneFeat[i] = cur;
+	}
+	if (hasPrev && sqrtf(sceneDelta2) > SCENE_CUT_THRESH) {
+		m_pByteTracker = std::make_unique<BYTETracker>(0.5f, 30, 0.8f, 24);
+		if (m_pMLDebugFile) {
+			fwprintf(m_pMLDebugFile, L"FACE_SCENE_CUT l2=%.4f thresh=%.4f feats=%.4f,%.4f,%.4f,%.4f,%.4f\n",
+				(double)sqrtf(sceneDelta2), (double)SCENE_CUT_THRESH,
+				(double)m_MLFeatures[0], (double)m_MLFeatures[1],
+				(double)m_MLFeatures[3], (double)m_MLFeatures[5], (double)m_MLFeatures[7]);
+			fflush(m_pMLDebugFile);
+		}
+	}
+
+	// Feed synchronous face detections into ByteTracker (Kalman + Hungarian)
+	if (!m_pByteTracker)
+		m_pByteTracker = std::make_unique<BYTETracker>(0.5f, 30, 0.8f, 24);
+
+	const int nRaw = m_nSyncFaces;
+	Eigen::MatrixXf detMatrix(nRaw > 0 ? nRaw : 1, 5);
+	if (nRaw > 0) {
+		for (int i = 0; i < nRaw; i++) {
+			detMatrix(i, 0) = m_syncFaces[i].x * FACE_DETECT_W;
+			detMatrix(i, 1) = m_syncFaces[i].y * FACE_DETECT_H;
+			detMatrix(i, 2) = m_syncFaces[i].w * FACE_DETECT_W;
+			detMatrix(i, 3) = m_syncFaces[i].h * FACE_DETECT_H;
+			detMatrix(i, 4) = m_syncFaces[i].score;
+		}
+	} else {
+		detMatrix.setZero();
+	}
+	auto trackedTracks = m_pByteTracker->process_frame_detections(detMatrix);
+	// Include recently-lost tracks (Kalman-predicted positions bridge detection gaps)
+	auto lostTracks = m_pByteTracker->get_recent_lost_tracks(8);
+	trackedTracks.insert(trackedTracks.end(), lostTracks.begin(), lostTracks.end());
+
+	// Convert tracked results back to UV [0,1] for the shader
+	CFaceDetect::FaceBox faceBoxes[4] = {};
+	float faceTrackIds[4] = {};
+	int numFaces = 0;
+	const float invW = 1.0f / FACE_DETECT_W;
+	const float invH = 1.0f / FACE_DETECT_H;
+	for (const auto& trk : trackedTracks) {
+		if (numFaces >= 4) break;
+		auto box = trk.tlwh();
+		faceTrackIds[numFaces] = (float)trk.get_track_id();
+		faceBoxes[numFaces++] = {
+			(float)(box[0] * invW), (float)(box[1] * invH),
+			(float)(box[2] * invW), (float)(box[3] * invH),
+			trk.get_score()
+		};
+	}
+
+	MLParams_t params = {
 		gamma,
 		shadow,
 		0.25f,                                            // shadow knee
@@ -1198,11 +1314,6 @@ void CDX11VideoProcessor::SetMLParams()
 		hunt,                                             // hunt compensation
 		l1max,
 		0.25f,                                            // highlight desaturation
-		// The grade input is PQ iff the swap chain is in the PQ color space.
-		// Testing config flags (m_bHdrPassthrough) is wrong: an HDR-capable
-		// display running convert-to-SDR keeps bHdrPassthrough set while the
-		// frame at this stage is gamma-2.2 SDR - the PQ round-trip then
-		// corrupts the whole image even at neutral settings.
 		(m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ? 1.0f : 0.0f,
 		0.0f,
 		// Phase 1b — chroma vector tuning (per-row enables)
@@ -1228,7 +1339,38 @@ void CDX11VideoProcessor::SetMLParams()
 		m_fMLContrastZoneLo,
 		m_fMLContrastSkinProtect,
 		m_fMLContrastRatioCap,
+		// Face detection
+		m_bFaceProtectEnabled ? m_fFaceProtect : 0.0f,
+		m_fFaceFeather,
+		m_fFaceExpand,
+		m_bFaceDebugVis ? 1.0f : 0.0f,
+		numFaces,
+		{}, // _padFace[3]
 	};
+	for (int i = 0; i < numFaces; i++) {
+		params.FaceBox[i * 4 + 0] = faceBoxes[i].x;
+		params.FaceBox[i * 4 + 1] = faceBoxes[i].y;
+		params.FaceBox[i * 4 + 2] = faceBoxes[i].w;
+		params.FaceBox[i * 4 + 3] = faceBoxes[i].h;
+		params.FaceTrackId[i] = faceTrackIds[i];
+	}
+
+	if (m_pMLDebugFile && m_MLDebugFrame % 60 == 0 && numFaces > 0) {
+		fwprintf(m_pMLDebugFile, L"FACE_CBUF numFaces=%d protect=%.2f debugVis=%.0f feather=%.3f expand=%.2f srcTex=%ux%u\n",
+			numFaces, (double)params.FaceProtect, (double)params.FaceDebugVis,
+			(double)params.FaceFeather, (double)params.FaceExpand,
+			m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height);
+		for (int i = 0; i < numFaces; i++) {
+			fwprintf(m_pMLDebugFile, L"  face[%d] tid=%d x=%.4f y=%.4f w=%.4f h=%.4f score=%.3f px=(%d,%d,%d,%d)\n",
+				i, (int)faceTrackIds[i], (double)faceBoxes[i].x, (double)faceBoxes[i].y,
+				(double)faceBoxes[i].w, (double)faceBoxes[i].h, (double)faceBoxes[i].score,
+				(int)(faceBoxes[i].x * m_TexConvertOutput.desc.Width),
+				(int)(faceBoxes[i].y * m_TexConvertOutput.desc.Height),
+				(int)(faceBoxes[i].w * m_TexConvertOutput.desc.Width),
+				(int)(faceBoxes[i].h * m_TexConvertOutput.desc.Height));
+		}
+		fflush(m_pMLDebugFile);
+	}
 
 	m_lastMLParams = params;
 
@@ -1302,6 +1444,51 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	m_MLDebugFeat0 = m_MLFeatures[0];
 	m_MLDebugFeat1 = m_MLFeatures[1];
 	m_MLDebugFeatReady = 1;
+
+	// Face detection: downsample color to 480x288 BGRA8 and submit to background thread
+	if (m_FaceDownsample && m_FaceStaging && m_pFaceDetect && m_pPSFaceDown) {
+		const CRect faceRect(0, 0, 480, 288);
+		// Update IsPQ flag so face_down shader applies PQ→SDR for the detector
+		if (m_pFaceDownParams) {
+			D3D11_MAPPED_SUBRESOURCE mr2 = {};
+			if (SUCCEEDED(m_pDeviceContext->Map(m_pFaceDownParams, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr2))) {
+				struct { float IsPQ; float pad[3]; } fd = {
+					(m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ? 1.0f : 0.0f
+				};
+				memcpy(mr2.pData, &fd, sizeof(fd));
+				m_pDeviceContext->Unmap(m_pFaceDownParams, 0);
+			}
+		}
+		hr = TextureCopyRect(m_TexConvertOutput, m_FaceDownsample, texRect, faceRect, m_pPSFaceDown, m_pFaceDownParams, 0, false);
+		if (SUCCEEDED(hr)) {
+			m_pDeviceContext->CopyResource(m_FaceStaging, m_FaceDownsample);
+			D3D11_MAPPED_SUBRESOURCE faceMr = {};
+			HRESULT hrMap = m_pDeviceContext->Map(m_FaceStaging, 0, D3D11_MAP_READ, 0, &faceMr);
+			if (SUCCEEDED(hrMap)) {
+				CFaceDetect::FaceBox syncOut[4] = {};
+				m_nSyncFaces = m_pFaceDetect->DetectSync((const uint8_t*)faceMr.pData, 480, 288, faceMr.RowPitch, syncOut, 4);
+				for (int i = 0; i < m_nSyncFaces; i++) m_syncFaces[i] = syncOut[i];
+				m_pDeviceContext->Unmap(m_FaceStaging, 0);
+				if (m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
+					fwprintf(m_pMLDebugFile, L"FACE_SYNC frame=%llu n=%d ready=%d texSrc=%ux%u\n",
+						m_MLDebugFrame, m_nSyncFaces, (int)m_pFaceDetect->IsReady(),
+						m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height);
+					fflush(m_pMLDebugFile);
+				}
+			} else if (m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
+				fwprintf(m_pMLDebugFile, L"FACE_SUBMIT map_failed hr=0x%08X\n", (unsigned)hrMap);
+				fflush(m_pMLDebugFile);
+			}
+		} else if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
+			fwprintf(m_pMLDebugFile, L"FACE_SUBMIT downsample_failed hr=0x%08X\n", (unsigned)hr);
+			fflush(m_pMLDebugFile);
+		}
+	} else if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
+		fwprintf(m_pMLDebugFile, L"FACE_SUBMIT skipped ds=%d stg=%d detect=%d shader=%d frame=%llu\n",
+			(m_FaceDownsample ? 1 : 0), (m_FaceStaging ? 1 : 0),
+			(m_pFaceDetect ? 1 : 0), (m_pPSFaceDown ? 1 : 0), m_MLDebugFrame);
+		fflush(m_pMLDebugFile);
+	}
 
 	UpdateMLBarsFromDetected();
 
@@ -1470,6 +1657,28 @@ void CDX11VideoProcessor::CreateMLTextures()
 		DLog(L"CDX11VideoProcessor::CreateMLTextures() failed to create the staging texture: {}", hr);
 		m_MLDownsample.Release();
 	}
+
+	// Face detection: 480x288 BGRA8 downsample + staging
+	D3D11_TEXTURE2D_DESC faceDesc = {};
+	faceDesc.Width = 480;
+	faceDesc.Height = 288;
+	faceDesc.MipLevels = 1;
+	faceDesc.ArraySize = 1;
+	faceDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	faceDesc.SampleDesc.Count = 1;
+	faceDesc.Usage = D3D11_USAGE_DEFAULT;
+	faceDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+	hr = m_pDevice->CreateTexture2D(&faceDesc, nullptr, &m_FaceDownsample);
+	if (SUCCEEDED(hr)) {
+		D3D11_TEXTURE2D_DESC faceStg = faceDesc;
+		faceStg.Usage = D3D11_USAGE_STAGING;
+		faceStg.BindFlags = 0;
+		faceStg.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		hr = m_pDevice->CreateTexture2D(&faceStg, nullptr, &m_FaceStaging);
+		if (FAILED(hr)) {
+			m_FaceDownsample.Release();
+		}
+	}
 }
 
 // Anchor used by GetModuleHandleExW to resolve this DLL's own module handle
@@ -1498,35 +1707,16 @@ std::wstring CDX11VideoProcessor::GetMLModelPath(const wchar_t* fileName)
 
 void CDX11VideoProcessor::InitMLDebug()
 {
-	if (m_bMLDebug && !m_pMLDebugFile) {
-		wchar_t path[MAX_PATH] = {};
-		swprintf_s(path, L"%s\\ml_debug.csv", GetMLModuleDir().c_str());
-		if (_wfopen_s(&m_pMLDebugFile, path, L"a") != 0 || !m_pMLDebugFile) {
-			// fall back to the temp dir if the filter folder is not writable
-			wchar_t temp[MAX_PATH] = {};
-			GetTempPathW(MAX_PATH, temp);
-			swprintf_s(path, L"%smpcvr_ml_debug.csv", temp);
-			_wfopen_s(&m_pMLDebugFile, path, L"a");
-		}
-		if (m_pMLDebugFile && (fseek(m_pMLDebugFile, 0, SEEK_END) == 0) && ftell(m_pMLDebugFile) == 0) {
-			fwprintf(m_pMLDebugFile,
-				L"# log open\n"
-				L"frame,time_100ns,active,mode,gamma,shadow,highlight,"
-				L"ispq,swapcs,swfmt,steps,tmactive,winW,winH,srcW,srcH,vidL,vidT,vidR,vidB,"
-				L"mlmin,mlmax,mlavg,clipfrac,edgefrac,logCOPY,"
-				L"featReady,stale,convSeen,texConv,feat0,feat1,pred\n");
-		}
-		if (m_pMLDebugFile) {
-			fwprintf(m_pMLDebugFile, L"# log open (ML enabled=%d, copy=%d)\n", (m_bML ? 1 : 0), (m_bMLDebugCopy ? 1 : 0));
-			fflush(m_pMLDebugFile);
-		}
-		m_MLDebugFrame = 0;
-		DLog(L"CDX11VideoProcessor::InitMLDebug() writing ML debug log to {}", path);
-	}
-
-	if (!m_bMLDebug && m_pMLDebugFile) {
-		fclose(m_pMLDebugFile);
-		m_pMLDebugFile = nullptr;
+	// The log file is opened unconditionally in the constructor.
+	// This method only writes the per-frame CSV header when debug is toggled on.
+	if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame == 0) {
+		fwprintf(m_pMLDebugFile,
+			L"frame,time_100ns,active,mode,gamma,shadow,highlight,"
+			L"ispq,swapcs,swfmt,steps,tmactive,winW,winH,srcW,srcH,vidL,vidT,vidR,vidB,"
+			L"mlmin,mlmax,mlavg,clipfrac,edgefrac,logCOPY,"
+			L"featReady,stale,convSeen,texConv,feat0,feat1,pred\n");
+		fwprintf(m_pMLDebugFile, L"# debug on (ML enabled=%d, copy=%d)\n", (m_bML ? 1 : 0), (m_bMLDebugCopy ? 1 : 0));
+		fflush(m_pMLDebugFile);
 	}
 }
 
@@ -2085,6 +2275,8 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 	UpdateStatsStatic();
 	UpdateStatsByWindow();
 	UpdateStatsByDisplay();
+
+	InitMLResources();
 
 	return hr;
 }
@@ -4067,7 +4259,44 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			ID3D11PixelShader* psHighlight = m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLHighlight.p;
 			ID3D11PixelShader* psGamma     = m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLGamma.p;
 
+			// Remap face box UVs from convertTex [0,1] to post-scale shader UV space.
+			// The shader's input.Tex spans [rect.left/inputW .. rect.right/inputW],
+			// not [0..1], when the video is pillarboxed/letterboxed in a larger surface.
+			const float inputW = (float)pInputTexture->desc.Width;
+			const float inputH = (float)pInputTexture->desc.Height;
+			const float uvOffX = (float)rect.left / inputW;
+			const float uvOffY = (float)rect.top / inputH;
+			const float uvScX  = (float)rect.Width() / inputW;
+			const float uvScY  = (float)rect.Height() / inputH;
+			if (m_lastMLParams.NumFaces > 0 && (uvOffX > 0.001f || uvOffY > 0.001f || uvScX < 0.999f || uvScY < 0.999f)) {
+				for (int i = 0; i < m_lastMLParams.NumFaces && i < 4; i++) {
+					float& bx = m_lastMLParams.FaceBox[i * 4 + 0];
+					float& by = m_lastMLParams.FaceBox[i * 4 + 1];
+					float& bw = m_lastMLParams.FaceBox[i * 4 + 2];
+					float& bh = m_lastMLParams.FaceBox[i * 4 + 3];
+					bx = uvOffX + bx * uvScX;
+					by = uvOffY + by * uvScY;
+					bw = bw * uvScX;
+					bh = bh * uvScY;
+				}
+				m_pDeviceContext->UpdateSubresource(m_pMLParams, 0, nullptr, &m_lastMLParams, 0, 0);
+			}
+
 			HRESULT hrs[4] = {};
+			if (m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
+				fwprintf(m_pMLDebugFile, L"MLPASS rect=(%d,%d,%d,%d) inputTex=%ux%u convertTex=%ux%u uvOff=(%.4f,%.4f) uvSc=(%.4f,%.4f)\n",
+					rect.left, rect.top, rect.right, rect.bottom,
+					pInputTexture->desc.Width, pInputTexture->desc.Height,
+					m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height,
+					(double)uvOffX, (double)uvOffY, (double)uvScX, (double)uvScY);
+				if (m_lastMLParams.NumFaces > 0) {
+					for (int i = 0; i < m_lastMLParams.NumFaces && i < 4; i++)
+						fwprintf(m_pMLDebugFile, L"  FACE_REMAP[%d] x=%.4f y=%.4f w=%.4f h=%.4f\n",
+							i, (double)m_lastMLParams.FaceBox[i*4], (double)m_lastMLParams.FaceBox[i*4+1],
+							(double)m_lastMLParams.FaceBox[i*4+2], (double)m_lastMLParams.FaceBox[i*4+3]);
+				}
+				fflush(m_pMLDebugFile);
+			}
 			if (m_bMLDebug && m_pMLDebugFile) {
 				fwprintf(m_pMLDebugFile, L"MLPASS enter step=%u\n", (unsigned)(step + 1));
 			}
@@ -4759,7 +4988,12 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			config.bMLChromaSkinEnabled != m_bMLChromaSkinEnabled ||
 			config.fMLChromaSkinProtect != m_fMLChromaSkinProtect ||
 			config.bMLBars != m_bMLBarsEnabled ||
-			config.bMLBarsHighlight != m_bMLBarsHighlight) {
+			config.bMLBarsHighlight != m_bMLBarsHighlight ||
+			config.bMLFaceProtectEnabled != m_bFaceProtectEnabled ||
+			config.fMLFaceProtect != m_fFaceProtect ||
+			config.fMLFaceFeather != m_fFaceFeather ||
+			config.fMLFaceExpand != m_fFaceExpand ||
+			config.bMLFaceDebugVis != m_bFaceDebugVis) {
 		m_bML          = config.bMLEnabled;
 		m_iMLMode      = config.iMLMode;
 		m_fMLGamma     = config.fMLGamma;
@@ -4794,6 +5028,11 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_fMLChromaSkinProtect = config.fMLChromaSkinProtect;
 		m_bMLBarsEnabled   = config.bMLBars;
 		m_bMLBarsHighlight = config.bMLBarsHighlight;
+		m_bFaceProtectEnabled = config.bMLFaceProtectEnabled;
+		m_fFaceProtect     = config.fMLFaceProtect;
+		m_fFaceFeather     = config.fMLFaceFeather;
+		m_fFaceExpand      = config.fMLFaceExpand;
+		m_bFaceDebugVis    = config.bMLFaceDebugVis;
 		DLog(L"CDX11VideoProcessor::Configure() configSeq=%u ML: enable=%d mode=%d toneCurve=%d gamma=%.3f(en=%d) shadow=%.3f(en=%d) "
 			L"highlight=%.3f(en=%d) chroma=%d hunt=%.2f(en=%d) chN=%.2f(en=%d) chF=%.2f(en=%d) "
 			L"knee=%.2f skin=%.2f bars=%d barsHL=%d debugLog=%d debugCopy=%d sizeof(Settings_t)=%zu",

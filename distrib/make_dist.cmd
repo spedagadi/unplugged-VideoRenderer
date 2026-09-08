@@ -75,6 +75,15 @@ IF EXIST "models\xgb_gamma_model.plxgb" (
   ECHO [WARN] models\*.plxgb not found - AUTO mode will be unavailable.
 )
 
+IF EXIST "Source\onnxrt\onnxruntime.dll" (
+  COPY /Y "Source\onnxrt\onnxruntime.dll" "%DIST_DIR%\" >NUL
+) ELSE (
+  ECHO [WARN] onnxruntime.dll not found - face detection will be unavailable.
+)
+IF EXIST "Source\onnxrt\face_detection_yunet.onnx" (
+  COPY /Y "Source\onnxrt\face_detection_yunet.onnx" "%DIST_DIR%\" >NUL
+)
+
 ECHO.
 ECHO Distribution folder ready:  "%CD%\%DIST_DIR%"
 ECHO.

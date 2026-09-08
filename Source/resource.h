@@ -94,6 +94,7 @@
 #define IDF_PS_11_ML_DOWNSAMPLE         886
 #define IDF_PS_11_ML_CHROMA             887
 #define IDF_PS_11_ML_BARS               890
+#define IDF_PS_11_ML_FACE_DOWN          891
 #define IDF_PS_11_TEST                  900
 #define IDC_EDIT1                       1001
 #define IDC_EDIT2                       1002

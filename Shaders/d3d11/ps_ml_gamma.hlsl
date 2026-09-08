@@ -1,13 +1,8 @@
-// Zion ML grade — midtone gamma ("The Oracle").
-// Port of libplacebo's l2_hook (src/ml_render.c).
-//
-// Operates on gamma-2.2 encoded luma: raises/lowers the midtones via the
-// smoothstep(0.08, 0.45) fade-in band, guarded from the highlights by an
-// adaptive guard threshold, with hunt compensation and highlight desaturation.
-// When IsPQ != 0 the signal is wrapped PQ -> linear -> gamma2.2 before the
-// grade and unwrapped after (HDR passthrough output); HDR->SDR output is
-// already gamma-2.2-like and is graded in place.
+// Zion ML grade — ICtCp midtone gamma ("The Oracle v2").
+// Gamma adjustments on the I (intensity) channel in ICtCp perceptual space
+// do not shift Ct/Cp (chrominance), preserving skin tones and hues by design.
 #include "../convert/st2084.hlsl"
+#include "../convert/ictcp.hlsl"
 
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
@@ -20,19 +15,18 @@ struct PS_INPUT
 
 cbuffer MLParams : register(b0)
 {
-	float MLGamma;           // predicted gamma [0.5, 1.5], 1.0 = neutral
-	float MLShadowToe;       // shared cbuffer; unused here
+	float MLGamma;
+	float MLShadowToe;
 	float MLShadowKnee;
 	float MLShadowDehaze;
 	float MLHighlightRolloff;
 	float MLHighlightKnee;
-	float MLGuard;            // highlight guard (adaptive on scene peak)
-	float MLHunt;             // hunt/chroma compensation
-	float MLL1Max;            // scene peak in PQ
-	float MLHiDesat;          // highlight desaturation strength
-	float IsPQ;               // 1 = input is PQ (HDR passthrough), 0 = gamma-2.2 (HDR->SDR)
+	float MLGuard;
+	float MLHunt;
+	float MLL1Max;
+	float MLHiDesat;
+	float IsPQ;
 	float Padding;
-	// Phase 1b — chroma vector tuning (unused in this pass, layout shared)
 	float MLChromaNeutral;
 	float MLChromaFire;
 	float MLChromaKnee;
@@ -49,80 +43,97 @@ cbuffer MLParams : register(b0)
 	float _reserved3;
 	float _reserved4;
 	float _reserved5;
+	float uBarTop;
+	float uBarBottom;
+	float uBarV0;
+	float uBarSpan;
+	float uBarFeather;
+	float uBarBlack;
+	float uBarHighlight;
+	float _padBar;
+	float MCStrength;
+	float MCZoneLo;
+	float MCSkinProtect;
+	float MCRatioCap;
+	float FaceProtect;
+	float FaceFeather;
+	float FaceExpand;
+	float FaceDebugVis;
+	int   NumFaces;
+	float3 _padFace;
+	float4 FaceBox[4];
+	float4 FaceTrackId;
 };
-
-static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
 
 float4 main(PS_INPUT input) : SV_Target
 {
 	float4 color = tex.Sample(samp, input.Tex);
 
+	// Convert to linear nits → ICtCp
+	float3 lin;
 	if (IsPQ > 0.5) {
-		color.rgb = ST2084ToLinear(color, 10000.0f).rgb;
-		color.rgb = pow(max(color.rgb, 0.0), 1.0 / 2.2);
+		lin = ST2084ToLinear(float4(color.rgb, 0.0), 10000.0).rgb;
+	} else {
+		lin = pow(max(color.rgb, 0.0), 2.2) * SDR_PEAK_NITS;
 	}
+	float3 ictcp = linear_to_ictcp(lin);
 
-	uint texw, texh;
-	tex.GetDimensions(texw, texh);
-	const float2 texsz = float2((float)texw, (float)texh);
-
-	float y = dot(color.rgb, luma_w);
-	float cb = color.b - y;
-	float cr = color.r - y;
-	float y_pre = y;
+	float I = ictcp.x;
+	float I_pre = I;
+	float I_peak = (IsPQ > 0.5) ? max(MLL1Max, 0.01) : SDR_I_PEAK_PQ;
+	float I_norm = I / I_peak;
 	float l2_gamma = MLGamma;
 
-	if (l2_gamma != 1.0 && y > 0.001 && y < 0.999) {
-		float hi = smoothstep(MLGuard, 0.98, y);
-		if (l2_gamma > 1.0) {
-			float fade = smoothstep(0.08, 0.45, y);
-			float eff = fade * (1.0 - hi);
-			y = lerp(y, pow(y, 1.0 / l2_gamma), eff);
-		} else {
-			// symmetric gamma: for l2_gamma < 1 the exponent 1/l2_gamma > 1,
-			// so darker values get pushed DOWN (midtone darken). (libplacebo's
-			// original else-branch used pow(y, lerp(1.0, l2_gamma, ...)) which
-			// also raised values - both sides brightened, making 1.5 vs 0.75
-			// visually indistinguishable.)
-			float fade2 = smoothstep(0.08, 0.45, y);
-			float eff = fade2 * (1.0 - hi);
-			y = lerp(y, pow(y, 1.0 / l2_gamma), eff);
-		}
+	// Gamma grade on I channel
+	if (l2_gamma != 1.0 && I_norm > 0.001 && I_norm < 0.999) {
+		float hi = smoothstep(MLGuard, 0.98, I_norm);
+		float fade = smoothstep(0.08, 0.45, I_norm);
+		float eff = fade * (1.0 - hi);
+		I_norm = lerp(I_norm, pow(I_norm, 1.0 / l2_gamma), eff);
 	}
 
-	// Hunt/desat only accompany an actual gamma; at gamma == 1.0 the pass is
-	// exactly identity (libplacebo does not even register the L2 hook then).
-	if (l2_gamma != 1.0) {
-		float hunt = 1.0 + MLHunt * pow(MLL1Max, 2.0);
-		if (y > 0.001 && y_pre > 0.001) {
-			float gamma_comp = pow(y_pre / y, 0.15);
-			cr *= hunt * gamma_comp;
-			cb *= hunt * gamma_comp;
-		}
-		float desat = smoothstep(MLGuard, 0.95, y);
-		cr *= (1.0 - desat * MLHiDesat);
-		cb *= (1.0 - desat * MLHiDesat);
-	}
+	I = I_norm * I_peak;
 
-	float r_out = y + cr;
-	float g_out = y - 0.2126 / 0.7152 * cr - 0.0722 / 0.7152 * cb;
-	float b_out = y + cb;
-	float mx = max(max(r_out, g_out), b_out);
-	float mn = min(min(r_out, g_out), b_out);
-	if (mx > 1.0 || mn < 0.0) {
-		float s = 1.0;
-		if (mx > 1.0 && mx > y + 0.001) s = min(s, (1.0 - y) / (mx - y));
-		if (mn < 0.0 && mn < y - 0.001) s = min(s, y / (y - mn));
-		cr *= max(s, 0.0);
-		cb *= max(s, 0.0);
-	}
+	// Face blending disabled — testing pure ICtCp output
+	float skin_blend = 0.0;
 
-	color.r = saturate(y + cr);
-	color.g = saturate(y - 0.2126 / 0.7152 * cr - 0.0722 / 0.7152 * cb);
-	color.b = saturate(y + cb);
+	ictcp.x = I;
+
+	// Inverse: ICtCp → linear nits → output encoding
+	float3 rgb_out = ictcp_to_linear(ictcp);
+
 	if (IsPQ > 0.5) {
-		color.rgb = pow(max(color.rgb, 0.0), 2.2);
-		color.rgb = LinearToST2084(color, 10000.0f).rgb;
+		color.rgb = LinearToST2084(float4(rgb_out, 0.0), 10000.0).rgb;
+	} else {
+		color.rgb = pow(saturate(rgb_out / SDR_PEAK_NITS), 1.0 / 2.2);
+	}
+
+	// Debug: track-colored ellipses
+	if (FaceDebugVis > 0.5 && NumFaces > 0) {
+		uint texw, texh;
+		tex.GetDimensions(texw, texh);
+		float2 texsz = float2((float)texw, (float)texh);
+		float2 uv = input.Tex;
+		float lineW = 2.5 / texsz.x;
+		float trackIds[4] = { FaceTrackId.x, FaceTrackId.y, FaceTrackId.z, FaceTrackId.w };
+
+		if (skin_blend > 0.01) {
+			color.rgb = lerp(color.rgb, float3(0.0, 1.0, 0.3), skin_blend * 0.4);
+		}
+
+		for (int fi = 0; fi < NumFaces; fi++) {
+			float4 box = FaceBox[fi];
+			float2 center = box.xy + box.zw * 0.5;
+			float2 radius = box.zw * 0.5 * FaceExpand;
+			float2 dd = (uv - center) / max(radius, 0.001);
+			float r = length(dd);
+
+			float hue = frac(trackIds[fi] * 0.618034);
+			float3 trkColor = saturate(abs(frac(hue + float3(0.0, 0.6667, 0.3333)) * 6.0 - 3.0) - 1.0);
+			if (abs(r - 1.0) < lineW / min(radius.x, radius.y)) {
+				color.rgb = trkColor;
+			}
+		}
 	}
 
 	return color;

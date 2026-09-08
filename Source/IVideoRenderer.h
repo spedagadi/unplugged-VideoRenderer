@@ -175,6 +175,12 @@ struct Settings_t {
 	float fMLChromaKnee = 0.55f;
 	bool  bMLChromaSkinEnabled = true;
 	float fMLChromaSkinProtect = 0.95f;
+	// Face detection
+	bool  bMLFaceProtectEnabled = true;
+	float fMLFaceProtect = 0.80f;   // face gamma protection strength [0,1]
+	float fMLFaceFeather = 0.04f;   // SDF feather width in UV
+	float fMLFaceExpand = 1.50f;    // box expansion factor
+	bool  bMLFaceDebugVis = false;  // red rectangle overlay on detected faces
 	// P0 black bars
 	bool  bMLBars = true;           // repaint detected letterbox bars
 	bool  bMLBarsHighlight = false; // red debug overlay
@@ -262,6 +268,11 @@ struct Settings_t {
 		fMLChromaKnee                   = 0.55f;
 		bMLChromaSkinEnabled            = true;
 		fMLChromaSkinProtect            = 0.95f;
+		bMLFaceProtectEnabled           = true;
+		fMLFaceProtect                  = 0.80f;
+		fMLFaceFeather                  = 0.04f;
+		fMLFaceExpand                   = 1.50f;
+		bMLFaceDebugVis                 = false;
 		bMLBars                         = true;
 		bMLBarsHighlight                = false;
 		configSeq                       = 0;

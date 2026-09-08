@@ -34,8 +34,11 @@
 #include "SubPic/DX11SubPic.h"
 #include "ml_model.h"
 #include "ml_features.h"
+#include "face_detect.h"
+#include "BYTETracker.h"
 
 #include <atomic>
+#include <memory>
 
 #define TEST_SHADER 0
 
@@ -154,6 +157,15 @@ private:
 		float MCZoneLo;            // zone floor where contrast fades in
 		float MCSkinProtect;       // skin protection for contrast band
 		float MCRatioCap;          // ratio cap for contrast band
+		// Face detection results
+		float FaceProtect;         // protection strength (0 = off, 1 = full)
+		float FaceFeather;         // feather width in UV space
+		float FaceExpand;          // box expansion factor (1.5 = 50% larger)
+		float FaceDebugVis;        // 1.0 = draw red debug rectangles
+		int   NumFaces;            // 0-4
+		float _padFace[3];         // align FaceBox to 16-byte boundary
+		float FaceBox[16];         // 4 x (x, y, w, h) in UV [0,1]
+		float FaceTrackId[4];      // ByteTrack persistent ID per face slot
 	};
 	MLParams_t m_lastMLParams = {};
 	CComPtr<ID3D11Buffer> m_pMLParams;
@@ -191,6 +203,27 @@ private:
 	float m_fMLContrastZoneLo = 0.15f;
 	float m_fMLContrastSkinProtect = 0.65f;
 	float m_fMLContrastRatioCap = 1.40f;
+	// Face detection (YuNet via ONNX Runtime)
+	std::unique_ptr<CFaceDetect> m_pFaceDetect;
+	CComPtr<ID3D11Texture2D>     m_FaceDownsample;   // 480x288 BGRA8
+	CComPtr<ID3D11Texture2D>     m_FaceStaging;      // CPU-readable copy
+	CComPtr<ID3D11PixelShader>   m_pPSFaceDown;      // color downsample shader
+	CComPtr<ID3D11Buffer>        m_pFaceDownParams;  // tiny cbuffer: IsPQ flag for PQ→SDR
+	bool  m_bFaceProtectEnabled = true;
+	float m_fFaceProtect = 0.8f;
+	float m_fFaceFeather = 0.12f;
+	float m_fFaceExpand = 2.0f;
+	bool  m_bFaceDebugVis = false;
+	// ByteTrack multi-object tracker (Kalman + Hungarian)
+	std::unique_ptr<BYTETracker> m_pByteTracker;
+	static constexpr int FACE_DETECT_W = 480;
+	static constexpr int FACE_DETECT_H = 288;
+	CFaceDetect::FaceBox m_syncFaces[4] = {};
+	int m_nSyncFaces = 0;
+	static constexpr int SCENE_CUT_FEATS[] = {0, 1, 3, 5, 7}; // maxscl, avg, p25, p75, p99
+	static constexpr int SCENE_CUT_N = 5;
+	static constexpr float SCENE_CUT_THRESH = 0.12f;
+	float m_fPrevSceneFeat[SCENE_CUT_N] = {-1, -1, -1, -1, -1};
 	FILE* m_pMLDebugFile = nullptr;
 	uint64_t m_MLDebugFrame = 0;
 	uint64_t m_MLDebugStepCount = 0;
@@ -411,6 +444,7 @@ private:
 	void ExtractMLFeatures();
 	void UpdateMLBarsFromDetected();
 	void CreateMLTextures();
+	void InitMLResources();
 	std::wstring GetMLModelPath(const wchar_t* fileName);
 	void InitMLDebug();
 	void LogMLFrame();

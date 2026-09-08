@@ -1,11 +1,9 @@
-// Zion ML grade — chroma vector tuning ("Spectrum Shift").
-// Port of libplacebo's chroma_tuner_hook (src/ml_render.c, trained-LUT body).
-//
-// Decomposes the gamma-2.2 signal into luma + chroma residuals, applies an
-// adaptive chroma boost that ramps neutral->fire above the knee, and protects
-// skin tones via a trained P(skin) LUT (WIDER FACE). When MLChromaGate is off
-// (feature disabled or DoVi preferred) the pass outputs its input unchanged.
+// Zion ML grade — chroma vector tuning (ICtCp "Spectrum Shift v2").
+// Adaptive chroma boost on Ct/Cp channels in ICtCp perceptual space.
+// Skin protection via trained P(skin) LUT (detection in Cr/Cb, boost in Ct/Cp).
+// When MLChromaGate is off the pass outputs its input unchanged.
 #include "../convert/st2084.hlsl"
+#include "../convert/ictcp.hlsl"
 
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
@@ -32,16 +30,15 @@ cbuffer MLParams : register(b0)
 	float MLHiDesat;
 	float IsPQ;
 	float Padding;
-	// Phase 1b — chroma vector tuning
-	float MLChromaNeutral;     // chroma gain at/below the knee (1.0 == off)
-	float MLChromaFire;        // chroma gain above the knee
-	float MLChromaKnee;        // luma knee for the transition
-	float MLChromaSkinProtect; // 0..1, pulls the boost toward 1 on skin
-	float MLSkinLUTCR0;        // P(skin) grid bounds (cr/cb)
+	float MLChromaNeutral;
+	float MLChromaFire;
+	float MLChromaKnee;
+	float MLChromaSkinProtect;
+	float MLSkinLUTCR0;
 	float MLSkinLUTCR1;
 	float MLSkinLUTCB0;
 	float MLSkinLUTCB1;
-	float MLChromaGate;        // 1.0 = pass active
+	float MLChromaGate;
 	float MLHuntGate;
 	float _reserved0;
 	float _reserved1;
@@ -57,53 +54,59 @@ float4 main(PS_INPUT input) : SV_Target
 {
 	float4 color = tex.Sample(samp, input.Tex);
 
+	if (MLChromaGate < 0.5)
+		return color;
+
+	// Convert to linear nits → ICtCp
+	float3 lin;
 	if (IsPQ > 0.5) {
-		color.rgb = ST2084ToLinear(color, 10000.0f).rgb;
-		color.rgb = pow(max(color.rgb, 0.0), 1.0 / 2.2);
+		lin = ST2084ToLinear(float4(color.rgb, 0.0), 10000.0).rgb;
+	} else {
+		lin = pow(max(color.rgb, 0.0), 2.2) * SDR_PEAK_NITS;
+	}
+	float3 ictcp = linear_to_ictcp(lin);
+
+	// Skin detection: use gamma-2.2 Cr/Cb with existing trained LUT
+	float3 g22;
+	if (IsPQ > 0.5) {
+		g22 = pow(max(lin, 0.0), 1.0 / 2.2);
+	} else {
+		g22 = color.rgb;
+	}
+	float y_g22 = dot(g22, luma_w);
+	float cr = (g22.r - y_g22) / 1.5748;
+	float cb = (g22.b - y_g22) / 1.8556;
+	float2 skin_uv = saturate(float2(
+		(cr - MLSkinLUTCR0) / (MLSkinLUTCR1 - MLSkinLUTCR0),
+		(cb - MLSkinLUTCB0) / (MLSkinLUTCB1 - MLSkinLUTCB0)));
+	float skin_weight = skin_lut.Sample(sampSkin, skin_uv).r;
+
+	// Chroma boost ramp: neutral below knee, fire above
+	float I_peak = (IsPQ > 0.5) ? max(MLL1Max, 0.01) : SDR_I_PEAK_PQ;
+	float I_norm = ictcp.x / I_peak;
+	float luma_boost = MLChromaNeutral;
+	float denom = 1.0 - MLChromaKnee;
+	if (I_norm > MLChromaKnee && denom > 0.001) {
+		float t = saturate((I_norm - MLChromaKnee) / denom);
+		luma_boost = lerp(MLChromaNeutral, MLChromaFire, pow(t, 1.5));
 	}
 
-	if (MLChromaGate > 0.5) {
-		const float y = dot(color.rgb, luma_w);
-		float r_res = color.r - y;
-		float b_res = color.b - y;
-		float cb = b_res / 1.8556;
-		float cr = r_res / 1.5748;
+	// Suppress boost on skin
+	float chroma_scalar = lerp(luma_boost, 1.0,
+	                           saturate(skin_weight * MLChromaSkinProtect));
+	chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);
 
-		// trained P(skin) lookup (sampled like libplacebo: lattice uv directly)
-		float2 uv = float2((cr - MLSkinLUTCR0) / (MLSkinLUTCR1 - MLSkinLUTCR0),
-		                   (cb - MLSkinLUTCB0) / (MLSkinLUTCB1 - MLSkinLUTCB0));
-		uv = saturate(uv);
-		float skin_weight = skin_lut.Sample(sampSkin, uv).r;
+	// Scale Ct/Cp — perceptually uniform chroma boost
+	ictcp.y *= chroma_scalar;
+	ictcp.z *= chroma_scalar;
 
-		float luma_boost = MLChromaNeutral;
-		float denom = 1.0 - MLChromaKnee;
-		if (y > MLChromaKnee && denom > 0.001) {
-			float t = saturate((y - MLChromaKnee) / denom);
-			luma_boost = lerp(MLChromaNeutral, MLChromaFire, pow(t, 1.5));
-		}
-		float chroma_scalar = lerp(luma_boost, 1.0,
-		                           saturate(skin_weight * MLChromaSkinProtect));
-		chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);
-
-		// green-safe taper: never let the reconstruction take G negative
-		float g_denom = (0.2126 / 0.7152) * r_res + (0.0722 / 0.7152) * b_res;
-		if (g_denom > 0.0) {
-			float max_safe = y / g_denom;
-			if (max_safe < chroma_scalar) {
-				chroma_scalar = max(1.0, max_safe);
-			}
-		}
-
-		r_res *= chroma_scalar;
-		b_res *= chroma_scalar;
-		color.r = saturate(y + r_res);
-		color.g = saturate(y - (0.2126 / 0.7152) * r_res - (0.0722 / 0.7152) * b_res);
-		color.b = saturate(y + b_res);
-	}
+	// Inverse: ICtCp → linear nits → output
+	float3 rgb_out = ictcp_to_linear(ictcp);
 
 	if (IsPQ > 0.5) {
-		color.rgb = pow(max(color.rgb, 0.0), 2.2);
-		color.rgb = LinearToST2084(color, 10000.0f).rgb;
+		color.rgb = LinearToST2084(float4(rgb_out, 0.0), 10000.0).rgb;
+	} else {
+		color.rgb = pow(saturate(rgb_out / SDR_PEAK_NITS), 1.0 / 2.2);
 	}
 
 	return color;
