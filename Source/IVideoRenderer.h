@@ -157,7 +157,7 @@ struct Settings_t {
 	float fMLShadowSkinProtect = 1.0f;
 	float fMLShadowRatioCap = 1.40f;
 	bool  bMLContrastEnabled = true;
-	float fMLContrast = 1.5f;
+	float fMLContrast = 0.15f; // micro-contrast clarity strength [0, 0.5]
 	float fMLContrastZoneLo = 0.15f;
 	float fMLContrastSkinProtect = 1.0f;
 	float fMLContrastRatioCap = 1.40f;
@@ -252,7 +252,7 @@ struct Settings_t {
 		fMLShadowSkinProtect            = 1.0f;
 		fMLShadowRatioCap               = 1.40f;
 		bMLContrastEnabled              = true;
-		fMLContrast                     = 1.5f;
+		fMLContrast                     = 0.15f; // micro-contrast clarity strength [0, 0.5]
 		fMLContrastZoneLo               = 0.15f;
 		fMLContrastSkinProtect          = 1.0f;
 		fMLContrastRatioCap             = 1.40f;

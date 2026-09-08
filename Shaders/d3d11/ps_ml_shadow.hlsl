@@ -1,8 +1,10 @@
-// Zion ML grade — dual-band detail enhancement (ICtCp).
-// Band 1 (shadow detail): DoG σ=1/σ=2 — fine texture in shadows.
-// Band 2 (contrast recovery): DoG σ=2/σ=4 — medium structure in midtones.
-// DoG computed in gamma-2.2 luma (efficient for frequency decomposition).
-// Boost applied to ICtCp I channel — no chroma shift, no skin protection needed.
+// Zion ML grade — micro-contrast (texture enhancement, ICtCp).
+// Multiplicative clarity on a gamma-2.2 luma surface, applied to the ICtCp I
+// channel: I_out = I * exp(MCStrength * zone * log(lum / blur_s1(lum))).
+// Halos are impossible (multiplicative, ratio-form), smooth ramps are
+// identity (lum ≈ blur), and shadows are gated by MCZoneLo. MCStrength is
+// slider × per-scene automatic texture gate (computed CPU-side).
+// Dual-band DoG infra (blur_s2/s4) retained unused for future detail bands.
 #include "../convert/st2084.hlsl"
 #include "../convert/ictcp.hlsl"
 
@@ -116,6 +118,61 @@ float blur_s4(float2 uv, float2 texel)
 
 float4 main(PS_INPUT input) : SV_Target
 {
-	// Shadow/contrast enhancement disabled — investigating gradient artifacts
-	return tex.Sample(samp, input.Tex);
+	float4 color = tex.Sample(samp, input.Tex);
+
+	// Fast path: micro-contrast disabled this frame (slider off or the
+	// automatic texture gate zeroed this scene). Skip it only when the debug
+	// heat is also off — heat must still draw to show the gate is live.
+	if (MCStrength < 0.001 && _reserved4 < 0.5)
+		return color;
+
+	// Convert to linear nits → ICtCp
+	float3 lin;
+	if (IsPQ > 0.5) {
+		lin = ST2084ToLinear(float4(color.rgb, 0.0), 10000.0).rgb;
+	} else {
+		lin = pow(max(color.rgb, 0.0), 2.2) * SDR_PEAK_NITS;
+	}
+	float3 ictcp = linear_to_ictcp(lin);
+
+	float I = ictcp.x;
+	float I_peak = (IsPQ > 0.5) ? max(MLL1Max, 0.01) : SDR_I_PEAK_PQ;
+	float I_norm = I / I_peak;
+
+	// Micro-contrast clarity (Design B, multiplicative — halo-impossible):
+	// per-pixel deviation from a σ≈1 gamma-2.2 surround, lifted in log space.
+	uint texw, texh;
+	tex.GetDimensions(texw, texh);
+	const float2 texel = 1.0f / float2((float)texw, (float)texh);
+	float lm    = sample_gamma_luma(input.Tex);
+	float b     = blur_s1(input.Tex, texel);   // fine surround (σ≈1)
+	float logr  = clamp(log(lm / max(b, 1e-5)), -1.0, 1.0);
+	float zone  = smoothstep(MCZoneLo, MCZoneLo + 0.15f, I_norm); // shadow gate
+	float lift  = exp(MCStrength * zone * logr);
+
+	// Excursion bound: dark side is naturally safe (lift<1); cap the bright side
+	// so no pixel exceeds ~(1 + RatioCap×strength) × its input.
+	float I_out = I_norm * lift;
+	I_out = min(I_out, I_norm * (1.0 + MCRatioCap * MCStrength));
+
+	ictcp.x = I_out * I_peak;
+
+	// Inverse: ICtCp → linear nits → output encoding
+	float3 rgb_out = ictcp_to_linear(ictcp);
+	if (IsPQ > 0.5) {
+		color.rgb = LinearToST2084(float4(rgb_out, 0.0), 10000.0).rgb;
+	} else {
+		color.rgb = pow(saturate(rgb_out / SDR_PEAK_NITS), 1.0 / 2.2);
+	}
+
+	// Debug heat: green shows the zone gate (independent of strength — so a
+	// zero-gate scene still proves the pass ran); brightness encodes strength.
+	// Channel: _reserved4 (bMLContrastDebugVis).
+	if (_reserved4 > 0.5) {
+		float g = saturate(zone);
+		float s = saturate(MCStrength * 4.0);
+		color.rgb = lerp(color.rgb, float3(0.1, 1.0, 0.3) * (0.35f + 0.65f * s), g * 0.6f);
+	}
+
+	return color;
 }

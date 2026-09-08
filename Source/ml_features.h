@@ -48,4 +48,5 @@ struct MLBarBounds {
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch,
                      float features[ML_FEATURE_DIM],
                      MLLumaDomain domain = MLLumaDomain::PQ,
-                     MLBarBounds* bars = nullptr);
+                     MLBarBounds* bars = nullptr,
+                     float* outTextureEnergy = nullptr);

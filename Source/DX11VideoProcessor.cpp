@@ -418,6 +418,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_fMLHighlight          = config.fMLHighlight;
 	m_bMLDebugCopy          = config.bMLDebugCopy;
 	m_bMLDebug              = config.bMLDebugLog;
+	if (m_pFaceDetect) m_pFaceDetect->SetLogEnabled(m_bMLDebug);   // per-frame face lines follow the flag
 	m_bMLShadowDebugVis    = config.bMLShadowDebugVis;
 	m_bMLContrastDebugVis  = config.bMLContrastDebugVis;
 	m_fMLShadowZoneCeil    = config.fMLShadowZoneCeil;
@@ -830,6 +831,10 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_bMLFeaturesReady = false;
 	m_bMLFeaturesStale = false;
 	m_bMLConvertSeen = false;
+	m_MLIIRGamma = 1.0f;
+	m_MLPrevL1Max = -1.0f;
+	m_MLRawTexture = 0.0f;
+	m_MLTextureSmooth = 0.0f;
 
 #if TEST_SHADER
 	m_pPS_TEST.Release();
@@ -1170,6 +1175,8 @@ void CDX11VideoProcessor::UpdateMLActive()
 	m_bMLConvertSeen = false;
 	m_MLIIRGamma = 1.0f;
 	m_MLPrevL1Max = -1.0f;
+	m_MLRawTexture = 0.0f;
+	m_MLTextureSmooth = 0.0f;
 	m_MLBarDetected = {};
 	m_MLCropTop = 0;
 	m_MLCropBot = ML_DOWNSAMPLE_H - 1;
@@ -1186,6 +1193,18 @@ void CDX11VideoProcessor::SetMLParams()
 	float shadow  = 0.0f;
 	float rolloff = 0.0f;
 	float l1max   = 0.5f;
+
+	// Micro-contrast texture gate: IIR-filter the raw texture energy, snapping
+	// on the same scene-jump anchor as the gamma filter (features[0] = maxscl).
+	// Placed BEFORE the gamma branch so m_MLPrevL1Max still holds last frame.
+	if (m_bMLFeaturesReady) {
+		const float f0now = m_MLFeatures[0];
+		if (m_MLPrevL1Max < 0.0f || fabsf(f0now - m_MLPrevL1Max) > 0.15f) {
+			m_MLTextureSmooth = m_MLRawTexture;
+		} else {
+			m_MLTextureSmooth = 0.10f * m_MLRawTexture + 0.90f * m_MLTextureSmooth;
+		}
+	}
 
 	if (m_iMLMode == ML_Manual) {
 		gamma   = (m_bMLToneCurveEnabled && m_bMLGammaEnabled) ? discard<float>(m_fMLGamma, 1.0f, 0.5f, 1.5f) : 1.0f;
@@ -1241,7 +1260,33 @@ void CDX11VideoProcessor::SetMLParams()
 	const bool bChromaActive = m_bMLChromaEnabled;
 
 	const float shadowStrength = 0.0f;
-	const float contrastStrength = m_bMLContrastEnabled ? fmaxf(0.0f, m_fMLContrast) : 0.0f;
+	// Micro-contrast strength = user slider (clarity exponent, cap 0.5) × the
+	// automatic per-scene texture gate. The gate NORMALIZES the raw texture
+	// energy into [0,1]: the raw fraction is ~0.006 on box-averaged luma and
+	// crushed strength below the shader's 0.001 fast-path. Textured scenes
+	// (raw ≥ kMCGateRef) get the full slider; flat scenes stay ~0.
+	const float kMCGateRef = 0.02f;
+	const float mcGate = m_bMLFeaturesReady
+		? fminf(1.0f, m_MLTextureSmooth / kMCGateRef)
+		: 0.0f;
+	const float contrastStrength = m_bMLContrastEnabled
+		? fmaxf(0.0f, fminf(m_fMLContrast, 0.50f) * mcGate)
+		: 0.0f;
+	if (m_bMLDebug && m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"MC_TRACE frame=%llu featsReady=%d enabled=%d cf=%.4f raw=%.4f smooth=%.4f strength=%.4f zoneLo=%.3f ratioCap=%.3f maxscl=%.4f debugVis=%d\n",
+			(unsigned long long)m_MLDebugFrame, (int)m_bMLFeaturesReady, (int)m_bMLContrastEnabled,
+			(double)m_fMLContrast, (double)m_MLRawTexture, (double)m_MLTextureSmooth,
+			(double)contrastStrength, (double)m_fMLContrastZoneLo, (double)m_fMLContrastRatioCap,
+			(double)m_MLFeatures[0], (int)m_bMLContrastDebugVis);
+		fflush(m_pMLDebugFile);
+	} else if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 120 == 0) {
+		// Throttled MC summary (frame-log on; keeps the file small at 2/sec).
+		fwprintf(m_pMLDebugFile, L"MC_SUM frame=%llu featsReady=%d enabled=%d cf=%.4f raw=%.4f smooth=%.4f strength=%.4f zoneLo=%.3f ratioCap=%.3f\n",
+			(unsigned long long)m_MLDebugFrame, (int)m_bMLFeaturesReady, (int)m_bMLContrastEnabled,
+			(double)m_fMLContrast, (double)m_MLRawTexture, (double)m_MLTextureSmooth,
+			(double)contrastStrength, (double)m_fMLContrastZoneLo, (double)m_fMLContrastRatioCap);
+		fflush(m_pMLDebugFile);
+	}
 
 	// Scene cut detection: L2 distance across multiple histogram features
 	float sceneDelta2 = 0.0f;
@@ -1256,7 +1301,7 @@ void CDX11VideoProcessor::SetMLParams()
 	}
 	if (hasPrev && sqrtf(sceneDelta2) > SCENE_CUT_THRESH) {
 		m_pByteTracker = std::make_unique<BYTETracker>(0.5f, 30, 0.8f, 24);
-		if (m_pMLDebugFile) {
+		if (m_bMLDebug && m_pMLDebugFile) {
 			fwprintf(m_pMLDebugFile, L"FACE_SCENE_CUT l2=%.4f thresh=%.4f feats=%.4f,%.4f,%.4f,%.4f,%.4f\n",
 				(double)sqrtf(sceneDelta2), (double)SCENE_CUT_THRESH,
 				(double)m_MLFeatures[0], (double)m_MLFeatures[1],
@@ -1356,7 +1401,7 @@ void CDX11VideoProcessor::SetMLParams()
 		params.FaceTrackId[i] = faceTrackIds[i];
 	}
 
-	if (m_pMLDebugFile && m_MLDebugFrame % 60 == 0 && numFaces > 0) {
+	if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0 && numFaces > 0) {
 		fwprintf(m_pMLDebugFile, L"FACE_CBUF numFaces=%d protect=%.2f debugVis=%.0f feather=%.3f expand=%.2f srcTex=%ux%u\n",
 			numFaces, (double)params.FaceProtect, (double)params.FaceDebugVis,
 			(double)params.FaceFeather, (double)params.FaceExpand,
@@ -1438,8 +1483,15 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	// is remapped into PQ units by BuildMLFeatures.
 	const MLLumaDomain domain = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
 		? MLLumaDomain::PQ : MLLumaDomain::SDRGamma22;
-	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain, &m_MLBarDetected);
+	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain, &m_MLBarDetected, &m_MLRawTexture);
 	m_pDeviceContext->Unmap(m_MLStaging, 0);
+
+	if (m_bMLDebug && m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"EXTRACT frame=%llu raw_tex=%.4f avg=%.4f maxscl=%.4f\n",
+			(unsigned long long)m_MLDebugFrame, (double)m_MLRawTexture,
+			(double)m_MLFeatures[1], (double)m_MLFeatures[0]);
+		fflush(m_pMLDebugFile);
+	}
 
 	m_bMLFeaturesReady = true;
 	m_MLDebugFeat0 = m_MLFeatures[0];
@@ -1470,13 +1522,13 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 				m_nSyncFaces = m_pFaceDetect->DetectSync((const uint8_t*)faceMr.pData, 480, 288, faceMr.RowPitch, syncOut, 4);
 				for (int i = 0; i < m_nSyncFaces; i++) m_syncFaces[i] = syncOut[i];
 				m_pDeviceContext->Unmap(m_FaceStaging, 0);
-				if (m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
+				if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
 					fwprintf(m_pMLDebugFile, L"FACE_SYNC frame=%llu n=%d ready=%d texSrc=%ux%u\n",
 						m_MLDebugFrame, m_nSyncFaces, (int)m_pFaceDetect->IsReady(),
 						m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height);
 					fflush(m_pMLDebugFile);
 				}
-			} else if (m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
+			} else if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
 				fwprintf(m_pMLDebugFile, L"FACE_SUBMIT map_failed hr=0x%08X\n", (unsigned)hrMap);
 				fflush(m_pMLDebugFile);
 			}
@@ -4284,7 +4336,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			}
 
 			HRESULT hrs[4] = {};
-			if (m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
+			if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
 				fwprintf(m_pMLDebugFile, L"MLPASS rect=(%d,%d,%d,%d) inputTex=%ux%u convertTex=%ux%u uvOff=(%.4f,%.4f) uvSc=(%.4f,%.4f)\n",
 					rect.left, rect.top, rect.right, rect.bottom,
 					pInputTexture->desc.Width, pInputTexture->desc.Height,
@@ -4302,20 +4354,14 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				fwprintf(m_pMLDebugFile, L"MLPASS enter step=%u\n", (unsigned)(step + 1));
 			}
 
+			// Order: highlight (passthrough) → gamma tone curve → micro-contrast
+			// — the MC pass runs on the post-tone-curve I_norm (what you see).
 			StepSetting();
-			if (m_SkinLUTSRV) {
-				m_pDeviceContext->PSSetShaderResources(1, 1, &m_SkinLUTSRV.p);
-				m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerSkin.p);
-			}
-			hrs[0] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psShadow, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
-			if (m_SkinLUTSRV) {
-				ID3D11ShaderResourceView* nullSRVs[1] = {};
-				m_pDeviceContext->PSSetShaderResources(1, 1, nullSRVs);
-			}
+			hrs[0] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psHighlight, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 			StepSetting();
-			hrs[1] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psHighlight, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
+			hrs[1] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psGamma, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 			StepSetting();
-			hrs[2] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psGamma, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
+			hrs[2] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psShadow, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 
 			// log luma stats of the gamma-step INPUT (pre-grade content) every 8th frame
 			if (m_bMLDebug && m_bMLDebugCopy == false && m_MLDebugFrame % 8 == 0) {
@@ -4337,9 +4383,9 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 
 			if (m_bMLDebug && m_pMLDebugFile) {
 				fwprintf(m_pMLDebugFile, L"MLPASS draws %s %s %s %s (hr=%x,%x,%x,%x)\n",
-					m_bMLDebugCopy ? L"copy" : L"shadow",
 					m_bMLDebugCopy ? L"copy" : L"highlight",
 					m_bMLDebugCopy ? L"copy" : L"gamma",
+					m_bMLDebugCopy ? L"copy" : L"microcont",
 					(m_pPSMLChroma ? (m_bMLDebugCopy ? L"copy" : L"chroma") : L"none"),
 					(unsigned)hrs[0], (unsigned)hrs[1], (unsigned)hrs[2], (unsigned)hrs[3]);
 				fflush(m_pMLDebugFile);
@@ -5006,6 +5052,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_bMLHighlightEnabled = config.bMLHighlightEnabled;
 		m_bMLDebugCopy = config.bMLDebugCopy;
 		m_bMLDebug     = config.bMLDebugLog;
+		if (m_pFaceDetect) m_pFaceDetect->SetLogEnabled(m_bMLDebug);
 		m_bMLShadowDebugVis = config.bMLShadowDebugVis;
 		m_bMLContrastDebugVis = config.bMLContrastDebugVis;
 		m_fMLShadowZoneCeil    = config.fMLShadowZoneCeil;

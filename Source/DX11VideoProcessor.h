@@ -199,7 +199,7 @@ private:
 	float m_fMLShadowSkinProtect = 0.65f;
 	float m_fMLShadowRatioCap = 1.40f;
 	bool  m_bMLContrastEnabled = true;
-	float m_fMLContrast = 3.0f;
+	float m_fMLContrast = 0.15f; // micro-contrast clarity strength (exponent) — overwritten by config
 	float m_fMLContrastZoneLo = 0.15f;
 	float m_fMLContrastSkinProtect = 0.65f;
 	float m_fMLContrastRatioCap = 1.40f;
@@ -274,6 +274,8 @@ private:
 	CMLModel m_MLHighlightModel;
 	float m_MLIIRGamma = 1.0f;
 	float m_MLPrevL1Max = -1.0f;
+	float m_MLRawTexture = 0.0f;    // BuildMLFeatures out-param (high-freq edge fraction)
+	float m_MLTextureSmooth = 0.0f; // IIR-filtered texture energy feeding the MC gate
 
 	// D3D11 Shader Video Processor
 	CComPtr<ID3D11PixelShader> m_pPSConvertColor;

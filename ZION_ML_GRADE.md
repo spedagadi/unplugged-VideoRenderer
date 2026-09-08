@@ -28,9 +28,9 @@ Source frame (PQ or SDR)
   ├── Face detection (480×288 BGRA8 → YuNet ONNX → ByteTrack)
   │
   ▼
-  1. ps_ml_shadow.hlsl    — Dual-band detail enhancement (currently passthrough)
-  2. ps_ml_highlight.hlsl — Highlight rolloff (passthrough — merged into gamma)
-  3. ps_ml_gamma.hlsl     — Unified tone curve (shadow toe + gamma + highlight rolloff)
+  1. ps_ml_highlight.hlsl — Highlight rolloff (passthrough — merged into gamma)
+  2. ps_ml_gamma.hlsl     — Unified tone curve (shadow toe + gamma + highlight rolloff)
+  3. ps_ml_shadow.hlsl    — Micro-contrast clarity (post-tone-curve texture lift)
   4. ps_ml_chroma.hlsl    — Chroma vector tuning (Ct/Cp boost with skin protection)
   5. ps_ml_bars.hlsl      — Black bar repaint (letterbox haze fix)
 ```
@@ -43,7 +43,7 @@ All passes share a single constant buffer (`MLParams_t`, 280 bytes) updated once
 
 Rather than three separate shader passes for shadow/gamma/highlight, a **single unified tone curve** operates on the normalized I channel in `ps_ml_gamma.hlsl`. This was a deliberate collapse: the three XGBoost models each predict a scalar that parameterizes one region of the same curve, and applying them sequentially in one pass avoids three round-trips through ICtCp conversion and texture ping-pong.
 
-The highlight pass (`ps_ml_highlight.hlsl`) is now a pure passthrough. The shadow detail pass (`ps_ml_shadow.hlsl`) retains its dual-band DoG infrastructure for future use but is also passthrough.
+The highlight pass (`ps_ml_highlight.hlsl`) is a pure passthrough. The `ps_ml_shadow.hlsl` pass was repurposed as the **micro-contrast** pass and moved to run *after* the gamma tone curve (it operates on the post-gamma I_norm — what the viewer sees). Its dual-band DoG infrastructure (σ=1/2/4 blurs) is retained dormant in the same file.
 
 ### Three Curve Regions
 
@@ -180,13 +180,36 @@ Hunt effect (perceived colorfulness increases with luminance) is already handled
 
 ### DoG Shadow Enhancement — Disabled
 
-The dual-band Difference-of-Gaussians (DoG) detail enhancement (`ps_ml_shadow.hlsl`) is architecturally complete but currently passthrough. The DoG computes frequency-separated detail at σ=1/σ=2 (shadow fine texture) and σ=2/σ=4 (midtone contrast recovery), with a soft-curve compressor to prevent halo artifacts. It was disabled due to gradient artifacts under investigation. The `shadowStrength` parameter is hardcoded to 0.0.
+The dual-band Difference-of-Gaussians (DoG) detail enhancement was architecturally complete but disabled for gradient/banding artifacts. Its σ=1/2/4 bilinear-optimized Gaussian functions remain in `ps_ml_shadow.hlsl` as dormant infrastructure; the pass's `main` now runs the micro-contrast clarity kernel instead (see above). Re-enabling the DoG bands is future work — and the micro-contrast design supersedes them for mid/high texture.
 
-The four s3_shell sliders (Strength, Zone ceil, Skin protect, Ratio cap) for the SHADOW section have been removed. The CONTRAST section (same 4-slider pattern) and FACE DETECT section are also removed from the UI. When re-enabled, these should be re-added.
+The three user-touch sections that were removed in the 2026-09-07 cycle — original SHADOW (DoG sliders), CONTRAST, FACE DETECT — were also removed from the s3_shell UI. Of these, CONTRAST returned as **MICRO CONTRAST** (new section below).
 
-### Contrast Recovery — Disabled in UI
+### Micro-Contrast — Texture Enhancement
 
-The dual-band contrast recovery (MCStrength, MCZoneLo, MCSkinProtect, MCRatioCap) is still wired in the cbuffer and shader but the UI section was removed. `contrastStrength` is driven by `m_bMLContrastEnabled` which s3_shell sets to false.
+**Design**: multiplicative clarity — a fine spatial-frequency local contrast lift, applied to the ICtCp I channel *after* the tone curve. The per-pixel deviation of the gamma-2.2 luma surface from its σ≈1 surround is lifted in log space:
+
+```hlsl
+lm   = γ2.2 luma(this pixel)
+b    = blur_σ1(lm)                     // bilinear-optimized Gaussian
+logr = clamp(log(lm / max(b, 1e-5)), -1, 1)
+zone = smoothstep(MCZoneLo, MCZoneLo + 0.15, I_norm)   // shadow gate
+I_out = I_norm * exp(MCStrength * zone * logr)
+I_out = min(I_out, I_norm * (1 + MCRatioCap * MCStrength))  // excursion bound
+```
+
+The multiplicative / ratio form makes halos impossible, and smooth gradients are identity (`lm ≈ b` → ratio ≈ 1) — the artefact class that killed the earlier DoG band does not occur.
+
+**Automatic per-scene gate (no ML model)**: a runtime texture-energy metric — the fraction of pixels in the existing 256×144 luma downsample whose luma deviates from the 4-neighbor mean by >5% PQ — is IIR-filtered (α=0.10, same scene-jump reset as gamma) and multiplies the slider into `MCStrength`. Flat/gradient scenes gate to ~0 strength; textured scenes get the lift. This is why micro-contrast needed no model: no texture data exists in the DV training set, and the metric is ~1 ms to compute directly.
+
+**Parameters** (`MCStrength` now carries slider × texture-gate):
+
+| Param | Default | Range | Role |
+|-------|--------|-------|------|
+| Strength | 0.15 | [0.00, 0.50] | Clarity exponent ceiling |
+| Zone lo | 0.15 | [0.00, 0.60] | Shadow gate floor (I_norm) |
+| Ratio cap | 1.40 | [1.00, 2.00] | Bright-side excursion cap |
+
+`MCSkinProtect` is unused — the pass touches only the I channel, so skins are inherently safe.
 
 ## Face Detection
 
@@ -258,6 +281,15 @@ Models are exported as `.plxgb` binary files (magic `PLXG`, version 1) — a com
 | Knee | Slider | zion.knee | 0.10 – 0.90 | 0.45 |
 | Skin | Slider | zion.skin | 0.50 – 1.00 | 0.95 |
 
+### MICRO CONTRAST Section
+
+| Control | Type | Key | Range | Default |
+|---------|------|-----|-------|---------|
+| Enable | Toggle | zion.contrast | — | on |
+| Strength | Slider | zion.contrastStrength | 0.00 – 0.50 | 0.15 |
+| Zone lo | Slider | zion.contrastZoneLo | 0.00 – 0.60 | 0.15 |
+| Ratio cap | Slider | zion.contrastRatioCap | 1.00 – 2.00 | 1.40 |
+
 ### DEBUG Section
 
 | Control | Type | Key |
@@ -265,6 +297,7 @@ Models are exported as `.plxgb` binary files (magic `PLXG`, version 1) — a com
 | Passthrough | Toggle | zion.debugCopyShaders |
 | Frame log | Toggle | zion.debugFrameLog |
 | Face boxes | Toggle | zion.faceDebugVis |
+| MC heat | Toggle | zion.contrastDebugVis |
 
 ### BLACK BARS Section
 
@@ -309,10 +342,10 @@ Offset  Field               Size    Notes
 132     uBarBlack           4
 136     uBarHighlight       4
 140     _padBar             4       Alignment
-144     MCStrength          4       0.0 (contrast disabled)
-148     MCZoneLo            4
-152     MCSkinProtect       4
-156     MCRatioCap          4
+144     MCStrength          4       slider × automatic texture gate [0, 0.5]
+148     MCZoneLo            4       shadow gate floor 0.15
+152     MCSkinProtect       4       1.0 (unused — I-channel pass)
+156     MCRatioCap          4       excursion cap 1.40
 160     FaceProtect         4       0.8
 164     FaceFeather         4       0.12
 168     FaceExpand          4       2.0
@@ -334,7 +367,7 @@ Total: 272 bytes (+ padding to 16-byte alignment = 272)
 | `ps_ml_luma.hlsl` | 256×144 luma downsample for feature extraction | Active |
 | `ps_ml_face_down.hlsl` | 480×288 color downsample for face detection | Active |
 | `ps_ml_gamma.hlsl` | Unified tone curve (shadow + gamma + highlight) + face debug vis | Active |
-| `ps_ml_shadow.hlsl` | Dual-band DoG detail enhancement | Passthrough |
+| `ps_ml_shadow.hlsl` | Micro-contrast clarity (post-gamma; DoG infra dormant) | Active |
 | `ps_ml_highlight.hlsl` | Highlight rolloff (merged into gamma) | Passthrough |
 | `ps_ml_chroma.hlsl` | ICtCp Ct/Cp chroma boost with skin LUT protection | Active |
 | `ps_ml_bars.hlsl` | Black bar repaint for projector haze | Active |
@@ -358,7 +391,7 @@ Total: 272 bytes (+ padding to 16-byte alignment = 272)
 
 ### UI (`mpc-hc/tools/engine_s3/s3_shell.cpp`)
 
-Controls panel with TONE CURVE, CHROMA, DEBUG, and BLACK BARS sections. Removed: SHADOW (DoG), CONTRAST, FACE DETECT sections. Shadow toe slider added to TONE CURVE alongside Gamma and Highlight.
+Controls panel with TONE CURVE, CHROMA, MICRO CONTRAST, DEBUG, and BLACK BARS sections. Removed: SHADOW (DoG) and FACE DETECT sections. Shadow toe slider lives in TONE CURVE alongside Gamma and Highlight.
 
 ## Current State (2026-09-08)
 
@@ -368,14 +401,15 @@ Controls panel with TONE CURVE, CHROMA, DEBUG, and BLACK BARS sections. Removed:
 - Auto mode: per-scene gamma, shadow toe, and highlight rolloff prediction with IIR temporal smoothing
 - Manual mode: all three tone curve parameters user-adjustable via s3_shell sliders
 - ICtCp chroma boost with smooth monotonic curve and skin LUT protection
+- Micro-contrast texture enhancement with an automatic per-scene texture gate
+  (IIR-filtered high-frequency luma edge fraction × user strength)
 - Face detection via YuNet + ByteTrack with debug visualization
 - Black bar repaint for projector haze
-- Scene cut detection resets both gamma IIR filter and ByteTrack tracker
+- Scene cut detection resets the gamma IIR filter and ByteTrack tracker
 
 ### Disabled / Passthrough
 
-- DoG shadow detail enhancement (gradient artifacts under investigation)
-- Contrast recovery band (UI removed, cbuffer wired)
+- DoG shadow detail enhancement (superseded by micro-contrast; σ=1/2/4 blurs dormant)
 - Hunt compensation (redundant in ICtCp)
 - Face-guided gamma protection (infrastructure ready, not activated)
 - Saturation gain model (per-title aesthetic, not scene-corrective)
@@ -384,5 +418,5 @@ Controls panel with TONE CURVE, CHROMA, DEBUG, and BLACK BARS sections. Removed:
 
 - MPCVR: `MpcVideoRenderer.sln` → Release x64 via MSBuild
 - s3_shell: `build_s3_shell.bat` via cl.exe
-- Distribution: `_bin\MpcVideoRenderer-0.10.8.2601\` with Install/Uninstall scripts
+- Distribution: `_bin\MpcVideoRenderer-0.10.8.2602\` with Install/Uninstall scripts
 - Dependencies: ONNX Runtime + DirectML DLLs, YuNet `.onnx` model, XGBoost `.plxgb` model files

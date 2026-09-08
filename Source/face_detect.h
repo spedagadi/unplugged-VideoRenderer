@@ -30,6 +30,7 @@ public:
 	HRESULT Init(const std::wstring& modelPath);
 	void    Shutdown();
 	void    SetLogFile(FILE* f) { m_logFile = f; }
+	void    SetLogEnabled(bool e) { m_logEnabled = e; }
 
 	void SubmitFrame(const uint8_t* bgra, int width, int height, int stride);
 	int  GetFaces(FaceBox* out, int maxFaces) const;
@@ -82,6 +83,7 @@ private:
 	std::atomic<bool>       m_ready{false};
 	bool                    m_frameReady = false;
 	std::wstring            m_lastError;
-	FILE*                   m_logFile = nullptr;
+	FILE*                   m_logFile = nullptr;   // init/error log (always)
+	bool                    m_logEnabled = false;  // per-frame cadence only under frame log
 	uint64_t                m_submitCount = 0;
 };

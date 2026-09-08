@@ -75,7 +75,7 @@ constexpr float kCropLimit = 0.01f;
 } // namespace
 
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[ML_FEATURE_DIM],
-                     MLLumaDomain domain, MLBarBounds* bars)
+                     MLLumaDomain domain, MLBarBounds* bars, float* outTextureEnergy)
 {
 	const int w = ML_DOWNSAMPLE_W;
 	const int h = ML_DOWNSAMPLE_H;
@@ -108,6 +108,30 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 			if (bin > max_bin) max_bin = bin;
 			if (fv > 0.5f) bright++;
 		}
+	}
+
+	// 1b) texture energy — fraction of interior pixels whose feature-domain
+	// luma deviates from the 4-neighbor mean by > kTexThreshold. Feeds the
+	// micro-contrast gate (Design B): flat/gradient scenes give ~0, textured
+	// scenes map to [0, ~0.3]. Same 5% step as the LogMLFrameStats edge scan.
+	if (outTextureEnergy) {
+		// Relative (2% of local value) + 0.0005 floor. PQ is a perceptual code
+		// space: an absolute threshold is a huge nits-jump in the deep shadows
+		// and killed the metric on dark HDR content (observed max ~0.006 on an
+		// 8x box-averaged dark title card).
+		int edges = 0;
+		for (int y = 1; y < h - 1; y++) {
+			const float* rowUp   = &tv[(size_t)(y - 1) * w];
+			const float* rowMid  = &tv[(size_t)y * w];
+			const float* rowDown = &tv[(size_t)(y + 1) * w];
+			for (int x = 1; x < w - 1; x++) {
+				const float mean4 = (rowUp[x] + rowMid[x - 1] + rowMid[x + 1] + rowDown[x]) * 0.25f;
+				const float thr = fmaxf(0.0005f, 0.02f * fmaxf(mean4, rowMid[x]));
+				if (fabsf(rowMid[x] - mean4) > thr) edges++;
+			}
+		}
+		const int interior = (w - 2) * (h - 2);
+		*outTextureEnergy = (interior > 0) ? (float)edges / interior : 0.0f;
 	}
 
 	// 2) summed area table + row means in feature space

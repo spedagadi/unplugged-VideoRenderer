@@ -258,7 +258,7 @@ void CFaceDetect::SubmitFrame(const uint8_t* bgra, int width, int height, int st
 
 	m_submitCount++;
 
-	if (m_logFile && m_submitCount % 60 == 1) {
+	if (m_logEnabled && m_logFile && m_submitCount % 60 == 1) {
 		fwprintf(m_logFile, L"FACE_PREPROCESS tex=%dx%d model=%dx%d scale=%.4f scaled=%dx%d pad=(%d,%d) bufSize=%zu frame=%llu\n",
 			width, height, mW, mH, (double)scale, scaledW, scaledH, padX, padY,
 			slot.buf.size(), m_submitCount);
@@ -392,7 +392,7 @@ int CFaceDetect::DetectSync(const uint8_t* bgra, int width, int height, int stri
 			}
 		}
 
-		if (m_logFile && m_submitCount % 60 == 1) {
+		if (m_logEnabled && m_logFile && m_submitCount % 60 == 1) {
 			fwprintf(m_logFile, L"FACE_SYNC frame=%llu candidates=%zu kept=%d scale=%.3f pad=(%d,%d)\n",
 				m_submitCount, candidates.size(), n, (double)scale, padX, padY);
 			fflush(m_logFile);
