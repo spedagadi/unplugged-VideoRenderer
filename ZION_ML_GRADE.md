@@ -4,7 +4,7 @@
 
 Zion ML Grade is a real-time video enhancement pipeline for MPC Video Renderer (MPCVR) that applies scene-adaptive tone mapping and chroma tuning using machine learning models trained on Dolby Vision Profile 5 metadata. All luminance operations are performed in the **ICtCp perceptual color space** (BT.2100 / SMPTE ST 2084 PQ transfer), which preserves chrominance (Ct/Cp) when the intensity (I) channel is modified — eliminating the hue and saturation shifts inherent in RGB or YCbCr-domain grading.
 
-The pipeline consists of four shader passes plus ancillary feature extraction, face detection, and black bar repaint. Three XGBoost models predict per-scene tone curve parameters from 88 GPU-extracted features, enabling fully automatic scene-adaptive grading with no user intervention.
+The pipeline consists of four shader passes plus ancillary feature extraction, face detection, **sky semantic segmentation** (yolo26n-sem via ONNX Runtime + DirectML), and black bar repaint. Three XGBoost models predict per-scene tone curve parameters from 88 GPU-extracted features for the automatic tone curve; the sky mask additionally relaxes the highlight guard *inside* detected sky so bright sky and cloud detail survive tone compression.
 
 ## Architecture
 
@@ -26,16 +26,20 @@ Source frame (PQ or SDR)
   │
   ├── Feature extraction (256×144 luma downsample → 88 histogram features)
   ├── Face detection (480×288 BGRA8 → YuNet ONNX → ByteTrack)
+  ├── Sky segmentation (640×360 SDR-ized preview → yolo26n-sem ONNX → DirectML,
+  │                     throttled ~10 fps; R8 content-aligned mask → t2 in shaders)
   │
   ▼
   1. ps_ml_highlight.hlsl — Highlight rolloff (passthrough — merged into gamma)
   2. ps_ml_gamma.hlsl     — Unified tone curve (shadow toe + gamma + highlight rolloff)
-  3. ps_ml_shadow.hlsl    — Micro-contrast clarity (post-tone-curve texture lift)
+                             + sky tone leg (guard relaxation + cloud-band lift)
+  3. ps_ml_shadow.hlsl    — Micro-contrast clarity (post-tone-curve texture lift,
+                             sky-upweighted inside the mask)
   4. ps_ml_chroma.hlsl    — Chroma vector tuning (Ct/Cp boost with skin protection)
   5. ps_ml_bars.hlsl      — Black bar repaint (letterbox haze fix)
 ```
 
-All passes share a single constant buffer (`MLParams_t`, 280 bytes) updated once per frame. The debug passthrough mode (`MLDebugPassthrough`) binds a simple copy shader to all steps for bisecting shader vs plumbing issues.
+All passes share a single constant buffer (`MLParams_t`, 304 bytes) updated once per frame. The debug passthrough mode (`MLDebugPassthrough`) binds a simple copy shader to all steps for bisecting shader vs plumbing issues, and the separate HDR/DV passthrough (`bHDRPassthroughRaw`) binds the copy shader to the tone-map + correction + all ML steps so an SDR display shows the unconverted HDR/DV signal.
 
 ## Tone Curve: The Unified Model
 
@@ -211,6 +215,64 @@ The multiplicative / ratio form makes halos impossible, and smooth gradients are
 
 `MCSkinProtect` is unused — the pass touches only the I channel, so skins are inherently safe.
 
+## Sky Semantic Segmentation (Sky Tone Leg)
+
+### Model and Runtime
+
+**Model**: `yolo26n-sem` (Ultralytics semantic segmentation, **Cityscapes 19-class, sky = class index 10**), exported to `yolo26n-sem.onnx` (opset 12, 640×640).
+
+**Runtime**: ONNX Runtime + **DirectML** EP (GPU inference, no CUDA dependency), mirroring the `CFaceDetect` pattern exactly:
+- `onnxruntime.dll` pre-loaded from next to the `.ax` (`/DELAYLOAD` keeps an eager resolver from grabbing a stale System32 copy)
+- `Ort::InitApi` under an SEH guard; session with `ORT_ENABLE_ALL`, one intra-op thread, DirectML EP (CPU fallback caught)
+- Input `images`: float `[1,3,640,640]` RGB, 0..1, gray-114 letterbox
+- Output `output0`: uint8 `[1,640,640]` **argmax class-index map** (Cityscapes class per pixel)
+
+### Preprocessing / Decode Contract
+
+`CSkySeg::DetectSky()` consumes a **640×360 SDR-ized BGRA8 preview** — rendered every ~10 frames by the *same* `ps_ml_face_down` shader used for face detection (PQ→SDR is already the right domain for Cityscapes). Letterbox fit into 640×640 (aspect preserved, gray-114 padding), bilinear to NCHW float, run, then:
+
+- **Crop the letterbox padding** — only `[padX..padX+sW, padY..padY+sH]` is copied into the output map (`default = 640×360`). The pad must NOT reach the shader: its top rows would read as a hard horizontal "not-sky" band.
+- Mask values 255 = sky / 0 = not, uploaded as an `R8_UNORM` 640×360 texture (`m_SkyMask`, `UpdateSubresource` with row-pitch = `sW`), sampled as `t2` on shader slots 2.
+- `sky_frac` (over valid pixels) and `sky_luma` (mean gamma-2.2 luma of sky) are reported separately for debug/slider use.
+
+Cadence: throttled `m_MLDebugFrame % 10 == 0` (~10 fps inference on the render thread); the mask persists between runs; all per-frame log output gates on the frame-log toggle (`m_bMLDebug`, so a 3-hour movie without frame log grows no log).
+
+### UV Remap (why the mask aligns with the video)
+
+The mask is content-aligned (`[0,1]` = the video content). The gamma/MC shaders sample the window-sized post-scale texture, where the content sits at `uvOff..uvOff+uvSc`. Every ML shader therefore remaps before sampling:
+
+```hlsl
+float2 cuv = (input.Tex - float2(MLSkyUVOffX, MLSkyUVOffY))
+           / max(float2(MLSkyUVScX, MLSkyUVScY), 0.001f);
+// in-content gate: 0 outside [0,1] so letterbox/pillarbox bars never read the
+// clamped mask edge (this bled sky into the top bar before the gate existed)
+const float inContent = (all(cuv >= 0.0) && all(cuv <= 1.0)) ? 1.0 : 0.0;
+float S = sky_mask.Sample(sampSky, saturate(cuv)).r * inContent;
+```
+
+The four UV fields (`MLSkyUVOffX/Y`, `MLSkyUVScX/Y`) ride the per-frame cbuffer refresh (`rect`/`inputW` computed in the ML render block), so the mask tracks the content rect on every frame — including pillarbox/letterbox. The cyan debug overlay samples the *same* `cuv` so what you validate visually is exactly what the tone leg targets.
+
+### Tone Effects (all gated by `S` = mask × `inContent`)
+
+All effects scale with `MLSkyStrength` (default 0.6, slider) and vanish at strength 0 — output is bit-identical with the pre-sky path.
+
+1. **Guard relaxation in the gamma leg** — the highlight guard is raised *inside* sky (`hi_s = smoothstep(MLSkyGuard, 0.98, I_norm)` vs the global `hi_g`), so the shoulder protects a wider range in sky; `I_norm = lerp(I_g, I_s, S × MLSkyStrength)` — both legs share the same curve family below the guard band, so there is no seam at the building/sky boundary.
+2. **Softened highlight rolloff** — `skyScale = 1.0 − 0.5×S×MLSkyStrength` thins the shoulder crush only inside sky.
+3. **Cloud-band lift** — a small extra allocation in the upper-mid luma band where clouds live (below the guard, which the guard-leg alone can't reach):
+   ```hlsl
+   band = smoothstep(0.40, 0.55, I_norm) * (1 − smoothstep(0.85, 0.95, I_norm));
+   I_norm += S × MLSkyStrength × 0.06 × band;
+   ```
+4. **Sky-upweighted micro-contrast** — in `ps_ml_shadow.hlsl` the clarity lift scales by `(1 + 2×S)` so cloud layering survives tone compression; flat sky is unaffected (`logr ≈ 0`).
+
+### Settings
+
+| Setting | Key | Default | Role |
+|---------|-----|---------|------|
+| Enable | `zion.skyEnabled` | off | Runs the segmenter + tone effects |
+| Strength | `zion.skyStrength` | 0.60 | Global scale for all four effects |
+| Mask overlay | `zion.skyDebugVis` | off | Cyan overlay at content UV (validation) |
+
 ## Face Detection
 
 ### Architecture
@@ -292,12 +354,30 @@ Models are exported as `.plxgb` binary files (magic `PLXG`, version 1) — a com
 
 ### DEBUG Section
 
+| Control | Type | Key | Notes |
+|---------|------|-----|-------|
+| HDR passthrough | Toggle | hdr.hdrPass | Raw HDR/DV on SDR — copies tone-map + correction + all ML steps (no processing at all). Mutually exclusive with Tone curve passthrough. |
+| Tone curve passthrough | Toggle | zion.debugCopyShaders | Binds copy shader to the ML steps only (ring step count intact). Mutually exclusive with HDR passthrough. |
+| Frame log | Toggle | zion.debugFrameLog | Gates every per-frame log line (EXTRACT, MLPASS, SKY_REFRESH, SKYUV, FACE_SYNC…) — log stays flat when off |
+| Face boxes | Toggle | zion.faceDebugVis | Track-colored ellipses (window UV) |
+| MC heat | Toggle | zion.contrastDebugVis | Green zone gate overlay (independent of strength) |
+
+Both passthrough toggles push **both** configs when either flips, so disabling the last passthrough retriggers the current Zion/MlSettings and ML re-applies cleanly.
+
+### SKY SEG Section
+
 | Control | Type | Key |
 |---------|------|-----|
-| Passthrough | Toggle | zion.debugCopyShaders |
-| Frame log | Toggle | zion.debugFrameLog |
-| Face boxes | Toggle | zion.faceDebugVis |
-| MC heat | Toggle | zion.contrastDebugVis |
+| Enable | Toggle | zion.skyEnabled |
+| Strength | Slider | zion.skyStrength |
+| Mask overlay | Toggle | zion.skyDebugVis |
+
+### HDR TONE MAPPING Section
+
+| Control | Type | Key | Range/Default |
+|---------|------|-----|---------------|
+| Curve | Cycle | hdr.toneMapCurve | ACES / Reinhard / Hable / Mobius / BT-2390, default BT-2390 |
+| SDR nits | Slider | hdr.sdrNits | default 50 (setpoint the SDR display is tuned to) |
 
 ### BLACK BARS Section
 
@@ -354,9 +434,19 @@ Offset  Field               Size    Notes
 180     _padFace[3]         12      Alignment
 192     FaceBox[16]         64      4 × (x, y, w, h) UV
 256     FaceTrackId[4]      16      ByteTrack persistent IDs
+272     MLSkyStrength       4       0..1 sky-leg blend (0 = bit-identical pre-sky path)
+276     MLSkyGuard          4       Raised guard used inside sky
+280     MLSkyLuma           4       Sky-region mean luma (informational)
+284     MLSkyUVOffX         4       Mask-UV remap — content sits at
+288     MLSkyUVOffY         4         uvOff..(uvOff+uvSc) in window UV
+292     MLSkyUVScX          4
+296     MLSkyUVScY          4
+300     _padSky             4       Keep sizeof a multiple of 16 (D3D11 rule)
 ────────────────────────────────────────────────────────
-Total: 272 bytes (+ padding to 16-byte alignment = 272)
+Total: 304 bytes (= 16 × 19)
 ```
+
+`pPSSetConstantBuffers` uploads `m_lastMLParams` every frame from the ML render block (also refreshing the four sky-UV fields from `rect`/`inputW`), so the remap tracks the content rect on every frame even when the mask only refreshes at ~10 fps.
 
 ## File Map
 
@@ -365,9 +455,9 @@ Total: 272 bytes (+ padding to 16-byte alignment = 272)
 | File | Purpose | State |
 |------|---------|-------|
 | `ps_ml_luma.hlsl` | 256×144 luma downsample for feature extraction | Active |
-| `ps_ml_face_down.hlsl` | 480×288 color downsample for face detection | Active |
-| `ps_ml_gamma.hlsl` | Unified tone curve (shadow + gamma + highlight) + face debug vis | Active |
-| `ps_ml_shadow.hlsl` | Micro-contrast clarity (post-gamma; DoG infra dormant) | Active |
+| `ps_ml_face_down.hlsl` | 480×288 + 640×360 color downsample for face and sky preprocessing | Active |
+| `ps_ml_gamma.hlsl` | Unified tone curve (shadow + gamma + highlight) + sky tone leg + face/sky debug vis | Active |
+| `ps_ml_shadow.hlsl` | Micro-contrast clarity (post-gamma; DoG infra dormant) + sky-upweighted MC | Active |
 | `ps_ml_highlight.hlsl` | Highlight rolloff (merged into gamma) | Passthrough |
 | `ps_ml_chroma.hlsl` | ICtCp Ct/Cp chroma boost with skin LUT protection | Active |
 | `ps_ml_bars.hlsl` | Black bar repaint for projector haze | Active |
@@ -376,9 +466,11 @@ Total: 272 bytes (+ padding to 16-byte alignment = 272)
 
 | File | Role |
 |------|------|
-| `DX11VideoProcessor.h` | `MLParams_t` cbuffer struct, ML state variables, XGBoost model instances |
-| `DX11VideoProcessor.cpp` | `SetMLParams()` (model inference + parameter packing), `ExtractMLFeatures()`, render pipeline hookup |
+| `DX11VideoProcessor.h` | `MLParams_t` cbuffer struct, ML state variables, XGBoost model instances, sky seg members |
+| `DX11VideoProcessor.cpp` | `SetMLParams()` (model inference + parameter packing), `ExtractMLFeatures()`, render pipeline hookup, sky mask texture + UV remap |
 | `face_detect.h` / `face_detect.cpp` | YuNet ONNX wrapper — init, preprocess, inference, NMS, sync detection |
+| `sky_seg.h` / `sky_seg.cpp` | yolo26n-sem ONNX wrapper — letterbox preprocess, DirectML run, pad-crop decode, sky_frac/luma |
+| `onnxrt/yolo26n-sem.onnx` | Sky segmentation model (Cityscapes 19-class, sky = class 10) |
 
 ### Training Scripts (`libplacebo/ml/`)
 
@@ -393,7 +485,7 @@ Total: 272 bytes (+ padding to 16-byte alignment = 272)
 
 Controls panel with TONE CURVE, CHROMA, MICRO CONTRAST, DEBUG, and BLACK BARS sections. Removed: SHADOW (DoG) and FACE DETECT sections. Shadow toe slider lives in TONE CURVE alongside Gamma and Highlight.
 
-## Current State (2026-09-08)
+## Current State (2026-09-09)
 
 ### Working
 
@@ -404,8 +496,16 @@ Controls panel with TONE CURVE, CHROMA, MICRO CONTRAST, DEBUG, and BLACK BARS se
 - Micro-contrast texture enhancement with an automatic per-scene texture gate
   (IIR-filtered high-frequency luma edge fraction × user strength)
 - Face detection via YuNet + ByteTrack with debug visualization
+- **Sky semantic segmentation** (yolo26n-sem, ONNX Runtime + DirectML): sky tone leg
+  (guard relaxation + softened rolloff + cloud-band lift) and sky-upweighted micro-contrast,
+  with a mask-overlay validation toggle
+- **Sky mask UV remap** — mask sampled at content UV `(input.Tex − uvOff)/uvSc` with an
+  in-content gate, so the tone leg + overlay track the video rect under pillarbox/letterbox
 - Black bar repaint for projector haze
 - Scene cut detection resets the gamma IIR filter and ByteTrack tracker
+- HDR/DV passthrough (raw, no processing) + Tone curve passthrough (ML steps copied),
+  mutually exclusive, both retrigger the current ML config on toggle-off
+- Tone curve selector (ACES / Reinhard / Hable / Mobius / BT-2390) + SDR nits default 50
 
 ### Disabled / Passthrough
 
@@ -413,10 +513,19 @@ Controls panel with TONE CURVE, CHROMA, MICRO CONTRAST, DEBUG, and BLACK BARS se
 - Hunt compensation (redundant in ICtCp)
 - Face-guided gamma protection (infrastructure ready, not activated)
 - Saturation gain model (per-title aesthetic, not scene-corrective)
+- Sky tone effects at strength 0 (bit-identical with the pre-sky path)
+
+### Debug Logging Contract
+
+All per-frame log lines (EXTRACT, MLPASS, FACE_SYNC, SKY_REFRESH, SKYUV, MC_TRACE…) gate on the
+frame-log toggle (`zion.debugFrameLog` → `m_bMLDebug`), and `CSkySeg`/`CFaceDetect` receive the
+same `SetLogEnabled`. With frame log off, the log file is flat during any-length playback; with it
+on, the ML render block writes `MLPASS … SKYUV=(uvOffX,uvOffY,uvScX,uvScY) frac=.. luma=..` every
+60 frames and `SKY_REFRESH` on each mask refresh, so UV-mapping issues are diagnosable offline.
 
 ### Build
 
-- MPCVR: `MpcVideoRenderer.sln` → Release x64 via MSBuild
-- s3_shell: `build_s3_shell.bat` via cl.exe
-- Distribution: `_bin\MpcVideoRenderer-0.10.8.2602\` with Install/Uninstall scripts
-- Dependencies: ONNX Runtime + DirectML DLLs, YuNet `.onnx` model, XGBoost `.plxgb` model files
+- MPCVR: `MpcVideoRenderer.sln` → Release x64 via MSBuild (`_rebuild_mpcvr.bat`; batches shader + CSO + resource compile)
+- s3_shell: `build_s3_shell.bat` via cl.exe (mpc-hc repo, branch `zion-s3-shell`)
+- Distribution: `_bin\MpcVideoRenderer-0.10.8.2603\` with Install/Uninstall scripts
+- Dependencies: ONNX Runtime + DirectML DLLs, YuNet + `yolo26n-sem.onnx` models, XGBoost `.plxgb` model files

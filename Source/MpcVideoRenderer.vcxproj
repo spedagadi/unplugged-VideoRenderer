@@ -85,6 +85,7 @@
     <ClCompile Include="Helper.cpp" />
     <ClCompile Include="MediaSampleSideData.cpp" />
     <ClCompile Include="face_detect.cpp" />
+    <ClCompile Include="sky_seg.cpp" />
     <ClCompile Include="ml_features.cpp" />
     <ClCompile Include="ml_model.cpp" />
     <ClCompile Include="tone_spline.cpp" />
@@ -153,6 +154,7 @@
     <ClInclude Include="IVideoRenderer.h" />
     <ClInclude Include="MediaSampleSideData.h" />
     <ClInclude Include="face_detect.h" />
+    <ClInclude Include="sky_seg.h" />
     <ClInclude Include="ml_features.h" />
     <ClInclude Include="ml_model.h" />
     <ClInclude Include="tone_spline.h" />

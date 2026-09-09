@@ -35,6 +35,7 @@
 #include "ml_model.h"
 #include "ml_features.h"
 #include "face_detect.h"
+#include "sky_seg.h"
 #include "BYTETracker.h"
 
 #include <atomic>
@@ -166,6 +167,15 @@ private:
 		float _padFace[3];         // align FaceBox to 16-byte boundary
 		float FaceBox[16];         // 4 x (x, y, w, h) in UV [0,1]
 		float FaceTrackId[4];      // ByteTrack persistent ID per face slot
+		// Sky tone leg (stage 3) — appended tail, offsets of all prior fields unchanged
+		float MLSkyStrength;       // 0..1 blend of the sky-relaxed curve leg
+		float MLSkyGuard;          // higher guard used inside sky (gentler crush)
+		float MLSkyLuma;           // sky-region mean luma (anchor, informational)
+		float MLSkyUVOffX;         // mask-UV remap: content sits at uvOff..(uvOff+uvSc)
+		float MLSkyUVOffY;         // within the window the shader samples
+		float MLSkyUVScX;
+		float MLSkyUVScY;
+		float _padSky;             // keep sizeof multiple of 16 (D3D11 cbuffer rule)
 	};
 	MLParams_t m_lastMLParams = {};
 	CComPtr<ID3D11Buffer> m_pMLParams;
@@ -214,6 +224,21 @@ private:
 	float m_fFaceFeather = 0.12f;
 	float m_fFaceExpand = 2.0f;
 	bool  m_bFaceDebugVis = false;
+	// Sky semantic segmentation (yolo26n-sem via ONNX Runtime + DirectML)
+	std::unique_ptr<CSkySeg>          m_pSkySeg;
+	CComPtr<ID3D11Texture2D>          m_SkyMask;      // 640x360 R8_UNORM (pad-cropped content)
+	CComPtr<ID3D11ShaderResourceView> m_SkyMaskSRV;
+	CComPtr<ID3D11SamplerState>       m_pSamplerSky;  // bilinear + clamp
+	CComPtr<ID3D11Texture2D>          m_SegDownsample; // 640x360 BGRA8 SDR-ized seg preview
+	CComPtr<ID3D11Texture2D>          m_SegStaging;    // CPU-readable copy
+	HRESULT CreateSkyMaskTexture();
+	HRESULT CreateSkySegTextures();
+	float   m_SkyFrac = 0.0f;      // last decode: fraction of valid pixels == sky
+	float   m_SkyLuma = 0.0f;      // last decode: mean gamma-2.2 luma of sky pixels
+	uint64_t m_nSkyFrame = 0;      // render-frame counter for cadence
+	bool    m_bSkyEnabled = true;  // run segmentation (+ overlay)
+	bool    m_bSkyDebugVis = false; // cyan overlay of the sky mask (validation)
+	float   m_fMLSkyStrength = 0.6f; // sky tone-leg blend amount [0, 1]
 	// ByteTrack multi-object tracker (Kalman + Hungarian)
 	std::unique_ptr<BYTETracker> m_pByteTracker;
 	static constexpr int FACE_DETECT_W = 480;

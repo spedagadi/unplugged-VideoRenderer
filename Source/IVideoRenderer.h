@@ -86,7 +86,7 @@ enum :int {
 	HDRTD_OnOff
 };
 
-#define SDR_NITS_DEF 125
+#define SDR_NITS_DEF 50
 #define SDR_NITS_MIN  25
 #define SDR_NITS_MAX 400
 #define SDR_NITS_STEP  5
@@ -137,8 +137,9 @@ struct Settings_t {
 	bool bConvertToSdr;
 	int  iSDRDisplayNits;
 	bool bHdrLocalToneMapping;
-	int  iHdrLocalToneMappingType;
+	int  iHdrLocalToneMappingType; // 1=ACES 2=Reinhard 3=Hable 4=Mobius 5=BT.2390 6=...
 	int iHdrDisplayMaxNits;
+	bool bHDRPassthroughRaw = false; // skip tone map + ML: show the raw HDR/DV signal on SDR (demo)
 
 	// Zion ML grade
 	bool  bMLEnabled = false;
@@ -162,6 +163,10 @@ struct Settings_t {
 	float fMLContrastSkinProtect = 1.0f;
 	float fMLContrastRatioCap = 1.40f;
 	bool  bMLContrastDebugVis = false;
+	// Sky semantic segmentation (yolo26n-sem; stage-2 overlay validation)
+	bool  bMLSkyEnabled = true;
+	bool  bMLSkyDebugVis = false;   // cyan mask overlay for validation
+	float fMLSkyStrength = 0.6f;    // sky tone-leg blend amount [0, 1]
 	bool  bTrayIcon = true;      // system tray icon when the renderer is active (opens the property page)
 	// Phase 1b — chroma vector tuning / hunt compensation
 	bool  bMLHuntEnabled = true;         // default preset: enabled
@@ -236,6 +241,8 @@ struct Settings_t {
 		bConvertToSdr                   = true;
 		iHdrOsdBrightness               = 0;
 		iSDRDisplayNits                 = SDR_NITS_DEF;
+		iHdrLocalToneMappingType        = 5;   // BT.2390 default
+		bHDRPassthroughRaw              = false;
 		bMLEnabled                      = false;
 		iMLMode                         = ML_Disable;
 		bMLToneCurveEnabled             = true;
@@ -257,6 +264,9 @@ struct Settings_t {
 		fMLContrastSkinProtect          = 1.0f;
 		fMLContrastRatioCap             = 1.40f;
 		bMLContrastDebugVis             = false;
+		bMLSkyEnabled                   = true;
+		bMLSkyDebugVis                  = false;
+		fMLSkyStrength                  = 0.6f;
 		bMLHuntEnabled                  = true;
 		fMLHunt                         = 0.80f;
 		bMLChromaEnabled                = true;

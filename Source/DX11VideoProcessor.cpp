@@ -406,6 +406,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_bHdrLocalToneMapping = config.bHdrLocalToneMapping;
 	m_iHdrLocalToneMappingType = config.iHdrLocalToneMappingType;
 	m_iHdrDisplayMaxNits   = config.iHdrDisplayMaxNits;
+	m_bHDRPassthroughRaw   = config.bHDRPassthroughRaw;
 	m_iHdrToggleDisplay    = config.iHdrToggleDisplay;
 	m_iHdrOsdBrightness    = config.iHdrOsdBrightness;
 	m_bConvertToSdr        = config.bConvertToSdr;
@@ -419,8 +420,12 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_bMLDebugCopy          = config.bMLDebugCopy;
 	m_bMLDebug              = config.bMLDebugLog;
 	if (m_pFaceDetect) m_pFaceDetect->SetLogEnabled(m_bMLDebug);   // per-frame face lines follow the flag
+	if (m_pSkySeg)     m_pSkySeg->SetLogEnabled(m_bMLDebug);       // .. and sky seg
 	m_bMLShadowDebugVis    = config.bMLShadowDebugVis;
 	m_bMLContrastDebugVis  = config.bMLContrastDebugVis;
+	m_bSkyEnabled          = config.bMLSkyEnabled;
+	m_bSkyDebugVis         = config.bMLSkyDebugVis;
+	m_fMLSkyStrength      = config.fMLSkyStrength;
 	m_fMLShadowZoneCeil    = config.fMLShadowZoneCeil;
 	m_fMLShadowSkinProtect = config.fMLShadowSkinProtect;
 	m_fMLShadowRatioCap    = config.fMLShadowRatioCap;
@@ -511,6 +516,22 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 		fflush(m_pMLDebugFile);
 	}
 	EXECUTE_ASSERT(SUCCEEDED(hrFace) && m_pFaceDetect->IsReady());
+
+	m_pSkySeg = std::make_unique<CSkySeg>();
+	m_pSkySeg->SetLogFile(m_pMLDebugFile);
+	m_pSkySeg->SetLogEnabled(m_bMLDebug);
+	HRESULT hrSky = m_pSkySeg->Init(GetMLModelPath(L"yolo26n-sem.onnx"));
+	if (m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"INIT_SKY hr=0x%08X ready=%d err=%s\n",
+			(unsigned)hrSky, (int)m_pSkySeg->IsReady(),
+			m_pSkySeg->GetLastError().c_str());
+		fflush(m_pMLDebugFile);
+	}
+	// Sky seg is optional — do not hard-fail the filter if the model is missing.
+	if (FAILED(hrSky) && m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"INIT_SKY disabled (model load failed)\n");
+		fflush(m_pMLDebugFile);
+	}
 
 	CComPtr<IDXGIAdapter> pDXGIAdapter;
 	for (UINT adapter = 0; m_pDXGIFactory1->EnumAdapters(adapter, &pDXGIAdapter) != DXGI_ERROR_NOT_FOUND; ++adapter) {
@@ -817,6 +838,11 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_SkinLUT.Release();
 	m_SkinLUTSRV.Release();
 	m_pSamplerSkin.Release();
+	m_SkyMask.Release();
+	m_SkyMaskSRV.Release();
+	m_pSamplerSky.Release();
+	m_SegDownsample.Release();
+	m_SegStaging.Release();
 	m_pPSMLDownsample.Release();
 	m_pPSFaceDown.Release();
 	m_pFaceDownParams.Release();
@@ -907,7 +933,7 @@ UINT CDX11VideoProcessor::GetPostScaleSteps()
 	if (m_bMLActive && m_pPSMLChroma) {
 		nSteps++; // chroma vector tuning (skin-guarded)
 	}
-	if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy) {
+	if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy && !m_bHDRPassthroughRaw) {
 		nSteps++; // P0 bar repaint
 	}
 	if (m_pPSHalfOUtoInterlace) {
@@ -1139,6 +1165,12 @@ void CDX11VideoProcessor::InitMLResources()
 
 	DLog(L"CDX11VideoProcessor::InitMLResources() creating textures...");
 	CreateMLTextures();
+	if (FAILED(CreateSkyMaskTexture())) {
+		DLog(L"CDX11VideoProcessor::InitMLResources() sky mask texture failed; overlay disabled");
+	}
+	if (FAILED(CreateSkySegTextures())) {
+		DLog(L"CDX11VideoProcessor::InitMLResources() sky seg preview textures failed; seg disabled");
+	}
 
 	if (!m_pMLParams) {
 		D3D11_BUFFER_DESC BufferDesc = {
@@ -1370,7 +1402,7 @@ void CDX11VideoProcessor::SetMLParams()
 		m_fSkinLUTCR0, m_fSkinLUTCR1, m_fSkinLUTCB0, m_fSkinLUTCB1,
 		bChromaActive ? 1.0f : 0.0f,
 		m_bMLHuntEnabled ? 1.0f : 0.0f,
-		m_bMLShadowDebugVis ? 1.0f : 0.0f, m_fMLShadowZoneCeil, m_fMLShadowSkinProtect, m_fMLShadowRatioCap, m_bMLContrastDebugVis ? 1.0f : 0.0f, 0.0f,
+		m_bMLShadowDebugVis ? 1.0f : 0.0f, m_fMLShadowZoneCeil, m_fMLShadowSkinProtect, m_fMLShadowRatioCap, m_bMLContrastDebugVis ? 1.0f : 0.0f, m_bSkyDebugVis ? 1.0f : 0.0f,
 		// P0 — black bars repaint
 		(m_bMLFeaturesReady ? m_fMLBarTop : 0.0f),
 		(m_bMLFeaturesReady ? m_fMLBarBot : 1.0f),
@@ -1430,6 +1462,14 @@ void CDX11VideoProcessor::SetMLParams()
 			(int)m_bMLBarsEnabled, (int)m_bMLBarsHighlight, (int)m_bMLFeaturesReady);
 		fflush(m_pMLDebugFile);
 	}
+
+	// Sky tone leg (stage 3): relaxed-guard leg blended inside sky by the mask.
+	params.MLSkyStrength = (m_bMLFeaturesReady && m_bSkyEnabled)
+		? fminf(1.0f, fmaxf(0.0f, m_fMLSkyStrength)) : 0.0f;
+	params.MLSkyGuard = m_bMLFeaturesReady
+		? fminf(0.97f, fmaxf(guard + 0.08f, 0.88f))
+		: guard - 1.0f; // effectively disabled before features are ready
+	params.MLSkyLuma = m_SkyLuma;
 
 	// Always upload: a zero-filled buffer (from a missed update) made the
 	// gamma shader run at MLGamma=0 -> pow(y, g<1) -> washed-out image.
@@ -1521,6 +1561,7 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 				CFaceDetect::FaceBox syncOut[4] = {};
 				m_nSyncFaces = m_pFaceDetect->DetectSync((const uint8_t*)faceMr.pData, 480, 288, faceMr.RowPitch, syncOut, 4);
 				for (int i = 0; i < m_nSyncFaces; i++) m_syncFaces[i] = syncOut[i];
+
 				m_pDeviceContext->Unmap(m_FaceStaging, 0);
 				if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
 					fwprintf(m_pMLDebugFile, L"FACE_SYNC frame=%llu n=%d ready=%d texSrc=%ux%u\n",
@@ -1541,6 +1582,41 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 			(m_FaceDownsample ? 1 : 0), (m_FaceStaging ? 1 : 0),
 			(m_pFaceDetect ? 1 : 0), (m_pPSFaceDown ? 1 : 0), m_MLDebugFrame);
 		fflush(m_pMLDebugFile);
+	}
+
+	// Sky segmentation — throttled (~10 fps). Renders its OWN 640x360 SDR-ized
+	// preview: higher fidelity than the 480x288 face texture, so building/sky
+	// boundaries survive the downscale. Pushes a 640x640 R8 mask to the shader.
+	if (m_bSkyEnabled && m_pSkySeg && m_pSkySeg->IsReady() && m_SkyMaskSRV &&
+		m_SegDownsample && m_SegStaging && (m_MLDebugFrame % 10 == 0)) {
+		const CRect segRect(0, 0, 640, 360);
+		HRESULT hrSeg = TextureCopyRect(m_TexConvertOutput, m_SegDownsample, texRect, segRect, m_pPSFaceDown, m_pFaceDownParams, 0, false);
+		if (SUCCEEDED(hrSeg)) {
+			m_pDeviceContext->CopyResource(m_SegStaging, m_SegDownsample);
+			D3D11_MAPPED_SUBRESOURCE segMr = {};
+			if (SUCCEEDED(m_pDeviceContext->Map(m_SegStaging, 0, D3D11_MAP_READ, 0, &segMr))) {
+				CSkySeg::Result sky;
+				if (m_pSkySeg->DetectSky((const uint8_t*)segMr.pData, 640, 360, segMr.RowPitch, sky)) {
+					m_SkyFrac = sky.skyFrac;
+					m_SkyLuma = sky.skyLuma;
+					if (!sky.map.empty()) {
+						m_pDeviceContext->UpdateSubresource(m_SkyMask, 0, nullptr, sky.map.data(), sky.mapW, 0);
+						if (m_bMLDebug && m_pMLDebugFile) {
+							fwprintf(m_pMLDebugFile,
+								L"SKY_REFRESH frame=%llu map=%dx%d srcW=%ux%u frac=%.4f luma=%.3f stagingPitch=%u\n",
+								(unsigned long long)m_MLDebugFrame, sky.mapW, sky.mapH,
+								m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height,
+								(double)sky.skyFrac, (double)sky.skyLuma, (unsigned)segMr.RowPitch);
+							fflush(m_pMLDebugFile);
+						}
+					}
+				} else if (m_bMLDebug && m_pMLDebugFile) {
+					fwprintf(m_pMLDebugFile, L"SKY_REFRESH frame=%llu DetectSky FAILED\n", (unsigned long long)m_MLDebugFrame);
+					fflush(m_pMLDebugFile);
+				}
+				m_pDeviceContext->Unmap(m_SegStaging, 0);
+			}
+		}
 	}
 
 	UpdateMLBarsFromDetected();
@@ -1625,6 +1701,58 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		(int)std::lround(m_fMLBarTop * m_windowRect.Height()),
 		(int)std::lround((1.0f - m_fMLBarBot) * m_windowRect.Height()),
 		(m_bMLBarsHighlight ? L" (hl)" : L""));
+}
+
+HRESULT CDX11VideoProcessor::CreateSkyMaskTexture()
+{
+	if (!m_pDevice) return E_FAIL;
+	if (m_SkyMaskSRV) return S_OK; // already created
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = 640;           // content-res mask (pad-cropped), matches shader UV
+	desc.Height = 360;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_R8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+	std::vector<uint8_t> zero(640 * 360, 0);
+	D3D11_SUBRESOURCE_DATA init = { zero.data(), (UINT)640, 0 };
+	HRESULT hr = m_pDevice->CreateTexture2D(&desc, &init, &m_SkyMask);
+	if (FAILED(hr)) return hr;
+	hr = m_pDevice->CreateShaderResourceView(m_SkyMask, nullptr, &m_SkyMaskSRV);
+	if (FAILED(hr)) return hr;
+
+	D3D11_SAMPLER_DESC sd = {};
+	sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+	sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	hr = m_pDevice->CreateSamplerState(&sd, &m_pSamplerSky);
+	return hr;
+}
+
+HRESULT CDX11VideoProcessor::CreateSkySegTextures()
+{
+	// 640x360 BGRA8 SDR-ized preview — higher fidelity than the 480x288 face
+	// texture so building/sky boundaries survive the downscale for the model.
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = 640;
+	desc.Height = 360;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+	HRESULT hr = m_pDevice->CreateTexture2D(&desc, nullptr, &m_SegDownsample);
+	if (FAILED(hr)) return hr;
+
+	desc.Usage = D3D11_USAGE_STAGING;
+	desc.BindFlags = 0;
+	desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	hr = m_pDevice->CreateTexture2D(&desc, nullptr, &m_SegStaging);
+	return hr;
 }
 
 HRESULT CDX11VideoProcessor::LoadSkinLUT()
@@ -4290,27 +4418,38 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 		}
 
 		if (m_pPSCorrection) {
+			// Raw HDR/DV passthrough also bypasses the correction step (the
+			// 10000/sdrNits scale) so the SDR display gets the UNconverted signal.
 			StepSetting();
-			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSCorrection, m_pCorrectionConstants, 0, false);
+			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect,
+				m_bHDRPassthroughRaw ? m_pPS_Simple.p : m_pPSCorrection.p,
+				m_bHDRPassthroughRaw ? nullptr : m_pCorrectionConstants, 0, false);
 		}
 
 		if (m_pPSHDR10ToneMapping) {
+			// Raw HDR/DV passthrough: keep the pipeline (and the ring step count)
+			// intact but bind the copy shader so no tone compression happens —
+			// the SDR display then shows the unprocessed HDR/DV signal.
 			StepSetting();
 
-			if (m_pDoViDynamicConstants) {
+			if (m_pDoViDynamicConstants && !m_bHDRPassthroughRaw) {
 				m_pDeviceContext->PSSetConstantBuffers(1, 1, &m_pDoViDynamicConstants.p);
 			}
 
-			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSHDR10ToneMapping, m_pHDR10ToneMappingConstants, 0, false);
+			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect,
+				m_bHDRPassthroughRaw ? m_pPS_Simple.p : m_pPSHDR10ToneMapping.p,
+				m_bHDRPassthroughRaw ? nullptr : m_pHDR10ToneMappingConstants, 0, false);
 		}
 
 		if (m_bMLActive && m_pPSMLGamma && m_pMLParams) {
 			// Zion ML grade — hook order matches libplacebo: shadow -> highlight -> gamma
 			// MLDebugPassthrough: bind the proven copy shader to all three steps
 			// to bisect "bad ML shader math" vs "broken step plumbing".
-			ID3D11PixelShader* psShadow    = m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLShadow.p;
-			ID3D11PixelShader* psHighlight = m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLHighlight.p;
-			ID3D11PixelShader* psGamma     = m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLGamma.p;
+			// Raw HDR/DV passthrough also copies every ML step (ring stays intact).
+			const bool bCopy = m_bMLDebugCopy || m_bHDRPassthroughRaw;
+			ID3D11PixelShader* psShadow    = bCopy ? m_pPS_Simple.p : m_pPSMLShadow.p;
+			ID3D11PixelShader* psHighlight = bCopy ? m_pPS_Simple.p : m_pPSMLHighlight.p;
+			ID3D11PixelShader* psGamma     = bCopy ? m_pPS_Simple.p : m_pPSMLGamma.p;
 
 			// Remap face box UVs from convertTex [0,1] to post-scale shader UV space.
 			// The shader's input.Tex spans [rect.left/inputW .. rect.right/inputW],
@@ -4321,6 +4460,12 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			const float uvOffY = (float)rect.top / inputH;
 			const float uvScX  = (float)rect.Width() / inputW;
 			const float uvScY  = (float)rect.Height() / inputH;
+			// Always refresh the per-frame cbuffer: face boxes (if any) remap into
+			// window UV AND the sky mask's UV remap follows the same rect.
+			m_lastMLParams.MLSkyUVOffX = uvOffX;
+			m_lastMLParams.MLSkyUVOffY = uvOffY;
+			m_lastMLParams.MLSkyUVScX = uvScX;
+			m_lastMLParams.MLSkyUVScY = uvScY;
 			if (m_lastMLParams.NumFaces > 0 && (uvOffX > 0.001f || uvOffY > 0.001f || uvScX < 0.999f || uvScY < 0.999f)) {
 				for (int i = 0; i < m_lastMLParams.NumFaces && i < 4; i++) {
 					float& bx = m_lastMLParams.FaceBox[i * 4 + 0];
@@ -4332,16 +4477,22 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 					bw = bw * uvScX;
 					bh = bh * uvScY;
 				}
-				m_pDeviceContext->UpdateSubresource(m_pMLParams, 0, nullptr, &m_lastMLParams, 0, 0);
 			}
+			m_pDeviceContext->UpdateSubresource(m_pMLParams, 0, nullptr, &m_lastMLParams, 0, 0);
 
 			HRESULT hrs[4] = {};
 			if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
-				fwprintf(m_pMLDebugFile, L"MLPASS rect=(%d,%d,%d,%d) inputTex=%ux%u convertTex=%ux%u uvOff=(%.4f,%.4f) uvSc=(%.4f,%.4f)\n",
+				fwprintf(m_pMLDebugFile, L"MLPASS rect=(%d,%d,%d,%d) inputTex=%ux%u convertTex=%ux%u uvOff=(%.4f,%.4f) uvSc=(%.4f,%.4f)",
 					rect.left, rect.top, rect.right, rect.bottom,
 					pInputTexture->desc.Width, pInputTexture->desc.Height,
 					m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height,
 					(double)uvOffX, (double)uvOffY, (double)uvScX, (double)uvScY);
+				// The exact UVs the per-frame cbuffer refresh just pushed for the
+				// sky mask — the shader computes cuv=(input.Tex-uvOff)/uvSc.
+				fwprintf(m_pMLDebugFile, L" SKYUV=(%.4f,%.4f,%.4f,%.4f) frac=%.4f luma=%.3f\n",
+					(double)m_lastMLParams.MLSkyUVOffX, (double)m_lastMLParams.MLSkyUVOffY,
+					(double)m_lastMLParams.MLSkyUVScX, (double)m_lastMLParams.MLSkyUVScY,
+					(double)m_SkyFrac, (double)m_SkyLuma);
 				if (m_lastMLParams.NumFaces > 0) {
 					for (int i = 0; i < m_lastMLParams.NumFaces && i < 4; i++)
 						fwprintf(m_pMLDebugFile, L"  FACE_REMAP[%d] x=%.4f y=%.4f w=%.4f h=%.4f\n",
@@ -4359,9 +4510,19 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			StepSetting();
 			hrs[0] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psHighlight, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 			StepSetting();
+			// Sky mask (640x360 R8) + sampler bound on t2/s2 for the gamma + MC passes
+			// (t2 is free in this block; the chroma t1 bundle is scoped below).
+			if (m_SkyMaskSRV && m_pSamplerSky) {
+				m_pDeviceContext->PSSetShaderResources(2, 1, &m_SkyMaskSRV.p);
+				m_pDeviceContext->PSSetSamplers(2, 1, &m_pSamplerSky.p);
+			}
 			hrs[1] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psGamma, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 			StepSetting();
 			hrs[2] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psShadow, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
+			if (m_SkyMaskSRV) {
+				ID3D11ShaderResourceView* nullSRVs[1] = {};
+				m_pDeviceContext->PSSetShaderResources(2, 1, nullSRVs);
+			}
 
 			// log luma stats of the gamma-step INPUT (pre-grade content) every 8th frame
 			if (m_bMLDebug && m_bMLDebugCopy == false && m_MLDebugFrame % 8 == 0) {
@@ -4375,7 +4536,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				m_pDeviceContext->PSSetShaderResources(1, 1, &m_SkinLUTSRV.p);
 				m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerSkin.p);
 				hrs[3] = TextureCopyRect(*pInputTexture, pRT, rect, rect,
-					m_bMLDebugCopy ? m_pPS_Simple.p : m_pPSMLChroma.p,
+					bCopy ? m_pPS_Simple.p : m_pPSMLChroma.p,
 					m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 				ID3D11ShaderResourceView* nullSRVs[1] = {};
 				m_pDeviceContext->PSSetShaderResources(1, 1, nullSRVs);
@@ -4392,7 +4553,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			}
 		}
 
-		if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy) {
+		if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy && !m_bHDRPassthroughRaw) {
 			StepSetting();
 			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSMLBars, m_pMLParams, 0, false);
 			if (m_bMLDebug && m_pMLDebugFile) {
@@ -4973,6 +5134,11 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		changeHDR = true;
 	}
 
+	if (config.bHDRPassthroughRaw != m_bHDRPassthroughRaw) {
+		m_bHDRPassthroughRaw = config.bHDRPassthroughRaw;
+		changeHDR = true;
+	}
+
 	if (config.iHdrDisplayMaxNits != m_iHdrDisplayMaxNits) {
 		m_iHdrDisplayMaxNits = config.iHdrDisplayMaxNits;
 		//changeHDR = true;
@@ -5020,7 +5186,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			config.bMLGammaEnabled != m_bMLGammaEnabled ||
 			config.bMLShadowEnabled != m_bMLShadowEnabled ||
 			config.bMLHighlightEnabled != m_bMLHighlightEnabled ||
-			config.bMLDebugCopy != m_bMLDebugCopy || config.bMLDebugLog != m_bMLDebug || config.bMLShadowDebugVis != m_bMLShadowDebugVis || config.bMLContrastDebugVis != m_bMLContrastDebugVis ||
+			config.bMLDebugCopy != m_bMLDebugCopy || config.bMLDebugLog != m_bMLDebug || config.bMLShadowDebugVis != m_bMLShadowDebugVis || config.bMLContrastDebugVis != m_bMLContrastDebugVis || config.bMLSkyEnabled != m_bSkyEnabled || config.bMLSkyDebugVis != m_bSkyDebugVis || config.fMLSkyStrength != m_fMLSkyStrength ||
 			config.fMLShadowZoneCeil != m_fMLShadowZoneCeil || config.fMLShadowSkinProtect != m_fMLShadowSkinProtect || config.fMLShadowRatioCap != m_fMLShadowRatioCap ||
 			config.bMLContrastEnabled != m_bMLContrastEnabled || config.fMLContrast != m_fMLContrast ||
 			config.fMLContrastZoneLo != m_fMLContrastZoneLo || config.fMLContrastSkinProtect != m_fMLContrastSkinProtect || config.fMLContrastRatioCap != m_fMLContrastRatioCap ||
@@ -5053,8 +5219,12 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_bMLDebugCopy = config.bMLDebugCopy;
 		m_bMLDebug     = config.bMLDebugLog;
 		if (m_pFaceDetect) m_pFaceDetect->SetLogEnabled(m_bMLDebug);
+		if (m_pSkySeg) m_pSkySeg->SetLogEnabled(m_bMLDebug);
 		m_bMLShadowDebugVis = config.bMLShadowDebugVis;
 		m_bMLContrastDebugVis = config.bMLContrastDebugVis;
+			m_bSkyEnabled          = config.bMLSkyEnabled;
+			m_bSkyDebugVis         = config.bMLSkyDebugVis;
+			m_fMLSkyStrength      = config.fMLSkyStrength;
 		m_fMLShadowZoneCeil    = config.fMLShadowZoneCeil;
 		m_fMLShadowSkinProtect = config.fMLShadowSkinProtect;
 		m_fMLShadowRatioCap    = config.fMLShadowRatioCap;

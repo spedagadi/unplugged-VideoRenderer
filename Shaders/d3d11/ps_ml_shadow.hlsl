@@ -12,6 +12,8 @@ Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 Texture2D skin_lut : register(t1);   // bound by C++ but unused in ICtCp path
 SamplerState sampSkin : register(s1);
+Texture2D sky_mask : register(t2);   // 640x360 R8 sky mask (content-aligned)
+SamplerState sampSky : register(s2);
 
 struct PS_INPUT
 {
@@ -61,6 +63,24 @@ cbuffer MLParams : register(b0)
 	float MCZoneLo;
 	float MCSkinProtect;
 	float MCRatioCap;
+	// Face section — declared only to keep cbuffer offsets in sync (unused here)
+	float FaceProtect;
+	float FaceFeather;
+	float FaceExpand;
+	float FaceDebugVis;
+	int   NumFaces;
+	float3 _padFace;
+	float4 FaceBox[4];
+	float4 FaceTrackId;
+	// Sky tone leg tail — the two uv fields remap the mask sample
+	float MLSkyStrength;
+	float MLSkyGuard;
+	float MLSkyLuma;
+	float MLSkyUVOffX;
+	float MLSkyUVOffY;
+	float MLSkyUVScX;
+	float MLSkyUVScY;
+	float _padSky;
 };
 
 static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
@@ -148,7 +168,15 @@ float4 main(PS_INPUT input) : SV_Target
 	float b     = blur_s1(input.Tex, texel);   // fine surround (σ≈1)
 	float logr  = clamp(log(lm / max(b, 1e-5)), -1.0, 1.0);
 	float zone  = smoothstep(MCZoneLo, MCZoneLo + 0.15f, I_norm); // shadow gate
-	float lift  = exp(MCStrength * zone * logr);
+	// Sky-upweighted clarity: within sky, raise the lift so cloud layering
+	// survives tone compression. Safe — flat sky has logr≈0 so nothing moves.
+	// In-content gate kills bar bleed (see ps_ml_gamma).
+	float2 cuv = (input.Tex - float2(MLSkyUVOffX, MLSkyUVOffY))
+		/ max(float2(MLSkyUVScX, MLSkyUVScY), 0.001f);
+	const float inContent = (all(cuv >= 0.0) && all(cuv <= 1.0)) ? 1.0 : 0.0;
+	float S = sky_mask.Sample(sampSky, saturate(cuv)).r * inContent;
+	float MCe = MCStrength * (1.0f + 2.0f * S);
+	float lift = exp(MCe * zone * logr);
 
 	// Excursion bound: dark side is naturally safe (lift<1); cap the bright side
 	// so no pixel exceeds ~(1 + RatioCap×strength) × its input.

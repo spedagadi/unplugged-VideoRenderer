@@ -9,6 +9,8 @@
 
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
+Texture2D sky_mask : register(t2);   // 160x90 R8 sky-probability map (class 10)
+SamplerState sampSky : register(s2);
 
 struct PS_INPUT
 {
@@ -66,6 +68,15 @@ cbuffer MLParams : register(b0)
 	float3 _padFace;
 	float4 FaceBox[4];
 	float4 FaceTrackId;
+	// Sky tone leg (stage 3) — appended tail, offsets of prior fields unchanged
+	float MLSkyStrength;
+	float MLSkyGuard;
+	float MLSkyLuma;
+	float MLSkyUVOffX;
+	float MLSkyUVOffY;
+	float MLSkyUVScX;
+	float MLSkyUVScY;
+	float _padSky;
 };
 
 float4 main(PS_INPUT input) : SV_Target
@@ -85,6 +96,18 @@ float4 main(PS_INPUT input) : SV_Target
 	float I_peak = (IsPQ > 0.5) ? max(MLL1Max, 0.01) : SDR_I_PEAK_PQ;
 	float I_norm = I / I_peak;
 
+	// Sky mask (t2, content-aligned 640x360) — sampled once at the CONTENT uv
+	// (input.Tex spans the window; the content sits at uvOff..(uvOff+uvSc)),
+	// used by the tone leg below and the debug overlay at the end.
+	float2 cuv = (input.Tex - float2(MLSkyUVOffX, MLSkyUVOffY))
+		/ max(float2(MLSkyUVScX, MLSkyUVScY), 0.001f);
+	// In-content gate: window pixels OUTSIDE the content rect (letterbox/pillarbox
+	// bars) must not read the clamped mask edge — S=0 kills both the tone leg and
+	// the overlay there, so bars stay clean. (all() on a float2 is lane-wise.)
+	const float inContent = (all(cuv >= 0.0) && all(cuv <= 1.0)) ? 1.0 : 0.0;
+	const float rawS = sky_mask.Sample(sampSky, saturate(cuv)).r * inContent;
+	float S = (MLSkyStrength > 0.001) ? rawS : 0.0f;
+
 	// === UNIFIED TONE CURVE (shadow toe → gamma → highlight rolloff) ===
 
 	// 1. Shadow toe: DV L2 offset pedestal lift — raises dark end toward knee
@@ -94,21 +117,37 @@ float4 main(PS_INPUT input) : SV_Target
 		I_norm = saturate(I_norm);
 	}
 
-	// 2. Gamma: DV L2 power midtone lift/lower between the two anchors
+	// 2. Gamma with a sky-relaxed guard leg. Both legs use the SAME curve
+	// family and differ only in the highlight guard, so they coincide below
+	// the guard band (no seam) and S=0 reproduces the global path exactly.
 	float l2_gamma = MLGamma;
 	if (l2_gamma != 1.0 && I_norm > 0.001 && I_norm < 0.999) {
-		float hi = smoothstep(MLGuard, 0.98, I_norm);
 		float fade = smoothstep(0.08, 0.45, I_norm);
-		float eff = fade * (1.0 - hi);
-		I_norm = lerp(I_norm, pow(I_norm, 1.0 / l2_gamma), eff);
+		float hi_g = smoothstep(MLGuard, 0.98, I_norm);
+		float hi_s = smoothstep(MLSkyGuard, 0.98, I_norm);
+		float p = pow(I_norm, 1.0 / l2_gamma);
+		float I_g = lerp(I_norm, p, fade * (1.0 - hi_g));
+		float I_s = lerp(I_norm, p, fade * (1.0 - hi_s));
+		I_norm = lerp(I_g, I_s, S * MLSkyStrength);
 	}
 
-	// 3. Highlight rolloff: DV gold curve shoulder shaping above highlight knee
+	// 3. Highlight rolloff — softened inside sky so the shoulder keeps the
+	// sky's luminance structure instead of crushing it.
 	if (abs(MLHighlightRolloff) > 0.005 && I_norm > MLHighlightKnee && I_norm < 0.995) {
 		float span = max(1.0 - MLHighlightKnee, 0.01);
 		float t = (I_norm - MLHighlightKnee) / span;
 		float shoulder = MLHighlightRolloff * t * t * (1.0 - I_norm);
-		I_norm = saturate(I_norm + shoulder);
+		float skyScale = 1.0 - 0.5 * S * MLSkyStrength;
+		I_norm = saturate(I_norm + shoulder * skyScale);
+	}
+
+	// 4. Sky cloud-band lift: the guard-only leg cannot reach I < MLSkyGuard,
+	// which is exactly where clouds live — so give the upper-mid luma band a
+	// small extra allocation inside sky. Range re-allocation, not re-curving.
+	{
+		float band = smoothstep(0.40f, 0.55f, I_norm) * (1.0f - smoothstep(0.85f, 0.95f, I_norm));
+		I_norm += S * MLSkyStrength * 0.06f * band;
+		I_norm = saturate(I_norm);
 	}
 
 	// Face blending disabled — testing pure ICtCp output
@@ -123,6 +162,16 @@ float4 main(PS_INPUT input) : SV_Target
 		color.rgb = LinearToST2084(float4(rgb_out, 0.0), 10000.0).rgb;
 	} else {
 		color.rgb = pow(saturate(rgb_out / SDR_PEAK_NITS), 1.0 / 2.2);
+	}
+
+	// Debug: sky-mask overlay (validation only — no tone effect yet). Cyan on
+// the sky region from the R8 t2 mask; rides _reserved5 (bMLSkyDebugVis).
+	if (_reserved5 > 0.5) {
+		// Full-res 640x360 mask at the CONTENT uv — same remap as the tone leg,
+		// so the cyan overlay shows exactly which pixels the tone is affecting.
+		// Uses rawS (not strength-gated S) so the mask is visible at any strength.
+		float S2 = smoothstep(0.25, 0.75, rawS);
+		color.rgb = lerp(color.rgb, float3(0.0, 1.0, 1.0) * 0.6, S2 * 0.5);
 	}
 
 	// Debug: track-colored ellipses

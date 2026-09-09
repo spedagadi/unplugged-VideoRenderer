@@ -83,6 +83,9 @@ IF EXIST "Source\onnxrt\onnxruntime.dll" (
 IF EXIST "Source\onnxrt\face_detection_yunet.onnx" (
   COPY /Y "Source\onnxrt\face_detection_yunet.onnx" "%DIST_DIR%\" >NUL
 )
+IF EXIST "Source\onnxrt\yolo26n-sem.onnx" (
+  COPY /Y "Source\onnxrt\yolo26n-sem.onnx" "%DIST_DIR%\" >NUL
+)
 
 ECHO.
 ECHO Distribution folder ready:  "%CD%\%DIST_DIR%"

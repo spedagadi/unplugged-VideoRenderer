@@ -67,6 +67,7 @@ protected:
 	bool m_bHdrLocalToneMapping            = false;
 	int  m_iHdrLocalToneMappingType        = 0;
 	int  m_iHdrDisplayMaxNits              = 1000;
+	bool m_bHDRPassthroughRaw             = false; // demo: show raw HDR/DV on SDR
 
 	// Zion ML grade
 	bool  m_bML                           = false;
