@@ -383,6 +383,11 @@ private:
 
 	UINT m_srcVideoTransferFunction = 0; // need a description or rename
 
+	// Forced input colour space for live HDMI capture (ICS_* enum in
+	// IVideoRenderer.h). Auto = current behaviour (media type / resolution).
+	int m_InputColorSpaceOverride = ICS_Auto;
+	void ApplyInputColorSpaceOverride(); // post-SpecifyExtendedFormat override
+
 	std::map<std::wstring, bool> m_hdrModeSavedState;
 	std::map<std::wstring, bool, std::less<>> m_hdrModeStartState;
 

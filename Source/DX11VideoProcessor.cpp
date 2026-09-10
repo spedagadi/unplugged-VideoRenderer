@@ -1680,13 +1680,27 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 {
 	const wchar_t* mode = (m_iMLMode == ML_Auto) ? L"Auto" : (m_iMLMode == ML_Manual ? L"Manual" : L"Off");
 	const wchar_t* domain = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ? L"PQ" : L"SDR-remap";
+	// input colour space (RENDERER IN / LIVE panel): what we're grading the
+	// signal as. ICS_Auto is derived from the media type + resolution; an
+	// explicit override is pushed by the DeckLink monitor.
+	const wchar_t* icsName = L"auto";
+	switch (m_InputColorSpaceOverride) {
+	case ICS_BT601:      icsName = L"601"; break;
+	case ICS_BT709:      icsName = L"709"; break;
+	case ICS_BT2020_SDR: icsName = L"2020-SDR"; break;
+	case ICS_BT2020_PQ:  icsName = L"2020-PQ"; break;
+	case ICS_BT2020_HLG: icsName = L"2020-HLG"; break;
+	default: break;
+	}
+	const wchar_t* inFmt = m_srcParams.str ? m_srcParams.str : L"-";
 	str = std::format(
 		L"mode: {}   domain: {}   active: {}\n"
 		L"gamma={:.4f}   shadow={:.3f}   highlight={:.3f}\n"
 		L"gates: tone={} gammaEnable={} gammaModel={} features={} gammaPredict={}\n"
 		L"scene: peak={:.4f} avg={:.4f}   pred={:.4f} raw={:.4f}   feat={}\n"
 		L"hunt={:.3f}{}   chroma={:.2f}/{:.2f} knee={:.2f} skin={:.2f}{}\n"
-		L"bars: top={} bot={}{}",
+		L"bars: top={} bot={}{}\n"
+		L"rendererIn: fmt={} {}x{}  ics={}",
 		mode, domain, (m_bMLActive ? L"yes" : L"no"),
 		m_lastMLParams.MLGamma, m_lastMLParams.MLShadowToe, m_lastMLParams.MLHighlightRolloff,
 		(m_bMLToneCurveEnabled ? L"1" : L"0"), (m_bMLGammaEnabled ? L"1" : L"0"),
@@ -1700,7 +1714,8 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		(m_lastMLParams.MLChromaGate > 0.5f ? L"" : L"(off)"),
 		(int)std::lround(m_fMLBarTop * m_windowRect.Height()),
 		(int)std::lround((1.0f - m_fMLBarBot) * m_windowRect.Height()),
-		(m_bMLBarsHighlight ? L" (hl)" : L""));
+		(m_bMLBarsHighlight ? L" (hl)" : L""),
+		inFmt, (int)m_srcRectWidth, (int)m_srcRectHeight, icsName);
 }
 
 HRESULT CDX11VideoProcessor::CreateSkyMaskTexture()
@@ -2754,8 +2769,61 @@ bool CDX11VideoProcessor::ToggleHDR(const DisplayConfig_t& displayConfig, const 
 	return ret == ERROR_SUCCESS;
 }
 
+void CDX11VideoProcessor::ApplyInputColorSpaceOverride()
+{
+	// Always-on trace (ml_debug.csv, opened at construction in release) so the
+	// HTPC decklink run shows exactly which ICS value was applied per media
+	// type / settings push.
+	if (m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"ICS override=%d (mt w=%u h=%u fmt=%d)\n",
+			m_InputColorSpaceOverride, (unsigned)m_srcRectWidth, (unsigned)m_srcRectHeight, (int)m_srcParams.cformat);
+		fflush(m_pMLDebugFile);
+	}
+
+	if (m_InputColorSpaceOverride == ICS_Auto) {
+		return;
+	}
+
+	// Override BOTH formats: m_srcExFmt drives the D3D11 VP / shader
+	// conversion matrices, m_decExFmt drives SourceIsHDR10orHLG() (and the
+	// PQ/HLG tone-map + swapchain decisions keyed off it). NominalRange is
+	// left to auto-detection (16-235 fallback in SpecifyExtendedFormat) —
+	// only the matrix / primaries / transfer are forced to the signal.
+	DXVA2_ExtendedFormat& x = m_srcExFmt;
+	switch (m_InputColorSpaceOverride) {
+	case ICS_BT601:      x.VideoTransferMatrix = DXVA2_VideoTransferMatrix_BT601; break;
+	case ICS_BT709:      x.VideoTransferMatrix = DXVA2_VideoTransferMatrix_BT709; break;
+	case ICS_BT2020_SDR:
+	case ICS_BT2020_PQ:
+	case ICS_BT2020_HLG: x.VideoTransferMatrix = MFVideoTransferMatrix_BT2020_10; break;
+	default:             break;
+	}
+	switch (m_InputColorSpaceOverride) {
+	case ICS_BT2020_SDR: x.VideoPrimaries = MFVideoPrimaries_BT2020;
+	                     x.VideoTransferFunction = DXVA2_VideoTransFunc_709; break;
+	case ICS_BT2020_PQ:  x.VideoPrimaries = MFVideoPrimaries_BT2020;
+	                     x.VideoTransferFunction = MFVideoTransFunc_2084; break;
+	case ICS_BT2020_HLG: x.VideoPrimaries = MFVideoPrimaries_BT2020;
+	                     x.VideoTransferFunction = MFVideoTransFunc_HLG; break;
+	case ICS_BT601:
+	case ICS_BT709:      x.VideoPrimaries = DXVA2_VideoPrimaries_BT709;
+	                     x.VideoTransferFunction = DXVA2_VideoTransFunc_709; break;
+	default:             break;
+	}
+	m_decExFmt.VideoTransferMatrix   = x.VideoTransferMatrix;
+	m_decExFmt.VideoPrimaries        = x.VideoPrimaries;
+	m_decExFmt.VideoTransferFunction = x.VideoTransferFunction;
+}
+
 BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 {
+	if (m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"InitMediaType enter (override=%d pmtFmt=%d cformat=%d)\n",
+			m_InputColorSpaceOverride,
+			(pmt && pmt->formattype == FORMAT_VideoInfo2) ? 2 : (pmt && pmt->formattype == FORMAT_VideoInfo) ? 1 : 0,
+			(pmt ? (int)GetFmtConvParams(pmt).cformat : -1));
+		fflush(m_pMLDebugFile);
+	}
 	DLog(L"CDX11VideoProcessor::InitMediaType()");
 
 	if (!VerifyMediaType(pmt)) {
@@ -2834,6 +2902,7 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 	m_srcRectHeight = m_srcRect.Height();
 
 	m_srcExFmt = SpecifyExtendedFormat(m_decExFmt, FmtParams, m_srcRectWidth, m_srcRectHeight);
+	ApplyInputColorSpaceOverride(); // forced ICS_* for live HDMI capture (no-op when Auto)
 
 	bool disableD3D11VP = false;
 	switch (FmtParams.cformat) {
@@ -5036,6 +5105,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	bool changeSuperRes          = false;
 	bool changeRTXVideoHDR       = false;
 	bool changeLuminanceParams   = false;
+	bool changeInputColor        = false;
 
 	// settings that do not require preparation
 	m_bShowStats           = config.bShowStats;
@@ -5264,6 +5334,19 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		UpdateMLActive();
 	}
 
+	// forced input colour space (live HDMI / DeckLink) — re-derive the media
+	// type so the override lands on m_srcExFmt + m_decExFmt before the tone-map
+	// and swapchain decisions read them (mirrors the changeHDR path).
+	if (config.iInputColorSpace != m_InputColorSpaceOverride) {
+		if (m_pMLDebugFile) {
+			fwprintf(m_pMLDebugFile, L"Configure: inputColorSpace %d -> %d (changeInputColor)\n",
+				m_InputColorSpaceOverride, config.iInputColorSpace);
+			fflush(m_pMLDebugFile);
+		}
+		m_InputColorSpaceOverride = config.iInputColorSpace;
+		changeInputColor = true;
+	}
+
 	if (!m_pFilter->GetActive()) {
 		return;
 	}
@@ -5278,6 +5361,21 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			m_srcVideoTransferFunction = 0;
 			InitMediaType(&m_pFilter->m_inputMT);
 		}
+		return;
+	}
+
+	if (changeInputColor) {
+		// force re-derive of the input colour space (ICS override or back to
+		// Auto) — invalidate the PQ/HLG transition latch so the HDR-toggle and
+		// shader selection re-evaluate against the new signal.
+		if (m_pMLDebugFile) {
+			fwprintf(m_pMLDebugFile, L"Configure: changeInputColor -> InitMediaType(override=%d)\n",
+				m_InputColorSpaceOverride);
+			fflush(m_pMLDebugFile);
+		}
+		m_srcVideoTransferFunction = 0;
+		InitMediaType(&m_pFilter->m_inputMT);
+
 		return;
 	}
 

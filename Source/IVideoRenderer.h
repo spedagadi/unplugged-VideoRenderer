@@ -108,6 +108,19 @@ enum : int {
 	ML_Auto
 };
 
+// Input colour-space override for live HDMI capture (DeckLink). Auto = derive
+// from the media type / resolution as today; an explicit value forces the
+// video input to be graded as that signal (the source filter does not stamp
+// VIH2 colourimetry for DeckLink streams).
+enum : int {
+	ICS_Auto = 0,
+	ICS_BT601,       // Rec.601 / SDR
+	ICS_BT709,       // Rec.709 / SDR
+	ICS_BT2020_SDR,  // BT.2020 primaries, SDR transfer (DV-on-HDMI heuristic)
+	ICS_BT2020_PQ,   // BT.2020 + PQ  (HDR10)
+	ICS_BT2020_HLG,  // BT.2020 + HLG
+};
+
 struct Settings_t {
 	bool bUseD3D11;
 	bool bShowStats;
@@ -140,6 +153,7 @@ struct Settings_t {
 	int  iHdrLocalToneMappingType; // 1=ACES 2=Reinhard 3=Hable 4=Mobius 5=BT.2390 6=...
 	int iHdrDisplayMaxNits;
 	bool bHDRPassthroughRaw = false; // skip tone map + ML: show the raw HDR/DV signal on SDR (demo)
+	int iInputColorSpace = ICS_Auto;  // forced input colour space for live HDMI capture (ICS_*)
 
 	// Zion ML grade
 	bool  bMLEnabled = false;
@@ -243,6 +257,7 @@ struct Settings_t {
 		iSDRDisplayNits                 = SDR_NITS_DEF;
 		iHdrLocalToneMappingType        = 5;   // BT.2390 default
 		bHDRPassthroughRaw              = false;
+		iInputColorSpace                = ICS_Auto;
 		bMLEnabled                      = false;
 		iMLMode                         = ML_Disable;
 		bMLToneCurveEnabled             = true;
