@@ -12,7 +12,7 @@ Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 Texture2D skin_lut : register(t1);   // bound by C++ but unused in ICtCp path
 SamplerState sampSkin : register(s1);
-Texture2D sky_mask : register(t2);   // 640x360 R8 sky mask (content-aligned)
+Texture2D sky_mask : register(t2);   // 640x360 R8G8 semseg: only .g (person) used here
 SamplerState sampSky : register(s2);
 
 struct PS_INPUT
@@ -81,6 +81,16 @@ cbuffer MLParams : register(b0)
 	float MLSkyUVScX;
 	float MLSkyUVScY;
 	float _padSky;
+	// Person skin protection (stage 4) — appended tail, offsets above unchanged
+	float MLSkinPersonStrength;  // 0..1 LUT-only-inside-people gate; 0 = legacy
+	float MLSkinPersonDebugVis;  // 0/1 magenta person-mask overlay
+	float _padPerson0;
+	float _padPerson1;
+	// Skin tone-preservation (stage 5) — appended tail
+	float MLSkinAnchor;    // skin-set mean source luma (IIR, gamma-2.2)
+	float MLSkinPreserve;  // 0..1 keep-scale of source skin structure
+	float MLSkinPad0;
+	float MLSkinPad1;
 };
 
 static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
@@ -168,14 +178,30 @@ float4 main(PS_INPUT input) : SV_Target
 	float b     = blur_s1(input.Tex, texel);   // fine surround (σ≈1)
 	float logr  = clamp(log(lm / max(b, 1e-5)), -1.0, 1.0);
 	float zone  = smoothstep(MCZoneLo, MCZoneLo + 0.15f, I_norm); // shadow gate
-	// Sky-upweighted clarity: within sky, raise the lift so cloud layering
-	// survives tone compression. Safe — flat sky has logr≈0 so nothing moves.
-	// In-content gate kills bar bleed (see ps_ml_gamma).
+	// Person mask sample (t2.g) + content-UV gate. The SKY mask (t2.r) is NOT
+	// used here — it steers the tone curve in ps_ml_gamma only, never MC.
 	float2 cuv = (input.Tex - float2(MLSkyUVOffX, MLSkyUVOffY))
 		/ max(float2(MLSkyUVScX, MLSkyUVScY), 0.001f);
 	const float inContent = (all(cuv >= 0.0) && all(cuv <= 1.0)) ? 1.0 : 0.0;
-	float S = sky_mask.Sample(sampSky, saturate(cuv)).r * inContent;
-	float MCe = MCStrength * (1.0f + 2.0f * S);
+	// Person-skin damping (stage 4): person-gated LUT weight suppresses the
+	// clarity lift on skin so pores/blemishes are not enhanced. Lo stays 0 when
+	// strength is 0 or the pixel is not on a person → MCe is identical to the
+	// pre-feature path (bit-identical at Strength=0, no LUT-suppression drag).
+	float Lo = 0.0f;
+	if (MLSkinPersonStrength > 0.001) {
+		float P = sky_mask.Sample(sampSky, saturate(cuv)).g * inContent;
+		float3 g22p = (IsPQ > 0.5) ? pow(max(lin, 0.0), 1.0f / 2.2f) : max(color.rgb, 0.0f);
+		float yp = dot(g22p, luma_w);
+		float2 skuv = saturate(float2(
+			(g22p.r - yp) / 1.5748 - MLSkinLUTCR0,
+			(g22p.b - yp) / 1.8556 - MLSkinLUTCB0) / float2(
+			MLSkinLUTCR1 - MLSkinLUTCR0, MLSkinLUTCB1 - MLSkinLUTCB0));
+		float L = skin_lut.Sample(sampSkin, skuv).r;
+		Lo = L * P * MLSkinPersonStrength;
+	}
+	// MC is now uniform: texture-gate × user strength, damped on person-skin.
+	// No sky coupling — the sky mask belongs to the tone curve only.
+	float MCe = MCStrength * (1.0f - saturate(Lo * MCSkinProtect));
 	float lift = exp(MCe * zone * logr);
 
 	// Excursion bound: dark side is naturally safe (lift<1); cap the bright side

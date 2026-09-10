@@ -78,13 +78,19 @@ IF EXIST "models\xgb_gamma_model.plxgb" (
 IF EXIST "Source\onnxrt\onnxruntime.dll" (
   COPY /Y "Source\onnxrt\onnxruntime.dll" "%DIST_DIR%\" >NUL
 ) ELSE (
-  ECHO [WARN] onnxruntime.dll not found - face detection will be unavailable.
+  ECHO [WARN] onnxruntime.dll not found - ML segmentation will be unavailable.
 )
-IF EXIST "Source\onnxrt\face_detection_yunet.onnx" (
-  COPY /Y "Source\onnxrt\face_detection_yunet.onnx" "%DIST_DIR%\" >NUL
-)
+REM face_detection_yunet.onnx disabled — person masks replace YuNet.
+REM IF EXIST "Source\onnxrt\face_detection_yunet.onnx" (
+REM   COPY /Y "Source\onnxrt\face_detection_yunet.onnx" "%DIST_DIR%\" >NUL
+REM )
 IF EXIST "Source\onnxrt\yolo26n-sem.onnx" (
   COPY /Y "Source\onnxrt\yolo26n-sem.onnx" "%DIST_DIR%\" >NUL
+)
+IF EXIST "Source\onnxrt\yolo26n-seg_op21.onnx" (
+  COPY /Y "Source\onnxrt\yolo26n-seg_op21.onnx" "%DIST_DIR%\" >NUL
+) ELSE (
+  ECHO [WARN] yolo26n-seg_op21.onnx not found - person mask unavailable.
 )
 
 ECHO.

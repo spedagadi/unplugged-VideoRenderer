@@ -426,6 +426,9 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_bSkyEnabled          = config.bMLSkyEnabled;
 	m_bSkyDebugVis         = config.bMLSkyDebugVis;
 	m_fMLSkyStrength      = config.fMLSkyStrength;
+	m_bPersonEnabled       = config.bMLPersonEnabled;
+	m_fPersonStrength      = config.fMLPersonStrength;
+	m_bPersonDebugVis      = config.bMLPersonDebugVis;
 	m_fMLShadowZoneCeil    = config.fMLShadowZoneCeil;
 	m_fMLShadowSkinProtect = config.fMLShadowSkinProtect;
 	m_fMLShadowRatioCap    = config.fMLShadowRatioCap;
@@ -484,7 +487,8 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 				fwprintf(m_pMLDebugFile, L"# ml_debug.csv — MPCVR ML diagnostic log\n");
 			}
 			fwprintf(m_pMLDebugFile, L"# init (bMLEnabled=%d bMLDebug=%d)\n", (int)m_bML, (int)m_bMLDebug);
-			fflush(m_pMLDebugFile);
+				fwprintf(m_pMLDebugFile, L"# BUILD ZION-PIPE tag=skyMC-decouple-v3 person=perFrame skyMaxCad=5 personModel=yolo26n-seg_op21\n");
+				fflush(m_pMLDebugFile);
 		}
 	}
 
@@ -506,6 +510,10 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	EXECUTE_ASSERT(m_bMLShadowModelLoaded);
 	EXECUTE_ASSERT(m_bMLHighlightModelLoaded);
 
+	// Face detection (YuNet) DISABLED — person instance masks replace it. The
+	// member stays NULL so every guarded block is inert; re-enable by restoring
+	// these lines and un-#if-0'ing the detect block in ExtractMLFeatures.
+#if 0
 	m_pFaceDetect = std::make_unique<CFaceDetect>();
 	m_pFaceDetect->SetLogFile(m_pMLDebugFile);
 	HRESULT hrFace = m_pFaceDetect->Init(GetMLModelPath(L"face_detection_yunet.onnx"));
@@ -516,6 +524,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 		fflush(m_pMLDebugFile);
 	}
 	EXECUTE_ASSERT(SUCCEEDED(hrFace) && m_pFaceDetect->IsReady());
+#endif
 
 	m_pSkySeg = std::make_unique<CSkySeg>();
 	m_pSkySeg->SetLogFile(m_pMLDebugFile);
@@ -530,6 +539,24 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	// Sky seg is optional — do not hard-fail the filter if the model is missing.
 	if (FAILED(hrSky) && m_pMLDebugFile) {
 		fwprintf(m_pMLDebugFile, L"INIT_SKY disabled (model load failed)\n");
+		fflush(m_pMLDebugFile);
+	}
+
+	// Person instance segmentation (yolo26n-seg, COCO class 0) — the continuity
+	// layer for skin protection. Ships re-stamped to opset 21 (the raw export is
+	// opset 22, rejected by the bundled ORT 1.21). Optional like sky.
+	m_pPersonSeg = std::make_unique<CPersonSeg>();
+	m_pPersonSeg->SetLogFile(m_pMLDebugFile);
+	m_pPersonSeg->SetLogEnabled(m_bMLDebug);
+	HRESULT hrPerson = m_pPersonSeg->Init(GetMLModelPath(L"yolo26n-seg_op21.onnx"));
+	if (m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"INIT_PERSON hr=0x%08X ready=%d err=%s\n",
+			(unsigned)hrPerson, (int)m_pPersonSeg->IsReady(),
+			m_pPersonSeg->GetLastError().c_str());
+		fflush(m_pMLDebugFile);
+	}
+	if (FAILED(hrPerson) && m_pMLDebugFile) {
+		fwprintf(m_pMLDebugFile, L"INIT_PERSON disabled (model load failed)\n");
 		fflush(m_pMLDebugFile);
 	}
 
@@ -843,6 +870,7 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_pSamplerSky.Release();
 	m_SegDownsample.Release();
 	m_SegStaging.Release();
+	m_MaskProbe.Release();
 	m_pPSMLDownsample.Release();
 	m_pPSFaceDown.Release();
 	m_pFaceDownParams.Release();
@@ -1320,7 +1348,8 @@ void CDX11VideoProcessor::SetMLParams()
 		fflush(m_pMLDebugFile);
 	}
 
-	// Scene cut detection: L2 distance across multiple histogram features
+	// Face detection (YuNet + ByteTrack) DISABLED — person masks replace it.
+#if 0
 	float sceneDelta2 = 0.0f;
 	bool hasPrev = m_fPrevSceneFeat[0] >= 0.0f;
 	for (int i = 0; i < SCENE_CUT_N; i++) {
@@ -1380,6 +1409,11 @@ void CDX11VideoProcessor::SetMLParams()
 			trk.get_score()
 		};
 	}
+#endif   // end of face-detection disable
+	// Face cbuffer stays zeroed (layout stable) — face path is inert.
+	int numFaces = 0;
+	CFaceDetect::FaceBox faceBoxes[4] = {};
+	float faceTrackIds[4] = {};
 
 	MLParams_t params = {
 		gamma,
@@ -1450,8 +1484,6 @@ void CDX11VideoProcessor::SetMLParams()
 		fflush(m_pMLDebugFile);
 	}
 
-	m_lastMLParams = params;
-
 	if (m_bMLDebug && m_pMLDebugFile) {
 		fwprintf(m_pMLDebugFile,
 			L"BARS_CBUF uBarTop=%.4f uBarBot=%.4f uBarV0=%.4f uBarSpan=%.4f uBarFeather=%.1f uBarBlack=%.4f uBarHL=%.0f  m_bMLBarsEnabled=%d m_bMLBarsHighlight=%d m_bMLFeaturesReady=%d\n",
@@ -1471,6 +1503,21 @@ void CDX11VideoProcessor::SetMLParams()
 		: guard - 1.0f; // effectively disabled before features are ready
 	params.MLSkyLuma = m_SkyLuma;
 
+	// Person skin protection (stage 4): LUT-only-inside-people gate. Strength 0
+	// -> shaders branch to the plain legacy LUT/MC path (bit-identical).
+	params.MLSkinPersonStrength = (m_bMLFeaturesReady && m_bPersonEnabled)
+		? fminf(1.0f, fmaxf(0.0f, m_fPersonStrength)) : 0.0f;
+	params.MLSkinPersonDebugVis = m_bPersonDebugVis ? 1.0f : 0.0f;
+	// Skin tone-preservation (stage 5): CPU IIR skin-set mean source luma (from the
+	// SKINMET readback cadence) anchors the shader's skin remap; strength 0 = inert.
+	params.MLSkinAnchor   = m_skinAnchorValid ? (float)m_skinAnchorSmooth : 0.0f;
+	params.MLSkinPreserve = fminf(1.0f, fmaxf(0.0f, m_fMLSkinPreserve));
+
+	// Snapshot the FULL struct AFTER the appended tails (sky/person) are set.
+	// Process() re-uploads m_lastMLParams every frame for the UV remap, so the
+	// mirror must carry the tails or they hit the shader as zeros.
+	m_lastMLParams = params;
+
 	// Always upload: a zero-filled buffer (from a missed update) made the
 	// gamma shader run at MLGamma=0 -> pow(y, g<1) -> washed-out image.
 	if (m_pMLParams) {
@@ -1486,6 +1533,8 @@ void CDX11VideoProcessor::SetMLParams()
 		EXECUTE_ASSERT(S_OK == result);
 	}
 }
+
+static void DumpSegPreviewBmp(const uint8_t* bgra, int w, int h, int stride, const wchar_t* path);
 
 void CDX11VideoProcessor::ExtractMLFeatures()
 {
@@ -1538,11 +1587,12 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	m_MLDebugFeat1 = m_MLFeatures[1];
 	m_MLDebugFeatReady = 1;
 
-	// Face detection: downsample color to 480x288 BGRA8 and submit to background thread
-	if (m_FaceDownsample && m_FaceStaging && m_pFaceDetect && m_pPSFaceDown) {
-		const CRect faceRect(0, 0, 480, 288);
-		// Update IsPQ flag so face_down shader applies PQ→SDR for the detector
-		if (m_pFaceDownParams) {
+	// Face detection DISABLED — person instance masks (yolo26n-seg) replace YuNet +
+// ByteTrack. The face_down shader + its IsPQ cbuffer STAY (the sky/person seg
+// preview uses them). Kept behind #if 0 for easy re-enable.
+	{
+		// Update IsPQ flag so face_down applies PQ→SDR for the seg preview.
+		if (m_pPSFaceDown && m_pFaceDownParams) {
 			D3D11_MAPPED_SUBRESOURCE mr2 = {};
 			if (SUCCEEDED(m_pDeviceContext->Map(m_pFaceDownParams, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr2))) {
 				struct { float IsPQ; float pad[3]; } fd = {
@@ -1552,71 +1602,116 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 				m_pDeviceContext->Unmap(m_pFaceDownParams, 0);
 			}
 		}
-		hr = TextureCopyRect(m_TexConvertOutput, m_FaceDownsample, texRect, faceRect, m_pPSFaceDown, m_pFaceDownParams, 0, false);
-		if (SUCCEEDED(hr)) {
-			m_pDeviceContext->CopyResource(m_FaceStaging, m_FaceDownsample);
-			D3D11_MAPPED_SUBRESOURCE faceMr = {};
-			HRESULT hrMap = m_pDeviceContext->Map(m_FaceStaging, 0, D3D11_MAP_READ, 0, &faceMr);
-			if (SUCCEEDED(hrMap)) {
-				CFaceDetect::FaceBox syncOut[4] = {};
-				m_nSyncFaces = m_pFaceDetect->DetectSync((const uint8_t*)faceMr.pData, 480, 288, faceMr.RowPitch, syncOut, 4);
-				for (int i = 0; i < m_nSyncFaces; i++) m_syncFaces[i] = syncOut[i];
-
-				m_pDeviceContext->Unmap(m_FaceStaging, 0);
-				if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
-					fwprintf(m_pMLDebugFile, L"FACE_SYNC frame=%llu n=%d ready=%d texSrc=%ux%u\n",
-						m_MLDebugFrame, m_nSyncFaces, (int)m_pFaceDetect->IsReady(),
-						m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height);
-					fflush(m_pMLDebugFile);
+#if 0
+		if (m_FaceDownsample && m_FaceStaging && m_pFaceDetect && m_pPSFaceDown) {
+			const CRect faceRect(0, 0, 480, 288);
+			hr = TextureCopyRect(m_TexConvertOutput, m_FaceDownsample, texRect, faceRect, m_pPSFaceDown, m_pFaceDownParams, 0, false);
+			if (SUCCEEDED(hr)) {
+				m_pDeviceContext->CopyResource(m_FaceStaging, m_FaceDownsample);
+				D3D11_MAPPED_SUBRESOURCE faceMr = {};
+				HRESULT hrMap = m_pDeviceContext->Map(m_FaceStaging, 0, D3D11_MAP_READ, 0, &faceMr);
+				if (SUCCEEDED(hrMap)) {
+					CFaceDetect::FaceBox syncOut[4] = {};
+					m_nSyncFaces = m_pFaceDetect->DetectSync((const uint8_t*)faceMr.pData, 480, 288, faceMr.RowPitch, syncOut, 4);
+					for (int i = 0; i < m_nSyncFaces; i++) m_syncFaces[i] = syncOut[i];
+					m_pDeviceContext->Unmap(m_FaceStaging, 0);
 				}
-			} else if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
-				fwprintf(m_pMLDebugFile, L"FACE_SUBMIT map_failed hr=0x%08X\n", (unsigned)hrMap);
-				fflush(m_pMLDebugFile);
 			}
-		} else if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
-			fwprintf(m_pMLDebugFile, L"FACE_SUBMIT downsample_failed hr=0x%08X\n", (unsigned)hr);
-			fflush(m_pMLDebugFile);
 		}
-	} else if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
-		fwprintf(m_pMLDebugFile, L"FACE_SUBMIT skipped ds=%d stg=%d detect=%d shader=%d frame=%llu\n",
-			(m_FaceDownsample ? 1 : 0), (m_FaceStaging ? 1 : 0),
-			(m_pFaceDetect ? 1 : 0), (m_pPSFaceDown ? 1 : 0), m_MLDebugFrame);
-		fflush(m_pMLDebugFile);
+#endif
 	}
 
-	// Sky segmentation — throttled (~10 fps). Renders its OWN 640x360 SDR-ized
-	// preview: higher fidelity than the 480x288 face texture, so building/sky
-	// boundaries survive the downscale. Pushes a 640x640 R8 mask to the shader.
-	if (m_bSkyEnabled && m_pSkySeg && m_pSkySeg->IsReady() && m_SkyMaskSRV &&
-		m_SegDownsample && m_SegStaging && (m_MLDebugFrame % 10 == 0)) {
-		const CRect segRect(0, 0, 640, 360);
-		HRESULT hrSeg = TextureCopyRect(m_TexConvertOutput, m_SegDownsample, texRect, segRect, m_pPSFaceDown, m_pFaceDownParams, 0, false);
-		if (SUCCEEDED(hrSeg)) {
-			m_pDeviceContext->CopyResource(m_SegStaging, m_SegDownsample);
+	// Sky/person segmentation — throttled (~10 fps). Renders its OWN 640x360
+	// SDR-ized preview: higher fidelity than the 480x288 face texture, so
+	// building/sky boundaries survive the downscale. Pushes a 640x360 R8G8 mask
+	// (R=sky, G=person) to the shader. Runs when either feature (or an overlay
+	// that needs the mask) is wanted; cadence uses the render-thread frame
+	// counter — m_MLDebugFrame is NOT a safe throttle (pinned at 0 without the
+	// frame log, which made this run EVERY frame in normal playback).
+	const bool wantPerson = m_bPersonEnabled || m_bPersonDebugVis;
+	const bool wantSky    = m_bSkyEnabled || m_bSkyDebugVis;
+	const bool wantMask   = wantPerson || wantSky;
+	// Person: every frame (fresh masks for fast zooms/pans). Sky: every 5 frames.
+	const bool doSky = wantSky && (m_nSkyFrame - m_nSkyLastFrame >= 5);
+	if (wantMask && (m_pPersonSeg && m_pPersonSeg->IsReady() || m_pSkySeg && m_pSkySeg->IsReady()) &&
+		m_SkyMaskSRV && m_SegDownsample && m_SegStaging && (wantPerson || doSky)) {
+		// Preview is rendered from the PRESENTED content rect in Process (the mask is
+		// keyed to the presentation, so it stays aligned even under player crop /
+		// zoom / pillarbox on any display aspect). Stage + detect here, 1 frame latent.
+		m_pDeviceContext->CopyResource(m_SegStaging, m_SegDownsample);
 			D3D11_MAPPED_SUBRESOURCE segMr = {};
 			if (SUCCEEDED(m_pDeviceContext->Map(m_SegStaging, 0, D3D11_MAP_READ, 0, &segMr))) {
-				CSkySeg::Result sky;
-				if (m_pSkySeg->DetectSky((const uint8_t*)segMr.pData, 640, 360, segMr.RowPitch, sky)) {
-					m_SkyFrac = sky.skyFrac;
-					m_SkyLuma = sky.skyLuma;
-					if (!sky.map.empty()) {
-						m_pDeviceContext->UpdateSubresource(m_SkyMask, 0, nullptr, sky.map.data(), sky.mapW, 0);
-						if (m_bMLDebug && m_pMLDebugFile) {
-							fwprintf(m_pMLDebugFile,
-								L"SKY_REFRESH frame=%llu map=%dx%d srcW=%ux%u frac=%.4f luma=%.3f stagingPitch=%u\n",
-								(unsigned long long)m_MLDebugFrame, sky.mapW, sky.mapH,
-								m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height,
-								(double)sky.skyFrac, (double)sky.skyLuma, (unsigned)segMr.RowPitch);
-							fflush(m_pMLDebugFile);
-						}
-					}
-				} else if (m_bMLDebug && m_pMLDebugFile) {
-					fwprintf(m_pMLDebugFile, L"SKY_REFRESH frame=%llu DetectSky FAILED\n", (unsigned long long)m_MLDebugFrame);
+				// Diagnostic: save the staged preview every ~120 refreshes (frame log
+				// on) so a mask-vs-screen offset can be eyeballed (esp. ultrawide /
+				// DV-P5) — is the preview the correct presented region?
+				if (m_bMLDebug && m_pMLDebugFile && segMr.pData && (m_nSkyFrame % 120 == 0)) {
+					wchar_t dumpPath[MAX_PATH];
+					swprintf_s(dumpPath, L"%s\\seg_preview_%04llu.bmp", GetMLModuleDir().c_str(),
+						(unsigned long long)(m_nSkyFrame / 120));
+					DumpSegPreviewBmp((const uint8_t*)segMr.pData, 640, 360, segMr.RowPitch, dumpPath);
+					fwprintf(m_pMLDebugFile, L"SEGDUMP wrote %s\n", dumpPath);
 					fflush(m_pMLDebugFile);
 				}
-				m_pDeviceContext->Unmap(m_SegStaging, 0);
+				CSkySeg::Result sky;
+				if (doSky) {
+					if (m_pSkySeg->DetectSky((const uint8_t*)segMr.pData, 640, 360, segMr.RowPitch, sky)) {
+						m_SkyFrac = sky.skyFrac;
+						m_SkyLuma = sky.skyLuma;
+						if (!sky.map.empty()) m_LastSkyMap = sky.map;
+					}
+					m_nSkyLastFrame = m_nSkyFrame;
+				}
+				// Person instance masks (yolo26n-seg, class 0) — every frame.
+				CPersonSeg::Result person;
+				if (wantPerson && m_pPersonSeg && m_pPersonSeg->IsReady() &&
+					m_pPersonSeg->DetectPersons((const uint8_t*)segMr.pData, 640, 360, segMr.RowPitch, person)) {
+					m_PersonFrac = person.personFrac;
+					// Temporal stability: blend the raw mask toward its smoothed twin so
+					// detection flicker (mirrors, weak silhouettes) can't pop the tone
+					// gate frame-to-frame. 75% old / 25% new per refresh.
+					if (m_PersonMaskSm.size() != 640 * 360) m_PersonMaskSm = m_LastPersonMap;
+					else {
+						for (size_t _i = 0; _i < m_LastPersonMap.size(); _i++)
+							m_PersonMaskSm[_i] = (uint8_t)((3 * (int)m_PersonMaskSm[_i] + (int)m_LastPersonMap[_i]) >> 2);
+					}
+					if (!person.map.empty()) m_LastPersonMap = person.map;
+				} else {
+					m_PersonFrac = 0.0f;
+				}
+				// R=sky (persists between refreshes), G=person (fresh every frame).
+				// Independent channels: zero-fill whichever model is unavailable.
+				const bool haveSky = !m_LastSkyMap.empty();
+				const std::vector<uint8_t>& gmap = m_PersonMaskSm.empty() ? m_LastPersonMap : m_PersonMaskSm;
+				const bool haveP = !gmap.empty();
+				if (haveSky || haveP) {
+					const size_t nPix = 640 * 360;
+					std::vector<uint8_t> packed(nPix * 2, 0);
+					for (size_t i = 0; i < nPix; i++) {
+						if (haveSky) packed[i * 2 + 0] = m_LastSkyMap[i];
+						if (haveP)   packed[i * 2 + 1] = gmap[i];
+					}
+					m_pDeviceContext->UpdateSubresource(m_SkyMask, 0, nullptr, packed.data(), (UINT)640 * 2, 0);
+					if (m_bMLDebug && m_pMLDebugFile && doSky) {
+						fwprintf(m_pMLDebugFile,
+							L"SKY_REFRESH frame=%llu srcW=%ux%u sfrac=%.4f pfrac=%.4f luma=%.3f skyOK=%d personOK=%d stagingPitch=%u\n",
+							(unsigned long long)m_MLDebugFrame,
+							m_TexConvertOutput.desc.Width, m_TexConvertOutput.desc.Height,
+							(double)m_SkyFrac, (double)m_PersonFrac, (double)m_SkyLuma,
+							(int)haveSky, (int)haveP, (unsigned)segMr.RowPitch);
+						fflush(m_pMLDebugFile);
+					}
+				}
+				// Skin-tone anchor (production — no frame log needed): source skin-set mean luma.
+		if (wantPerson && segMr.pData) UpdateSkinAnchor((const uint8_t*)segMr.pData, segMr.RowPitch);
+		m_pDeviceContext->Unmap(m_SegStaging, 0);
 			}
-		}
+	}
+
+	// Mask auto-diagnostic: read back the ACTUAL R8G8 GPU texture and compare
+	// the G (person) channel against the CPU personFrac. If gpuG stays ~0 while
+	// cpu pfrac is live, the upload/pack is broken — log catches it in the field.
+	if (m_bMLDebug && m_pMLDebugFile && (m_nSkyFrame % 36 == 0)) {
+		LogMaskProbe();
 	}
 
 	UpdateMLBarsFromDetected();
@@ -1699,6 +1794,7 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		L"gates: tone={} gammaEnable={} gammaModel={} features={} gammaPredict={}\n"
 		L"scene: peak={:.4f} avg={:.4f}   pred={:.4f} raw={:.4f}   feat={}\n"
 		L"hunt={:.3f}{}   chroma={:.2f}/{:.2f} knee={:.2f} skin={:.2f}{}\n"
+		L"mask: sky={:.3f} person={:.3f}  pDbg={} pStr={:.3f} cad={}/{}\n"
 		L"bars: top={} bot={}{}\n"
 		L"rendererIn: fmt={} {}x{}  ics={}",
 		mode, domain, (m_bMLActive ? L"yes" : L"no"),
@@ -1712,6 +1808,10 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		m_lastMLParams.MLChromaNeutral, m_lastMLParams.MLChromaFire,
 		m_lastMLParams.MLChromaKnee, m_lastMLParams.MLChromaSkinProtect,
 		(m_lastMLParams.MLChromaGate > 0.5f ? L"" : L"(off)"),
+		m_SkyFrac, m_PersonFrac,
+		(m_bPersonDebugVis ? L"1" : L"0"),
+		(double)m_lastMLParams.MLSkinPersonStrength,
+		(unsigned long long)m_nSkyFrame, (unsigned long long)m_nSkyLastFrame,
 		(int)std::lround(m_fMLBarTop * m_windowRect.Height()),
 		(int)std::lround((1.0f - m_fMLBarBot) * m_windowRect.Height()),
 		(m_bMLBarsHighlight ? L" (hl)" : L""),
@@ -1728,13 +1828,13 @@ HRESULT CDX11VideoProcessor::CreateSkyMaskTexture()
 	desc.Height = 360;
 	desc.MipLevels = 1;
 	desc.ArraySize = 1;
-	desc.Format = DXGI_FORMAT_R8_UNORM;
+	desc.Format = DXGI_FORMAT_R8G8_UNORM;   // R = sky, G = person (single semseg mask)
 	desc.SampleDesc.Count = 1;
 	desc.Usage = D3D11_USAGE_DEFAULT;
 	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-	std::vector<uint8_t> zero(640 * 360, 0);
-	D3D11_SUBRESOURCE_DATA init = { zero.data(), (UINT)640, 0 };
+	std::vector<uint8_t> zero(640 * 360 * 2, 0);
+	D3D11_SUBRESOURCE_DATA init = { zero.data(), (UINT)1280, 0 };
 	HRESULT hr = m_pDevice->CreateTexture2D(&desc, &init, &m_SkyMask);
 	if (FAILED(hr)) return hr;
 	hr = m_pDevice->CreateShaderResourceView(m_SkyMask, nullptr, &m_SkyMaskSRV);
@@ -1744,6 +1844,13 @@ HRESULT CDX11VideoProcessor::CreateSkyMaskTexture()
 	sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
 	sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
 	hr = m_pDevice->CreateSamplerState(&sd, &m_pSamplerSky);
+	if (FAILED(hr)) return hr;
+
+	// CPU-readable twin for the mask auto-diagnostic (LogMaskProbe).
+	desc.Usage = D3D11_USAGE_STAGING;
+	desc.BindFlags = 0;
+	desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	hr = m_pDevice->CreateTexture2D(&desc, nullptr, &m_MaskProbe);
 	return hr;
 }
 
@@ -1767,7 +1874,196 @@ HRESULT CDX11VideoProcessor::CreateSkySegTextures()
 	desc.BindFlags = 0;
 	desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 	hr = m_pDevice->CreateTexture2D(&desc, nullptr, &m_SegStaging);
+	if (FAILED(hr)) return hr;
+
+	// Skin-metric grab pair: 640x360 BGRA downsampled copy of the graded output.
+	desc = {};
+	desc.Width = 640; desc.Height = 360; desc.MipLevels = 1; desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+	hr = m_pDevice->CreateTexture2D(&desc, nullptr, &m_MetDown);
+	if (FAILED(hr)) return hr;
+	desc.Usage = D3D11_USAGE_STAGING; desc.BindFlags = 0;
+	desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	hr = m_pDevice->CreateTexture2D(&desc, nullptr, &m_MetStaging);
 	return hr;
+}
+
+void CDX11VideoProcessor::LogSkinMetric(ID3D11Texture2D* pRT, const CRect& rect)
+{
+	// Real-video skin-retention check: on a cadence, grab the GRADED output
+	// (pRT content rect -> 640x360) and the SOURCE preview (m_SegStaging, the
+	// SDR-ized PQ this frame) and log the source->output displacement in the skin
+	// LUT's own space (gamma-2.2 luma + Cr/Cb), averaged over PERSON pixels and
+	// the skin sub-set (person ∧ LUT>0.5). Small deltas = retained skin tone.
+	if (!pRT || !m_MetDown || !m_MetStaging || !m_pDeviceContext || !m_pMLDebugFile) return;
+	if (m_LastPersonMap.size() != 640 * 360) return;
+
+	Tex2D_t pRTt = {}; pRTt.pTexture = pRT;
+	D3D11_TEXTURE2D_DESC d{}; pRT->GetDesc(&d);
+	pRTt.desc.Width = d.Width; pRTt.desc.Height = d.Height;
+	HRESULT hr = TextureCopyRect(pRTt, m_MetDown, rect, CRect(0, 0, 640, 360), m_pPS_Simple.p, nullptr, 0, false);
+	if (FAILED(hr)) return;
+	m_pDeviceContext->CopyResource(m_MetStaging, m_MetDown);
+	D3D11_MAPPED_SUBRESOURCE omr = {};
+	if (FAILED(m_pDeviceContext->Map(m_MetStaging, 0, D3D11_MAP_READ, 0, &omr))) return;
+	D3D11_MAPPED_SUBRESOURCE smr = {};
+	if (FAILED(m_pDeviceContext->Map(m_SegStaging, 0, D3D11_MAP_READ, 0, &smr))) {
+		m_pDeviceContext->Unmap(m_MetStaging, 0);
+		return;
+	}
+	const uint8_t* outBgr = (const uint8_t*)omr.pData;
+	const uint8_t* srcBgr = (const uint8_t*)smr.pData;
+	const UINT op = omr.RowPitch, sp = smr.RowPitch;
+
+	const float cr0 = m_fSkinLUTCR0, cr1 = m_fSkinLUTCR1, cb0 = m_fSkinLUTCB0, cb1 = m_fSkinLUTCB1;
+	struct Acc { double y = 0, cr = 0, cb = 0; long long n = 0; } srcP, outP, srcS, outS;
+	for (int y0 = 0; y0 < 360; y0 += 3) {
+		for (int x0 = 0; x0 < 640; x0 += 3) {
+			if (m_LastPersonMap[(size_t)y0 * 640 + x0] == 0) continue;
+			auto rd = [](const uint8_t* p, size_t ox) {
+				return (float)p[ox] / 255.0f;
+			};
+			auto ycb = [](float r, float g, float b, float& y, float& cr, float& cb) {
+				y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+				cr = (r - y) / 1.5748f; cb = (b - y) / 1.8556f;
+			};
+			// source preview is gamma-2.2 SDR-ized (face_down); output may be PQ.
+			float sr = rd(srcBgr, (size_t)y0 * sp + (size_t)x0 * 4 + 2);
+			float sg = rd(srcBgr, (size_t)y0 * sp + (size_t)x0 * 4 + 1);
+			float sb = rd(srcBgr, (size_t)y0 * sp + (size_t)x0 * 4 + 0);
+			float orr = rd(outBgr, (size_t)y0 * op + (size_t)x0 * 4 + 2);
+			float og = rd(outBgr, (size_t)y0 * op + (size_t)x0 * 4 + 1);
+			float ob = rd(outBgr, (size_t)y0 * op + (size_t)x0 * 4 + 0);
+			float sy, scr, scb, oy, ocr, ocb;
+			ycb(sr, sg, sb, sy, scr, scb);
+			ycb(orr, og, ob, oy, ocr, ocb);
+			srcP.y += sy; srcP.cr += scr; srcP.cb += scb; srcP.n++;
+			outP.y += oy; outP.cr += ocr; outP.cb += ocb;
+			// skin selector: person ∧ skinLUT(source cr/cb) > 0.5 (bilinear, like the shader)
+			const float u = (scr - cr0) / (cr1 - cr0);
+			const float v = (scb - cb0) / (cb1 - cb0);
+			float lutW = 0.0f;
+			if (m_SkinLutN > 0 && u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
+				const float fu = u * (m_SkinLutN - 1), fv = v * (m_SkinLutN - 1);
+				const int iu = (int)fu, iv = (int)fv;
+				const int iu1 = std::min(m_SkinLutN - 1, iu + 1), iv1 = std::min(m_SkinLutN - 1, iv + 1);
+				const float wu = fu - iu, wv = fv - iv;
+				const auto L = [&](int ci, int ri) {
+					return (float)m_SkinLutCpu[(size_t)ri * m_SkinLutN + ci] / 255.0f;
+				};
+				lutW = L(iu, iv) * (1 - wu) * (1 - wv) + L(iu1, iv) * wu * (1 - wv)
+					 + L(iu, iv1) * (1 - wu) * wv + L(iu1, iv1) * wu * wv;
+			}
+			if (lutW > 0.5f) {
+				srcS.y += sy; srcS.cr += scr; srcS.cb += scb; srcS.n++;
+				outS.y += oy; outS.cr += ocr; outS.cb += ocb;
+			}
+		}
+	}
+	m_pDeviceContext->Unmap(m_SegStaging, 0);
+	m_pDeviceContext->Unmap(m_MetStaging, 0);
+
+	// Log source->output deltas over person + skin sub-sets (gamma-2.2 Y/Cr/Cb).
+	// (The stage-5 anchor is updated by UpdateSkinAnchor in the seg block, not here.)
+	auto avg = [](const Acc& a) { return a.n ? (double)(a.y / a.n) : 0.0; };
+	auto avgc = [](const Acc& a) { return a.n ? a.cr / a.n : 0.0; };
+	auto avgq = [](const Acc& a) { return a.n ? a.cb / a.n : 0.0; };
+	fwprintf(m_pMLDebugFile,
+		L"SKINMET frame=%llu nP=%lld nS=%lld  dYp=%.4f dCrp=%.4f dCbp=%.4f  dYs=%.4f dCrs=%.4f dCbs=%.4f anch=%.4f\n",
+		(unsigned long long)m_MLDebugFrame, srcP.n, srcS.n,
+		(double)fabs(avg(outP) - avg(srcP)), (double)fabs(avgc(outP) - avgc(srcP)), (double)fabs(avgq(outP) - avgq(srcP)),
+		(double)fabs(avg(outS) - avg(srcS)), (double)fabs(avgc(outS) - avgc(srcS)), (double)fabs(avgq(outS) - avgq(srcS)),
+		(double)(m_skinAnchorValid ? m_skinAnchorSmooth : -1.0));
+	fflush(m_pMLDebugFile);
+}
+
+void CDX11VideoProcessor::UpdateSkinAnchor(const uint8_t* bgra, UINT stride)
+{
+	// Skin-tone anchor: IIR of the skin-set mean SOURCE luma (gamma-2.2, in the
+	// same SDR-ized space the shader samples via t3) — runs in the seg block so
+	// it's live in production (no frame log needed). MLSkinAnchor for stage 5.
+	if (!bgra || m_SkinLutN <= 0) return;
+	const std::vector<uint8_t>& pm = m_PersonMaskSm.empty() ? m_LastPersonMap : m_PersonMaskSm;
+	if (pm.size() != 640 * 360) return;
+	const int N = m_SkinLutN;
+	const float cr0 = m_fSkinLUTCR0, cr1 = m_fSkinLUTCR1, cb0 = m_fSkinLUTCB0, cb1 = m_fSkinLUTCB1;
+	long long n = 0; double sy = 0;
+	for (int y = 0; y < 360; y += 3)
+		for (int x = 0; x < 640; x += 3) {
+			if (pm[(size_t)y * 640 + x] == 0) continue;
+			const uint8_t* p = bgra + (size_t)y * stride + (size_t)x * 4;
+			const float r = p[2] / 255.0f, g = p[1] / 255.0f, b = p[0] / 255.0f;
+			const float Y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+			const float cr = (r - Y) / 1.5748f, cb = (b - Y) / 1.8556f;
+			const float u = (cr - cr0) / (cr1 - cr0), v = (cb - cb0) / (cb1 - cb0);
+			if (u < 0 || u > 1 || v < 0 || v > 1) continue;
+			const float fu = u * (N - 1), fv = v * (N - 1);
+			const int iu = (int)fu, iv = (int)fv;
+			const int iu1 = std::min(N - 1, iu + 1), iv1 = std::min(N - 1, iv + 1);
+			const float wu = fu - iu, wv = fv - iv;
+			const auto L = [&](int ci, int ri) { return (float)m_SkinLutCpu[(size_t)ri * N + ci] / 255.0f; };
+			const float w = L(iu, iv) * (1 - wu) * (1 - wv) + L(iu1, iv) * wu * (1 - wv)
+				+ L(iu, iv1) * (1 - wu) * wv + L(iu1, iv1) * wu * wv;
+			if (w > 0.5f) { sy += Y; n++; }
+		}
+	if (n > 8) {
+		const double m = sy / (double)n;
+		if (!m_skinAnchorValid) { m_skinAnchorSmooth = m; m_skinAnchorValid = true; }
+		else                     { m_skinAnchorSmooth = 0.88 * m_skinAnchorSmooth + 0.12 * m; }
+	}
+}
+
+// Diagnostic: dump the staged BGRA seg preview to an 8-bit BMP next to the log
+// (frame-log gated) so mask-vs-screen alignment can be eyeballed (esp. non-16:9
+// windows / DV-P5 where the ring layout can diverge from the nominal rect).
+static void DumpSegPreviewBmp(const uint8_t* bgra, int w, int h, int stride, const wchar_t* path)
+{
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"wb") != 0 || !f) return;
+    const int rowSize = w * 3 + ((4 - (w * 3) % 4) % 4);
+    const int dataSize = rowSize * h;
+    BITMAPFILEHEADER bf = {}; bf.bfType = 0x4D42; bf.bfSize = 54 + dataSize; bf.bfOffBits = 54;
+    BITMAPINFOHEADER bi = {}; bi.biSize = 40; bi.biWidth = w; bi.biHeight = h;
+    bi.biPlanes = 1; bi.biBitCount = 24; bi.biSizeImage = dataSize;
+    fwrite(&bf, 1, 14, f); fwrite(&bi, 1, 40, f);
+    std::vector<uint8_t> row(rowSize, 0);
+    for (int y = h - 1; y >= 0; y--) {            // BMP is bottom-up
+        const uint8_t* src = bgra + (size_t)y * stride;
+        for (int x = 0; x < w; x++) {              // BGRA -> BGR
+            row[x * 3 + 0] = src[x * 4 + 0];
+            row[x * 3 + 1] = src[x * 4 + 1];
+            row[x * 3 + 2] = src[x * 4 + 2];
+        }
+        fwrite(row.data(), 1, rowSize, f);
+    }
+    fclose(f);
+}
+
+void CDX11VideoProcessor::LogMaskProbe()
+{
+	if (!m_MaskProbe || !m_SkyMask || !m_pDeviceContext || !m_pMLDebugFile) return;
+	m_pDeviceContext->CopyResource(m_MaskProbe, m_SkyMask);
+	D3D11_MAPPED_SUBRESOURCE mr = {};
+	if (FAILED(m_pDeviceContext->Map(m_MaskProbe, 0, D3D11_MAP_READ, 0, &mr))) return;
+	const uint8_t* p = (const uint8_t*)mr.pData;
+	const uint32_t pitch = mr.RowPitch;
+	long long nR = 0, nG = 0, n = 0;
+	for (int y = 0; y < 360; y += 6)
+		for (int x = 0; x < 640; x += 6) {
+			const uint8_t* t = p + (size_t)y * pitch + (size_t)x * 2;
+			if (t[0] > 128) nR++;
+			if (t[1] > 128) nG++;
+			n++;
+		}
+	const uint8_t* cp = p + 180 * (size_t)pitch + 320 * 2;
+	fwprintf(m_pMLDebugFile,
+		L"MASKPROBE cpuP=%.4f gpuR=%.3f gpuG=%.3f centerRG=(%u,%u) dbg=%.0f str=%.3f\n",
+		(double)m_PersonFrac, (double)((double)nR / n), (double)((double)nG / n),
+		(unsigned)cp[0], (unsigned)cp[1],
+		(double)m_lastMLParams.MLSkinPersonDebugVis, (double)m_lastMLParams.MLSkinPersonStrength);
+	fflush(m_pMLDebugFile);
+	m_pDeviceContext->Unmap(m_MaskProbe, 0);
 }
 
 HRESULT CDX11VideoProcessor::LoadSkinLUT()
@@ -1804,6 +2100,9 @@ HRESULT CDX11VideoProcessor::LoadSkinLUT()
 	if (FAILED(hr)) {
 		return hr;
 	}
+	// CPU rast dense cache for the skin-metric (spatial-delta) logging.
+	m_SkinLutN = (int)N;
+	m_SkinLutCpu.assign((const BYTE*)data + 20, (const BYTE*)data + 20 + (size_t)N * N);
 	hr = m_pDevice->CreateShaderResourceView(m_SkinLUT, nullptr, &m_SkinLUTSRV);
 	if (FAILED(hr)) {
 		return hr;
@@ -2822,6 +3121,29 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 			m_InputColorSpaceOverride,
 			(pmt && pmt->formattype == FORMAT_VideoInfo2) ? 2 : (pmt && pmt->formattype == FORMAT_VideoInfo) ? 1 : 0,
 			(pmt ? (int)GetFmtConvParams(pmt).cformat : -1));
+		// Session geometry probe (diagnostic): mt dims, rcSource, aspect, DV flag.
+		// Correlates the seg-mask UV remap against per-title presentation geometry
+		// (e.g. Dolby Vision profile 5 crop windows).
+		++m_mlSessionId;
+		int mtw = 0, mth = 0;
+		RECT src = {};
+		if (pmt && pmt->formattype == FORMAT_VideoInfo2) {
+			const VIDEOINFOHEADER2* v = (const VIDEOINFOHEADER2*)pmt->pbFormat;
+			mtw = (int)v->bmiHeader.biWidth; mth = (int)v->bmiHeader.biHeight;
+			if (mth < 0) mth = -mth;
+			src = v->rcSource;
+		} else if (pmt && pmt->formattype == FORMAT_VideoInfo) {
+			const VIDEOINFOHEADER* v = (const VIDEOINFOHEADER*)pmt->pbFormat;
+			mtw = (int)v->bmiHeader.biWidth; mth = (int)v->bmiHeader.biHeight;
+			if (mth < 0) mth = -mth;
+			src = v->rcSource;
+		}
+		fwprintf(m_pMLDebugFile,
+			L"SESSION#%u doVi=%d mt=%dx%d srcRect=(%d,%d,%d,%d) aspect=%d:%d convert=%ux%u\n",
+			(unsigned)m_mlSessionId, (int)m_Dovi.bValid,
+			mtw, mth, (int)src.left, (int)src.top, (int)src.right, (int)src.bottom,
+			(int)m_srcAspectRatioX, (int)m_srcAspectRatioY,
+			(unsigned)m_TexConvertOutput.desc.Width, (unsigned)m_TexConvertOutput.desc.Height);
 		fflush(m_pMLDebugFile);
 	}
 	DLog(L"CDX11VideoProcessor::InitMediaType()");
@@ -3707,6 +4029,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 		m_MLDebugWinH = (int)m_windowRect.Height();
 		LogMLFrame();
 	}
+	m_nSkyFrame++;   // render-frame counter for the seg cadence (always)
 
 	// ML params must be refreshed before this frame is processed; keep this
 	// unconditional (only gated by active state) so a stale or zero-filled
@@ -4558,10 +4881,11 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 					(double)uvOffX, (double)uvOffY, (double)uvScX, (double)uvScY);
 				// The exact UVs the per-frame cbuffer refresh just pushed for the
 				// sky mask — the shader computes cuv=(input.Tex-uvOff)/uvSc.
-				fwprintf(m_pMLDebugFile, L" SKYUV=(%.4f,%.4f,%.4f,%.4f) frac=%.4f luma=%.3f\n",
+				fwprintf(m_pMLDebugFile, L" SKYUV=(%.4f,%.4f,%.4f,%.4f) sfrac=%.4f pfrac=%.4f luma=%.3f pDbg=%.0f pStr=%.3f\n",
 					(double)m_lastMLParams.MLSkyUVOffX, (double)m_lastMLParams.MLSkyUVOffY,
 					(double)m_lastMLParams.MLSkyUVScX, (double)m_lastMLParams.MLSkyUVScY,
-					(double)m_SkyFrac, (double)m_SkyLuma);
+					(double)m_SkyFrac, (double)m_PersonFrac, (double)m_SkyLuma,
+					(double)m_lastMLParams.MLSkinPersonDebugVis, (double)m_lastMLParams.MLSkinPersonStrength);
 				if (m_lastMLParams.NumFaces > 0) {
 					for (int i = 0; i < m_lastMLParams.NumFaces && i < 4; i++)
 						fwprintf(m_pMLDebugFile, L"  FACE_REMAP[%d] x=%.4f y=%.4f w=%.4f h=%.4f\n",
@@ -4579,18 +4903,78 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			StepSetting();
 			hrs[0] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psHighlight, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 			StepSetting();
-			// Sky mask (640x360 R8) + sampler bound on t2/s2 for the gamma + MC passes
-			// (t2 is free in this block; the chroma t1 bundle is scoped below).
+			// Sky/person mask (640x360 R8G8: R=sky, G=person) + sampler bound on t2/s2 for
+			// the gamma + MC passes; chroma re-binds t2 for the person channel below.
 			if (m_SkyMaskSRV && m_pSamplerSky) {
 				m_pDeviceContext->PSSetShaderResources(2, 1, &m_SkyMaskSRV.p);
 				m_pDeviceContext->PSSetSamplers(2, 1, &m_pSamplerSky.p);
 			}
+			// Skin tone-preservation leg: trained skin LUT (t1) + pre-grade source (t3)
+			// bound for the gamma pass. Unbound right after (t2 stays for MC person .g).
+			if (m_SkinLUTSRV && m_pSamplerSkin) {
+				m_pDeviceContext->PSSetShaderResources(1, 1, &m_SkinLUTSRV.p);
+				m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerSkin.p);
+			}
+			if (m_TexConvertOutput.pShaderResource && m_pSamplerSky) {
+				m_pDeviceContext->PSSetShaderResources(3, 1, &m_TexConvertOutput.pShaderResource.p);
+				m_pDeviceContext->PSSetSamplers(3, 1, &m_pSamplerSky.p);
+			}
+			// Seg preview = the PRESENTED content rect (the same geometry cuv samples in
+			// the shaders). Keying the mask to the presentation — not the full source
+			// convert — keeps it aligned under player crop/zoom/pillarbox on any display
+			// aspect (e.g. ultrawide 2.39:1 with a 2.39 picture auto-cropped to fill).
+			// Staged in the next ExtractMLFeatures (1-frame latency, pre-existing).
+			{
+				const bool wantPers = m_bPersonEnabled || m_bPersonDebugVis;
+				const bool wantSky  = m_bSkyEnabled || m_bSkyDebugVis;
+				if ((wantPers || wantSky) && m_SegDownsample && m_pPSFaceDown && m_pFaceDownParams &&
+					rect.right > rect.left && rect.bottom > rect.top) {
+					const CRect segRect(0, 0, 640, 360);
+					TextureCopyRect(*pInputTexture, m_SegDownsample, rect, segRect, m_pPSFaceDown, m_pFaceDownParams, 0, false);
+				}
+			}
 			hrs[1] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psGamma, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
+			{
+				ID3D11ShaderResourceView* nul = nullptr;   // unbind t1 (LUT) + t3 (source); t2 stays for MC
+				m_pDeviceContext->PSSetShaderResources(1, 1, &nul);
+				m_pDeviceContext->PSSetShaderResources(3, 1, &nul);
+			}
+			if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
+				fwprintf(m_pMLDebugFile,
+					L"GAMMA_DRAW shader=%s t2=%s pDbg=%.0f pStr=%.3f skyS=%.3f skyG=%.3f sfrac=%.3f pfrac=%.3f\n",
+					(m_bMLDebugCopy ? L"copy" : L"gamma"),
+					(m_SkyMaskSRV ? L"mask" : L"NULL"),
+					(double)m_lastMLParams.MLSkinPersonDebugVis,
+					(double)m_lastMLParams.MLSkinPersonStrength,
+					(double)m_lastMLParams.MLSkyStrength,
+					(double)m_lastMLParams.MLSkyGuard,
+					(double)m_SkyFrac, (double)m_PersonFrac);
+				fflush(m_pMLDebugFile);
+			}
 			StepSetting();
+			// MC pass: skin LUT (t1) for person-gated skin damping; the R8G8 semseg
+			// mask stays on t2 from the gamma step (person .g damping only — the
+			// SKY channel was removed from MC in skyMC-decouple-v3).
+			if (m_SkinLUTSRV && m_pSamplerSkin) {
+				m_pDeviceContext->PSSetShaderResources(1, 1, &m_SkinLUTSRV.p);
+				m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerSkin.p);
+			}
 			hrs[2] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psShadow, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
-			if (m_SkyMaskSRV) {
-				ID3D11ShaderResourceView* nullSRVs[1] = {};
-				m_pDeviceContext->PSSetShaderResources(2, 1, nullSRVs);
+			if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
+				fwprintf(m_pMLDebugFile,
+					L"MC_DRAW shader=%s lut=%s maskT2=%s mcStr=%.3f mcProtect=%.3f pStr=%.3f skyS=%.3f\n",
+					(m_bMLDebugCopy ? L"copy" : L"shadow"),
+					(m_SkinLUTSRV ? L"skin" : L"NULL"),
+					(m_SkyMaskSRV ? L"mask" : L"NULL"),
+					(double)m_lastMLParams.MCStrength,
+					(double)m_lastMLParams.MCSkinProtect,
+					(double)m_lastMLParams.MLSkinPersonStrength,
+					(double)m_lastMLParams.MLSkyStrength);
+				fflush(m_pMLDebugFile);
+			}
+			{
+				ID3D11ShaderResourceView* nullSRVs[2] = {};
+				m_pDeviceContext->PSSetShaderResources(1, 2, nullSRVs);
 			}
 
 			// log luma stats of the gamma-step INPUT (pre-grade content) every 8th frame
@@ -4598,17 +4982,21 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				LogMLFrameStats(*pInputTexture, L"IN");
 			}
 
-			// 4. chroma vector tuning (skin-guarded) — LUT on t1 + s1 like FinalPass
+			// 4. chroma vector tuning (skin-guarded) — LUT on t1, semseg mask on t2 (person .g)
 			hrs[3] = S_OK;
 			if (m_pPSMLChroma && m_SkinLUTSRV) {
 				StepSetting();
 				m_pDeviceContext->PSSetShaderResources(1, 1, &m_SkinLUTSRV.p);
 				m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerSkin.p);
+				if (m_SkyMaskSRV && m_pSamplerSky) {
+					m_pDeviceContext->PSSetShaderResources(2, 1, &m_SkyMaskSRV.p);
+					m_pDeviceContext->PSSetSamplers(2, 1, &m_pSamplerSky.p);
+				}
 				hrs[3] = TextureCopyRect(*pInputTexture, pRT, rect, rect,
 					bCopy ? m_pPS_Simple.p : m_pPSMLChroma.p,
 					m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
-				ID3D11ShaderResourceView* nullSRVs[1] = {};
-				m_pDeviceContext->PSSetShaderResources(1, 1, nullSRVs);
+				ID3D11ShaderResourceView* nullSRVs[2] = {};
+				m_pDeviceContext->PSSetShaderResources(1, 2, nullSRVs);
 			}
 
 			if (m_bMLDebug && m_pMLDebugFile) {
@@ -4622,7 +5010,13 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			}
 		}
 
-		if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy && !m_bHDRPassthroughRaw) {
+		// Skin-retention metric on real video (frame log; every ~30 frames):
+			// source preview vs graded output over person/skin pixels.
+			if (m_bMLDebug && m_pMLDebugFile && !m_bMLDebugCopy && (m_MLDebugFrame % 30 == 15)) {
+				LogSkinMetric(pRT, rect);
+			}
+
+			if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy && !m_bHDRPassthroughRaw) {
 			StepSetting();
 			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSMLBars, m_pMLParams, 0, false);
 			if (m_bMLDebug && m_pMLDebugFile) {
@@ -5257,6 +5651,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			config.bMLShadowEnabled != m_bMLShadowEnabled ||
 			config.bMLHighlightEnabled != m_bMLHighlightEnabled ||
 			config.bMLDebugCopy != m_bMLDebugCopy || config.bMLDebugLog != m_bMLDebug || config.bMLShadowDebugVis != m_bMLShadowDebugVis || config.bMLContrastDebugVis != m_bMLContrastDebugVis || config.bMLSkyEnabled != m_bSkyEnabled || config.bMLSkyDebugVis != m_bSkyDebugVis || config.fMLSkyStrength != m_fMLSkyStrength ||
+			config.bMLPersonEnabled != m_bPersonEnabled || config.fMLPersonStrength != m_fPersonStrength || config.bMLPersonDebugVis != m_bPersonDebugVis || config.fMLSkinPreserve != m_fMLSkinPreserve ||
 			config.fMLShadowZoneCeil != m_fMLShadowZoneCeil || config.fMLShadowSkinProtect != m_fMLShadowSkinProtect || config.fMLShadowRatioCap != m_fMLShadowRatioCap ||
 			config.bMLContrastEnabled != m_bMLContrastEnabled || config.fMLContrast != m_fMLContrast ||
 			config.fMLContrastZoneLo != m_fMLContrastZoneLo || config.fMLContrastSkinProtect != m_fMLContrastSkinProtect || config.fMLContrastRatioCap != m_fMLContrastRatioCap ||
@@ -5295,6 +5690,10 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			m_bSkyEnabled          = config.bMLSkyEnabled;
 			m_bSkyDebugVis         = config.bMLSkyDebugVis;
 			m_fMLSkyStrength      = config.fMLSkyStrength;
+			m_bPersonEnabled       = config.bMLPersonEnabled;
+			m_fPersonStrength      = config.fMLPersonStrength;
+			m_bPersonDebugVis      = config.bMLPersonDebugVis;
+			m_fMLSkinPreserve      = config.fMLSkinPreserve;
 		m_fMLShadowZoneCeil    = config.fMLShadowZoneCeil;
 		m_fMLShadowSkinProtect = config.fMLShadowSkinProtect;
 		m_fMLShadowRatioCap    = config.fMLShadowRatioCap;

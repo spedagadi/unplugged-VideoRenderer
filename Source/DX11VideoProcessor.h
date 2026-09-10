@@ -36,6 +36,7 @@
 #include "ml_features.h"
 #include "face_detect.h"
 #include "sky_seg.h"
+#include "person_seg.h"
 #include "BYTETracker.h"
 
 #include <atomic>
@@ -176,7 +177,19 @@ private:
 		float MLSkyUVScX;
 		float MLSkyUVScY;
 		float _padSky;             // keep sizeof multiple of 16 (D3D11 cbuffer rule)
+		// Person skin protection (stage 4) — appended tail (offsets above unchanged).
+		// Effective skin weight: LUT weight gated to people. Strength 0 = legacy.
+		float MLSkinPersonStrength; // 0..1 gate; 0 = bit-identical legacy LUT path
+		float MLSkinPersonDebugVis; // 0/1 magenta person-mask overlay
+		float _padPerson0;          // keep the block 16-byte aligned
+		float _padPerson1;
+		// Skin tone-preservation (stage 5): source-anchored I remap on skin pixels.
+		float MLSkinAnchor;   // skin-set mean source luma (IIR, normalized gamma-2.2)
+		float MLSkinPreserve; // 0..1 keep-scale of the source's internal skin structure
+		float _padSkin0;
+		float _padSkin1;
 	};
+	static_assert(sizeof(MLParams_t) == 336, "MLParams_t cbuffer size drift");
 	MLParams_t m_lastMLParams = {};
 	CComPtr<ID3D11Buffer> m_pMLParams;
 	CComPtr<ID3D11PixelShader> m_pPSMLGamma;
@@ -202,6 +215,7 @@ private:
 
 	// Zion ML debug (registry: MLDebugLog / MLDebugPassthrough)
 	bool m_bMLDebug = false;
+	int   m_mlSessionId = 0;      // playback session counter (media-type changes) for log triage
 	bool m_bMLDebugCopy = false; // bind ps_simple to the grade steps (bisect test)
 	bool m_bMLShadowDebugVis = false;
 	bool m_bMLContrastDebugVis = false;
@@ -226,19 +240,38 @@ private:
 	bool  m_bFaceDebugVis = false;
 	// Sky semantic segmentation (yolo26n-sem via ONNX Runtime + DirectML)
 	std::unique_ptr<CSkySeg>          m_pSkySeg;
-	CComPtr<ID3D11Texture2D>          m_SkyMask;      // 640x360 R8_UNORM (pad-cropped content)
+	std::unique_ptr<CPersonSeg>       m_pPersonSeg;
+	CComPtr<ID3D11Texture2D>          m_SkyMask;      // 640x360 R8G8_UNORM (R=sky, G=person)
 	CComPtr<ID3D11ShaderResourceView> m_SkyMaskSRV;
 	CComPtr<ID3D11SamplerState>       m_pSamplerSky;  // bilinear + clamp
 	CComPtr<ID3D11Texture2D>          m_SegDownsample; // 640x360 BGRA8 SDR-ized seg preview
 	CComPtr<ID3D11Texture2D>          m_SegStaging;    // CPU-readable copy
+	CComPtr<ID3D11Texture2D>          m_MaskProbe;     // CPU staging twin of m_SkyMask (diag readback)
+	CComPtr<ID3D11Texture2D>          m_MetDown;       // 640x360 BGRA graded-output grab (skin metric)
+	CComPtr<ID3D11Texture2D>          m_MetStaging;
 	HRESULT CreateSkyMaskTexture();
 	HRESULT CreateSkySegTextures();
+	void    LogMaskProbe();
+	void    LogSkinMetric(ID3D11Texture2D* pRT, const CRect& rect);
+	void    UpdateSkinAnchor(const uint8_t* bgra, UINT stride);
 	float   m_SkyFrac = 0.0f;      // last decode: fraction of valid pixels == sky
+	float   m_PersonFrac = 0.0f;   // last decode: fraction of valid pixels == person/rider
+	std::vector<uint8_t> m_LastSkyMap;     // CPU cache of last sky map (640x360) — R channel persists between refreshes
+	std::vector<uint8_t> m_LastPersonMap;  // CPU cache of last person map (640x360) — refreshed every frame
+	std::vector<uint8_t> m_PersonMaskSm;   // temporally smoothed twin (flicker-stable gate)
 	float   m_SkyLuma = 0.0f;      // last decode: mean gamma-2.2 luma of sky pixels
-	uint64_t m_nSkyFrame = 0;      // render-frame counter for cadence
-	bool    m_bSkyEnabled = true;  // run segmentation (+ overlay)
+	uint64_t m_nSkyFrame = 0;      // render-frame counter for cadence (incremented per frame)
+	uint64_t m_nSkyLastFrame = 0;  // last frame a mask refresh was uploaded
+	bool    m_bSkyEnabled = false; // sky segmentation + tone leg — default OFF
 	bool    m_bSkyDebugVis = false; // cyan overlay of the sky mask (validation)
 	float   m_fMLSkyStrength = 0.6f; // sky tone-leg blend amount [0, 1]
+	// Person skin protection (stage 4) — class 11|12 of the same seg inference
+	bool    m_bPersonEnabled = true;   // gate person skin protection (not the inference)
+	float   m_fPersonStrength = 1.0f;  // LUT-only-inside-people gate [0,1]
+	bool    m_bPersonDebugVis = false; // magenta person-mask overlay (validation)
+	float   m_fMLSkinPreserve = 0.0f;  // stage-5 skin tone keep-scale (default OFF)
+	double  m_skinAnchorSmooth = 0.0f; // IIR skin-set mean source luma (gamma-2.2)
+	bool    m_skinAnchorValid = false;
 	// ByteTrack multi-object tracker (Kalman + Hungarian)
 	std::unique_ptr<BYTETracker> m_pByteTracker;
 	static constexpr int FACE_DETECT_W = 480;
@@ -274,6 +307,8 @@ private:
 	float m_fSkinLUTCB0 = -0.2494f, m_fSkinLUTCB1 = 0.1967f;
 	CComPtr<ID3D11Texture2D> m_SkinLUT;
 	CComPtr<ID3D11ShaderResourceView> m_SkinLUTSRV;
+	std::vector<unsigned char> m_SkinLutCpu; // 96x96 raster cache (skin-metric CPU sampling)
+	int  m_SkinLutN = 0;
 	CComPtr<ID3D11SamplerState> m_pSamplerSkin;
 	HRESULT LoadSkinLUT();
 

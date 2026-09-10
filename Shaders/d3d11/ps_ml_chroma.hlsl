@@ -9,6 +9,8 @@ Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 Texture2D skin_lut : register(t1);
 SamplerState sampSkin : register(s1);
+Texture2D sky_mask : register(t2);   // 640x360 R8G8 semseg mask (R=sky, G=person)
+SamplerState sampSky : register(s2);
 
 struct PS_INPUT
 {
@@ -16,6 +18,10 @@ struct PS_INPUT
 	float2 Tex : TEXCOORD;
 };
 
+// The C++ MLParams_t is a single 320-byte layout shared by every ps_ml_* pass.
+// Offsets are absolute (computed by the compiler from THIS declaration), so this
+// shader must mirror the full struct — a short declaration would shift the
+// person fields (and MLSkyUV*) onto the wrong bytes.
 cbuffer MLParams : register(b0)
 {
 	float MLGamma;
@@ -46,6 +52,44 @@ cbuffer MLParams : register(b0)
 	float _reserved3;
 	float _reserved4;
 	float _reserved5;
+	float uBarTop;
+	float uBarBottom;
+	float uBarV0;
+	float uBarSpan;
+	float uBarFeather;
+	float uBarBlack;
+	float uBarHighlight;
+	float _padBar;
+	float MCStrength;
+	float MCZoneLo;
+	float MCSkinProtect;
+	float MCRatioCap;
+	float FaceProtect;
+	float FaceFeather;
+	float FaceExpand;
+	float FaceDebugVis;
+	int   NumFaces;
+	float3 _padFace;
+	float4 FaceBox[4];
+	float4 FaceTrackId;
+	float MLSkyStrength;
+	float MLSkyGuard;
+	float MLSkyLuma;
+	float MLSkyUVOffX;
+	float MLSkyUVOffY;
+	float MLSkyUVScX;
+	float MLSkyUVScY;
+	float _padSky;
+	// Person skin protection (stage 4) — appended tail, offsets above unchanged
+	float MLSkinPersonStrength;  // 0..1 LUT-only-inside-people gate; 0 = legacy
+	float MLSkinPersonDebugVis;  // 0/1 magenta person-mask overlay
+	float _padPerson0;
+	float _padPerson1;
+	// Skin tone-preservation (stage 5) — appended tail
+	float MLSkinAnchor;    // skin-set mean source luma (IIR, gamma-2.2)
+	float MLSkinPreserve;  // 0..1 keep-scale of source skin structure
+	float MLSkinPad0;
+	float MLSkinPad1;
 };
 
 static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
@@ -81,6 +125,19 @@ float4 main(PS_INPUT input) : SV_Target
 		(cb - MLSkinLUTCB0) / (MLSkinLUTCB1 - MLSkinLUTCB0)));
 	float skin_weight = skin_lut.Sample(sampSkin, skin_uv).r;
 
+	// Person gate (stage 4): LUT weight is kept as-is OUTSIDE people, and
+	// multiplied by the person mask INSIDE people — protection concentrates on
+	// actual people (kills red/orange-object false positives). Strength 0 falls
+	// back to the plain LUT exactly (lerp(a,b,0) is IEEE-exact) → bit-identical.
+	float eff = skin_weight;
+	if (MLSkinPersonStrength > 0.001) {
+		float2 cuv = (input.Tex - float2(MLSkyUVOffX, MLSkyUVOffY))
+			/ max(float2(MLSkyUVScX, MLSkyUVScY), 0.001f);
+		const float inContent = (all(cuv >= 0.0) && all(cuv <= 1.0)) ? 1.0 : 0.0;
+		float P = sky_mask.Sample(sampSky, saturate(cuv)).g * inContent;
+		eff = lerp(skin_weight, skin_weight * P, MLSkinPersonStrength);
+	}
+
 	// Chroma boost curve: 1.0 at black → neutral at knee → fire at peak.
 	// Monotonic ramp matches tone-mapping desaturation profile (highlights
 	// lose more saturation than shadows). No boost on near-black noise.
@@ -95,9 +152,9 @@ float4 main(PS_INPUT input) : SV_Target
 		luma_boost = lerp(MLChromaNeutral, MLChromaFire, pow(t, 1.5));
 	}
 
-	// Suppress boost on skin
+	// Suppress boost on skin (person-gated LUT weight)
 	float chroma_scalar = lerp(luma_boost, 1.0,
-	                           saturate(skin_weight * MLChromaSkinProtect));
+	                           saturate(eff * MLChromaSkinProtect));
 	chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);
 
 	// Scale Ct/Cp — perceptually uniform chroma boost

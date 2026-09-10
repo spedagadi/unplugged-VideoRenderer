@@ -4,7 +4,7 @@
 
 Zion ML Grade is a real-time video enhancement pipeline for MPC Video Renderer (MPCVR) that applies scene-adaptive tone mapping and chroma tuning using machine learning models trained on Dolby Vision Profile 5 metadata. All luminance operations are performed in the **ICtCp perceptual color space** (BT.2100 / SMPTE ST 2084 PQ transfer), which preserves chrominance (Ct/Cp) when the intensity (I) channel is modified — eliminating the hue and saturation shifts inherent in RGB or YCbCr-domain grading.
 
-The pipeline consists of four shader passes plus ancillary feature extraction, face detection, **sky semantic segmentation** (yolo26n-sem via ONNX Runtime + DirectML), and black bar repaint. Three XGBoost models predict per-scene tone curve parameters from 88 GPU-extracted features for the automatic tone curve; the sky mask additionally relaxes the highlight guard *inside* detected sky so bright sky and cloud detail survive tone compression.
+The pipeline consists of four shader passes plus ancillary feature extraction, face detection, **semantic segmentation** (ONNX Runtime + DirectML, two dedicated models) and black bar repaint. Three XGBoost models predict per-scene tone curve parameters from 88 GPU-extracted features for the automatic tone curve; the **sky** mask (yolo26n-sem, Cityscapes class 10) relaxes the highlight guard *inside* detected sky so bright sky and cloud detail survive tone compression, and the **person** mask (yolo26n-seg, COCO instance class 0) gates the trained skin LUT so chroma push and micro-contrast never destroy skin tone. The two models feed the two channels (R=sky, G=person) of a single packed R8G8 content-res mask — each model trained for its own task rather than a shared Cityscapes map, so closeup person coverage stays reliable.
 
 ## Architecture
 
@@ -26,8 +26,8 @@ Source frame (PQ or SDR)
   │
   ├── Feature extraction (256×144 luma downsample → 88 histogram features)
   ├── Face detection (480×288 BGRA8 → YuNet ONNX → ByteTrack)
-  ├── Sky segmentation (640×360 SDR-ized preview → yolo26n-sem ONNX → DirectML,
-  │                     throttled ~10 fps; R8 content-aligned mask → t2 in shaders)
+  ├── Semantic segmentation (640×360 SDR-ized preview → yolo26n-sem ONNX → DirectML,
+  │                     throttled ~10 fps; R8G8 content-aligned mask R=sky, G=person → t2)
   │
   ▼
   1. ps_ml_highlight.hlsl — Highlight rolloff (passthrough — merged into gamma)
@@ -153,10 +153,11 @@ The `pow(t, 1.5)` exponent creates a gentle acceleration into the highlights rat
 A pre-trained 2D LUT maps Cr/Cb coordinates (in gamma-2.2 space) to a skin probability P(skin) ∈ [0, 1]. The chroma boost is suppressed on skin regions:
 
 ```hlsl
-chroma_scalar = lerp(luma_boost, 1.0, skin_weight × MLChromaSkinProtect)
+eff = lerp(skin_weight, skin_weight × person_mask, MLSkinPersonStrength)   // stage 4
+chroma_scalar = lerp(luma_boost, 1.0, saturate(eff × MLChromaSkinProtect))
 ```
 
-Detection happens in gamma-2.2 Cr/Cb (where the LUT was trained), but the boost is applied in ICtCp Ct/Cp — detection and application are in different color spaces by design.
+Detection happens in gamma-2.2 Cr/Cb (where the LUT was trained), but the boost is applied in ICtCp Ct/Cp — detection and application are in different color spaces by design. Since stage 4, the LUT weight is gated to the semantic-segmentation person mask (LUT-only-inside-people): outside real people the suppression falls away, eliminating the LUT's false positives on red/orange objects; inside people the LUT applies at full strength. `MLSkinPersonStrength` = 0 keeps the legacy LUT-only behavior exactly (bit-identical).
 
 ### Saturation Gain: Why It's Not Trained
 
@@ -213,7 +214,7 @@ The multiplicative / ratio form makes halos impossible, and smooth gradients are
 | Zone lo | 0.15 | [0.00, 0.60] | Shadow gate floor (I_norm) |
 | Ratio cap | 1.40 | [1.00, 2.00] | Bright-side excursion cap |
 
-`MCSkinProtect` is unused — the pass touches only the I channel, so skins are inherently safe.
+**Person-skin damping (stage 4)**: `MCSkinProtect` (default 0.65) now suppresses the clarity lift on skin. The lift is multiplied by `1 − saturate(Lo × MCSkinProtect)` where `Lo = skin_lut(cr,cb) × person_mask × MLSkinPersonStrength` — even though the pass touches only the I channel, naive clarity amplifies skin pores/blemishes, so skin is exempted. `Lo` is 0 at strength 0 → the pass is byte-identical to the pre-person path.
 
 ## Sky Semantic Segmentation (Sky Tone Leg)
 
@@ -235,7 +236,7 @@ The multiplicative / ratio form makes halos impossible, and smooth gradients are
 - Mask values 255 = sky / 0 = not, uploaded as an `R8_UNORM` 640×360 texture (`m_SkyMask`, `UpdateSubresource` with row-pitch = `sW`), sampled as `t2` on shader slots 2.
 - `sky_frac` (over valid pixels) and `sky_luma` (mean gamma-2.2 luma of sky) are reported separately for debug/slider use.
 
-Cadence: throttled `m_MLDebugFrame % 10 == 0` (~10 fps inference on the render thread); the mask persists between runs; all per-frame log output gates on the frame-log toggle (`m_bMLDebug`, so a 3-hour movie without frame log grows no log).
+Cadence: a dedicated render-thread counter (`m_nSkyFrame`, incremented every frame) gates inference at ~6-frame spacing (~10 fps at 60 Hz) — *not* the debug-frame counter, which only ticks with the frame log on and previously made this run **every frame** in normal playback. The mask persists between runs. Runs when any of sky-enabled / person-enabled / either overlay is wanted (`wantMask`), so person protection keeps the inference alive even with SKY SEG off. All per-frame log output gates on the frame-log toggle (`m_bMLDebug`, so a 3-hour movie without frame log grows no log).
 
 ### UV Remap (why the mask aligns with the video)
 
@@ -272,6 +273,43 @@ All effects scale with `MLSkyStrength` (default 0.6, slider) and vanish at stren
 | Enable | `zion.skyEnabled` | off | Runs the segmenter + tone effects |
 | Strength | `zion.skyStrength` | 0.60 | Global scale for all four effects |
 | Mask overlay | `zion.skyDebugVis` | off | Cyan overlay at content UV (validation) |
+
+## Person Instance Segmentation (person mask source)
+
+Sky and person use **dedicated models** (not a shared Cityscapes map): the Cityscapes person class is street-scene trained and unreliable on closeups, so the person channel comes from **`yolo26n-seg`** — Ultralytics instance segmentation on COCO (person = class 0, not Cityscapes).
+
+- **Model**: `yolo26n-seg.onnx` (input `images [1,3,640,640]` → `output0 [1,300,38]` post-NMS dets: x1,y1,x2,y2,score,cls,32 mask coeffs + `output1 [1,32,160,160]` prototypes). **Ships re-stamped to opset 21** (`yolo26n-seg_op21.onnx`) — the raw export is opset 22, rejected by the bundled ORT 1.21.
+- **Decode** (`person_seg.cpp`, validated 0.5577 vs python 0.5573): letterbox 640×360 preview → gray-114 → run → per instance `{cls==0, score≥0.25}` mask = `sigmoid(proto · coeff)` at 160×160 → bilinear to model res → `>0.5` within the box → union → letterbox-crop to the content rect → 640×360 person map + frac.
+- Runs at the same ~10 fps cadence as sky, on the same staged preview; packs into the G channel of the R8G8 mask.
+- Cost: ~15 ms/graph + ~20 ms/decode measured on CPU-only; materially lower on DirectML, off the per-frame path.
+
+## Person Skin Protection (stage 4)
+
+The **person** mask (Cityscapes classes 11 person + 12 rider) is decoded from the *same* 19-class argmax map as the sky mask — zero extra inference, same 640×360 pad-crop, packed into the **G channel** of the single R8G8 semseg texture (R = sky, G = person), sampled with the same content-UV remap + in-content gate.
+
+### Protection model: LUT-only-inside-people
+
+Both chroma and micro-contrast combine the **trained 96×96 skin LUT** `L = skin_lut(cr,cb)` (gamma-2.2 Cr/Cb detection space) with the person gate `P`:
+
+```
+chroma:  eff = lerp(L, L × P, MLSkinPersonStrength)
+         chroma_scalar = lerp(luma_boost, 1.0, saturate(eff × MLChromaSkinProtect))
+MC:      Lo = L × P × MLSkinPersonStrength
+         MCe = MCStrength × (1 + 2×S_sky) × (1 − saturate(Lo × MCSkinProtect))
+```
+
+- **At `MLSkinPersonStrength` = 0** both paths fall back exactly: chroma's `lerp(L, L·P, 0) = L` (IEEE-exact) and MC's `Lo = 0` — output is **bit-identical** to the pre-person pipeline.
+- **At 1**, protection concentrates on real people: inside a person the LUT is applied at full weight; outside, both effects revert to no skin suppression — this kills the LUT's red/orange-object false positives (`Gate`-like behavior is implied; `L×P` is the LUT-only-inside-people contract).
+- The chroma pass samples the mask on **t2** and the LUT on **t1**; the MC pass now also binds **t1** (previously never bound) for its per-pixel LUT read. The MC shader computes gamma-2.2 Cr/Cb per-pixel exactly like the chroma shader.
+
+### Settings (PERSON SKIN section)
+
+| Setting | Key | Default | Role |
+|---------|-----|---------|------|
+| Enable | `zion.personEnabled` | on | Gates protection weight (not the shared inference) |
+| Strength | `zion.personStrength` | 1.00 | LUT-only-inside-people gate; 0 = bit-identical legacy |
+| Mask overlay | `zion.personOverlay` | off | Magenta overlay of the person mask (validation) |
+| MC skin protect | `zion.contrastSkinProtect` | 0.65 | Damping applied by the MC pass (MICRO CONTRAST section) |
 
 ## Face Detection
 
@@ -351,6 +389,7 @@ Models are exported as `.plxgb` binary files (magic `PLXG`, version 1) — a com
 | Strength | Slider | zion.contrastStrength | 0.00 – 0.50 | 0.15 |
 | Zone lo | Slider | zion.contrastZoneLo | 0.00 – 0.60 | 0.15 |
 | Ratio cap | Slider | zion.contrastRatioCap | 1.00 – 2.00 | 1.40 |
+| Skin protect | Slider | zion.contrastSkinProtect | 0.00 – 1.00 | 0.65 |
 
 ### DEBUG Section
 
@@ -371,6 +410,14 @@ Both passthrough toggles push **both** configs when either flips, so disabling t
 | Enable | Toggle | zion.skyEnabled |
 | Strength | Slider | zion.skyStrength |
 | Mask overlay | Toggle | zion.skyDebugVis |
+
+### PERSON SKIN Section
+
+| Control | Type | Key |
+|---------|------|-----|
+| Enable | Toggle | zion.personEnabled |
+| Strength | Slider | zion.personStrength |
+| Mask overlay | Toggle | zion.personOverlay |
 
 ### HDR TONE MAPPING Section
 
@@ -442,8 +489,11 @@ Offset  Field               Size    Notes
 292     MLSkyUVScX          4
 296     MLSkyUVScY          4
 300     _padSky             4       Keep sizeof a multiple of 16 (D3D11 rule)
+304     MLSkinPersonStrength 4      0..1 LUT-only-inside-people gate (0 = legacy)
+308     MLSkinPersonDebugVis 4      0/1 magenta person-mask overlay
+312     _padPerson[2]       8       Alignment
 ────────────────────────────────────────────────────────
-Total: 304 bytes (= 16 × 19)
+Total: 320 bytes (= 16 × 20)
 ```
 
 `pPSSetConstantBuffers` uploads `m_lastMLParams` every frame from the ML render block (also refreshing the four sky-UV fields from `rect`/`inputW`), so the remap tracks the content rect on every frame even when the mask only refreshes at ~10 fps.
@@ -455,11 +505,11 @@ Total: 304 bytes (= 16 × 19)
 | File | Purpose | State |
 |------|---------|-------|
 | `ps_ml_luma.hlsl` | 256×144 luma downsample for feature extraction | Active |
-| `ps_ml_face_down.hlsl` | 480×288 + 640×360 color downsample for face and sky preprocessing | Active |
-| `ps_ml_gamma.hlsl` | Unified tone curve (shadow + gamma + highlight) + sky tone leg + face/sky debug vis | Active |
-| `ps_ml_shadow.hlsl` | Micro-contrast clarity (post-gamma; DoG infra dormant) + sky-upweighted MC | Active |
+| `ps_ml_face_down.hlsl` | 480×288 + 640×360 color downsample for face and seg preprocessing | Active |
+| `ps_ml_gamma.hlsl` | Unified tone curve + sky tone leg + sky/person mask overlays | Active |
+| `ps_ml_shadow.hlsl` | Micro-contrast (sky-upweighted) + person-gated skin damping | Active |
 | `ps_ml_highlight.hlsl` | Highlight rolloff (merged into gamma) | Passthrough |
-| `ps_ml_chroma.hlsl` | ICtCp Ct/Cp chroma boost with skin LUT protection | Active |
+| `ps_ml_chroma.hlsl` | ICtCp chroma boost, person-gated skin LUT protection (full cbuffer layout) | Active |
 | `ps_ml_bars.hlsl` | Black bar repaint for projector haze | Active |
 
 ### C++ Source (`Source/`)
@@ -469,8 +519,10 @@ Total: 304 bytes (= 16 × 19)
 | `DX11VideoProcessor.h` | `MLParams_t` cbuffer struct, ML state variables, XGBoost model instances, sky seg members |
 | `DX11VideoProcessor.cpp` | `SetMLParams()` (model inference + parameter packing), `ExtractMLFeatures()`, render pipeline hookup, sky mask texture + UV remap |
 | `face_detect.h` / `face_detect.cpp` | YuNet ONNX wrapper — init, preprocess, inference, NMS, sync detection |
-| `sky_seg.h` / `sky_seg.cpp` | yolo26n-sem ONNX wrapper — letterbox preprocess, DirectML run, pad-crop decode, sky_frac/luma |
-| `onnxrt/yolo26n-sem.onnx` | Sky segmentation model (Cityscapes 19-class, sky = class 10) |
+| `sky_seg.h` / `sky_seg.cpp` | yolo26n-sem ONNX wrapper — letterbox preprocess, DirectML run, pad-crop decode, sky mask + frac/luma |
+| `person_seg.h` / `person_seg.cpp` | yolo26n-seg ONNX wrapper — letterbox preprocess, DirectML run, post-NMS instance-mask decode, person map + frac |
+| `onnxrt/yolo26n-sem.onnx` | Sky model (Cityscapes 19-class, sky = class 10) |
+| `onnxrt/yolo26n-seg_op21.onnx` | Person model (COCO instance, person = class 0; opset 21 re-stamp) |
 
 ### Training Scripts (`libplacebo/ml/`)
 
@@ -499,6 +551,9 @@ Controls panel with TONE CURVE, CHROMA, MICRO CONTRAST, DEBUG, and BLACK BARS se
 - **Sky semantic segmentation** (yolo26n-sem, ONNX Runtime + DirectML): sky tone leg
   (guard relaxation + softened rolloff + cloud-band lift) and sky-upweighted micro-contrast,
   with a mask-overlay validation toggle
+- **Person skin protection** (class 11|12 of the same inference): LUT-only-inside-people
+  gate on the chroma push and the micro-contrast lift (bit-identical at strength 0), with a
+  magenta mask-overlay validation toggle; seg cadence fixed to a true ~10 fps throttle
 - **Sky mask UV remap** — mask sampled at content UV `(input.Tex − uvOff)/uvSc` with an
   in-content gate, so the tone leg + overlay track the video rect under pillarbox/letterbox
 - Black bar repaint for projector haze
@@ -514,13 +569,14 @@ Controls panel with TONE CURVE, CHROMA, MICRO CONTRAST, DEBUG, and BLACK BARS se
 - Face-guided gamma protection (infrastructure ready, not activated)
 - Saturation gain model (per-title aesthetic, not scene-corrective)
 - Sky tone effects at strength 0 (bit-identical with the pre-sky path)
+- Person skin protection at strength 0 (LUT-only-inside-people gate off → bit-identical legacy LUT/MC path)
 
 ### Debug Logging Contract
 
 All per-frame log lines (EXTRACT, MLPASS, FACE_SYNC, SKY_REFRESH, SKYUV, MC_TRACE…) gate on the
 frame-log toggle (`zion.debugFrameLog` → `m_bMLDebug`), and `CSkySeg`/`CFaceDetect` receive the
 same `SetLogEnabled`. With frame log off, the log file is flat during any-length playback; with it
-on, the ML render block writes `MLPASS … SKYUV=(uvOffX,uvOffY,uvScX,uvScY) frac=.. luma=..` every
+on, the ML render block writes `MLPASS … SKYUV=(uvOffX,uvOffY,uvScX,uvScY) sfrac=.. pfrac=..` every
 60 frames and `SKY_REFRESH` on each mask refresh, so UV-mapping issues are diagnosable offline.
 
 ### Build
@@ -528,4 +584,4 @@ on, the ML render block writes `MLPASS … SKYUV=(uvOffX,uvOffY,uvScX,uvScY) fra
 - MPCVR: `MpcVideoRenderer.sln` → Release x64 via MSBuild (`_rebuild_mpcvr.bat`; batches shader + CSO + resource compile)
 - s3_shell: `build_s3_shell.bat` via cl.exe (mpc-hc repo, branch `zion-s3-shell`)
 - Distribution: `_bin\MpcVideoRenderer-0.10.8.2603\` with Install/Uninstall scripts
-- Dependencies: ONNX Runtime + DirectML DLLs, YuNet + `yolo26n-sem.onnx` models, XGBoost `.plxgb` model files
+- Dependencies: ONNX Runtime + DirectML DLLs, YuNet + `yolo26n-sem.onnx` + `yolo26n-seg_op21.onnx` models, XGBoost `.plxgb` model files

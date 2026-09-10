@@ -273,7 +273,7 @@ bool CSkySeg::DetectSky(const uint8_t* bgra, int width, int height, int stride, 
 
     m_callCount++;
     if (m_logEnabled && m_logFile && (m_callCount & 15) == 1) {
-        fwprintf(m_logFile, L"SKY_TRACE call=%llu pre=%.1fms run=%.1fms dec=%.1fms frac=%.4f luma=%.3f pad=(%d,%d,%d,%d)\n",
+        fwprintf(m_logFile, L"SKY_TRACE call=%llu pre=%.1fms run=%.1fms dec=%.1fms sfrac=%.4f luma=%.3f pad=(%d,%d,%d,%d)\n",
             (unsigned long long)m_callCount, out.preMs, out.runMs, out.decMs,
             (double)out.skyFrac, (double)out.skyLuma, padX, padY, sW, sH);
         fflush(m_logFile);

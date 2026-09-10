@@ -9,8 +9,12 @@
 
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
-Texture2D sky_mask : register(t2);   // 160x90 R8 sky-probability map (class 10)
+Texture2D skin_lut : register(t1);   // trained 96x96 skin LUT (stage-5 tone leg gate)
+SamplerState sampSkin : register(s1);
+Texture2D sky_mask : register(t2);   // 640x360 R8G8 semseg (R=sky, G=person)
 SamplerState sampSky : register(s2);
+Texture2D src_tex : register(t3);    // pre-grade source (convert output) for the skin tone leg
+SamplerState sampSrc : register(s3);
 
 struct PS_INPUT
 {
@@ -77,7 +81,19 @@ cbuffer MLParams : register(b0)
 	float MLSkyUVScX;
 	float MLSkyUVScY;
 	float _padSky;
+	// Person skin protection (stage 4) — appended tail, offsets above unchanged
+	float MLSkinPersonStrength;  // 0..1 LUT-only-inside-people gate; 0 = legacy
+	float MLSkinPersonDebugVis;  // 0/1 magenta person-mask overlay
+	float _padPerson0;
+	float _padPerson1;
+	// Skin tone-preservation (stage 5) — appended tail
+	float MLSkinAnchor;    // skin-set mean source luma (IIR, gamma-2.2)
+	float MLSkinPreserve;  // 0..1 keep-scale of source skin structure
+	float MLSkinPad0;
+	float MLSkinPad1;
 };
+
+static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
 
 float4 main(PS_INPUT input) : SV_Target
 {
@@ -105,7 +121,9 @@ float4 main(PS_INPUT input) : SV_Target
 	// bars) must not read the clamped mask edge — S=0 kills both the tone leg and
 	// the overlay there, so bars stay clean. (all() on a float2 is lane-wise.)
 	const float inContent = (all(cuv >= 0.0) && all(cuv <= 1.0)) ? 1.0 : 0.0;
-	const float rawS = sky_mask.Sample(sampSky, saturate(cuv)).r * inContent;
+	const float2 maskRG = sky_mask.Sample(sampSky, saturate(cuv)).rg * inContent;
+	const float rawS = maskRG.r;   // sky (class 10)
+	const float rawP = maskRG.g;   // person | rider (class 11|12)
 	float S = (MLSkyStrength > 0.001) ? rawS : 0.0f;
 
 	// === UNIFIED TONE CURVE (shadow toe → gamma → highlight rolloff) ===
@@ -153,6 +171,48 @@ float4 main(PS_INPUT input) : SV_Target
 	// Face blending disabled — testing pure ICtCp output
 	float skin_blend = 0.0;
 
+	// Skin tone-preservation (stage 5): steer the WHOLE person region's luma toward
+	// the source skin tone. Gate = PERSON mask (bilinear → spatially smooth, no
+	// skin-LUT boundaries → no hot spots/patches). The skin subset only defines
+	// the target: MLSkinAnchor (CPU IIR skin-set mean source luma). Bounded, and
+	// OFF by default (MLSkinPreserve = 0 → bit-identical).
+	if (MLSkinPersonStrength > 0.001 && MLSkinPreserve > 0.001 && MLSkinAnchor > 0.01f) {
+		// Blurred person gate: a raw mask edge would print the silhouettes into the
+		// tone field (discontinuity). Plus-shape blur over ~2 mask texels (~20+ px at
+		// 4K) makes the correction fade smoothly across the silhouette.
+		uint mw, mh; sky_mask.GetDimensions(mw, mh);
+		const float2 mt = float2(1.0f / (float)mw, 1.0f / (float)mh) * 2.0f;
+		const float Pa = sky_mask.Sample(sampSky, saturate(cuv + float2(-mt.x, 0.0f))).g;
+		const float Pb = sky_mask.Sample(sampSky, saturate(cuv + float2(mt.x, 0.0f))).g;
+		const float Pc = sky_mask.Sample(sampSky, saturate(cuv + float2(0.0f, -mt.y))).g;
+		const float Pd = sky_mask.Sample(sampSky, saturate(cuv + float2(0.0f, mt.y))).g;
+		const float Pe = sky_mask.Sample(sampSky, saturate(cuv)).g;
+		const float PbS = (0.25f * (Pa + Pb + Pc + Pd) + 0.5f * Pe) * inContent;
+		// Erode + soften: the fade sits INSIDE the silhouette (no outer halo).
+		const float P = smoothstep(0.10f, 0.72f, PbS);
+		if (P > 0.005) {
+			float3 srcRGB = src_tex.Sample(sampSrc, saturate(cuv)).rgb;
+			float3 srcLin;
+			if (IsPQ > 0.5) srcLin = ST2084ToLinear(float4(srcRGB, 0.0), 10000.0).rgb;
+			else            srcLin = pow(max(srcRGB, 0.0), 2.2) * SDR_PEAK_NITS;
+			float3 sg22 = (IsPQ > 0.5) ? pow(saturate(srcLin / 400.0f), 1.0f / 2.2f) : max(srcRGB, 0.0f);
+			float sy = dot(sg22, luma_w);
+			// Soft skin evidence (continuous 0..1 — no hard gate → no patches): the
+			// correction concentrates on pixels that actually read as skin, so hair,
+			// clothing and mirror reflections get ~no re-anchor (kills reflection shimmer).
+			float2 skuv = saturate(float2(
+				(sg22.r - sy) / 1.5748f - MLSkinLUTCR0,
+				(sg22.b - sy) / 1.8556f - MLSkinLUTCB0) / float2(
+				MLSkinLUTCR1 - MLSkinLUTCR0, MLSkinLUTCB1 - MLSkinLUTCB0));
+			const float skinEv = smoothstep(0.25f, 0.70f, skin_lut.Sample(sampSkin, skuv).r);
+			float srcLum = sy;
+			float outLum = (IsPQ > 0.5) ? pow(max(dot(lin, luma_w), 0.0), 1.0f / 2.2f)
+			                            : dot(max(color.rgb, 0.0), luma_w);
+			float desired = clamp(MLSkinAnchor + (srcLum - MLSkinAnchor) * MLSkinPreserve, 0.0, 1.0);
+			float corr = clamp(desired - outLum, -0.12f, 0.12f);
+			I_norm = saturate(I_norm + corr * P * skinEv * MLSkinPersonStrength * 0.45f);
+		}
+	}
 	ictcp.x = I_norm * I_peak;
 
 	// Inverse: ICtCp → linear nits → output encoding
@@ -165,7 +225,7 @@ float4 main(PS_INPUT input) : SV_Target
 	}
 
 	// Debug: sky-mask overlay (validation only — no tone effect yet). Cyan on
-// the sky region from the R8 t2 mask; rides _reserved5 (bMLSkyDebugVis).
+// the sky region from the t2 mask; rides _reserved5 (bMLSkyDebugVis).
 	if (_reserved5 > 0.5) {
 		// Full-res 640x360 mask at the CONTENT uv — same remap as the tone leg,
 		// so the cyan overlay shows exactly which pixels the tone is affecting.
@@ -174,32 +234,18 @@ float4 main(PS_INPUT input) : SV_Target
 		color.rgb = lerp(color.rgb, float3(0.0, 1.0, 1.0) * 0.6, S2 * 0.5);
 	}
 
-	// Debug: track-colored ellipses
-	if (FaceDebugVis > 0.5 && NumFaces > 0) {
-		uint texw, texh;
-		tex.GetDimensions(texw, texh);
-		float2 texsz = float2((float)texw, (float)texh);
-		float2 uv = input.Tex;
-		float lineW = 2.5 / texsz.x;
-		float trackIds[4] = { FaceTrackId.x, FaceTrackId.y, FaceTrackId.z, FaceTrackId.w };
+	// Debug: person-mask overlay (stage 4, validation). Magenta on people from
+	// the G channel, same content UV — gates only on the debug flag so it shows
+	// at any person strength (rawP, not the strength-gated weight).
+	if (MLSkinPersonDebugVis > 0.5) {
+		float P2 = smoothstep(0.25, 0.75, rawP);
+		color.rgb = lerp(color.rgb, float3(1.0, 0.0, 1.0) * 0.6, P2 * 0.5);
+	}
 
-		if (skin_blend > 0.01) {
-			color.rgb = lerp(color.rgb, float3(0.0, 1.0, 0.3), skin_blend * 0.4);
-		}
-
-		for (int fi = 0; fi < NumFaces; fi++) {
-			float4 box = FaceBox[fi];
-			float2 center = box.xy + box.zw * 0.5;
-			float2 radius = box.zw * 0.5 * FaceExpand;
-			float2 dd = (uv - center) / max(radius, 0.001);
-			float r = length(dd);
-
-			float hue = frac(trackIds[fi] * 0.618034);
-			float3 trkColor = saturate(abs(frac(hue + float3(0.0, 0.6667, 0.3333)) * 6.0 - 3.0) - 1.0);
-			if (abs(r - 1.0) < lineW / min(radius.x, radius.y)) {
-				color.rgb = trkColor;
-			}
-		}
+	// Debug: track-colored ellipses — DISABLED (face detection removed; person
+// instances replace it). FaceBox/FaceTrackId cbuffer decls stay for layout.
+	if (0) {
+		// face-track ellipse draw removed
 	}
 
 	return color;

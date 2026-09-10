@@ -209,3 +209,12 @@ bottom code range for shadow separation → perceived contrast).
 1. **P0 black-bars** (no deps, highest visible payoff) — SAT row-max probe today,
    mask pass, HTPC projector check.
 2. Follow P1 → P2 → P3(features) — P4 whenever the audit is convenient.
+
+## Persons + skin protection (2026-09-10, done)
+
+Person mask (class 11|12) decoded from the SAME yolo26n-sem inference as sky, packed
+into the G channel of the R8G8 semseg mask (R=sky unchanged). LUT-only-inside-people
+gate: chroma push suppression and micro-contrast damping now concentrate on real
+people; `zion.personStrength` 0 = bit-identical legacy. Seg cadence fixed to a true
+~10 fps throttle (was every frame in normal playback). Face detection/tracker (YuNet +
+ByteTrack) now redundant — **Phase 2 follow-up: remove after HTPC validation.**

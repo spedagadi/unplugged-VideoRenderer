@@ -174,13 +174,19 @@ struct Settings_t {
 	bool  bMLContrastEnabled = true;
 	float fMLContrast = 0.15f; // micro-contrast clarity strength [0, 0.5]
 	float fMLContrastZoneLo = 0.15f;
-	float fMLContrastSkinProtect = 1.0f;
+	float fMLContrastSkinProtect = 0.65f; // MC damping on person-skin (stage 4)
 	float fMLContrastRatioCap = 1.40f;
 	bool  bMLContrastDebugVis = false;
-	// Sky semantic segmentation (yolo26n-sem; stage-2 overlay validation)
-	bool  bMLSkyEnabled = true;
+	// Sky semantic segmentation (yolo26n-sem; tone-leg). Default OFF — the sky
+	// tone leg produced mask-region artifacts on first live runs; kept for later tuning.
+	bool  bMLSkyEnabled = false;
 	bool  bMLSkyDebugVis = false;   // cyan mask overlay for validation
 	float fMLSkyStrength = 0.6f;    // sky tone-leg blend amount [0, 1]
+	// Person skin protection (stage 4; class 11|12 of the same segmentation)
+	bool  bMLPersonEnabled = true;
+	float fMLPersonStrength = 1.0f; // LUT-only-inside-people gate [0,1]; 0 = legacy
+	bool  bMLPersonDebugVis = false; // magenta person-mask overlay (validation)
+	float fMLSkinPreserve = 0.0f;    // stage-5 skin tone: source-structure keep-scale [0,1] (default OFF)
 	bool  bTrayIcon = true;      // system tray icon when the renderer is active (opens the property page)
 	// Phase 1b — chroma vector tuning / hunt compensation
 	bool  bMLHuntEnabled = true;         // default preset: enabled
@@ -276,12 +282,15 @@ struct Settings_t {
 		bMLContrastEnabled              = true;
 		fMLContrast                     = 0.15f; // micro-contrast clarity strength [0, 0.5]
 		fMLContrastZoneLo               = 0.15f;
-		fMLContrastSkinProtect          = 1.0f;
+		fMLContrastSkinProtect          = 0.65f;
 		fMLContrastRatioCap             = 1.40f;
 		bMLContrastDebugVis             = false;
-		bMLSkyEnabled                   = true;
+		bMLSkyEnabled                   = false;
 		bMLSkyDebugVis                  = false;
 		fMLSkyStrength                  = 0.6f;
+		bMLPersonEnabled                = true;
+		fMLPersonStrength               = 1.0f;
+		bMLPersonDebugVis               = false;
 		bMLHuntEnabled                  = true;
 		fMLHunt                         = 0.80f;
 		bMLChromaEnabled                = true;
