@@ -183,7 +183,7 @@ struct Settings_t {
 	bool  bMLSkyDebugVis = false;   // cyan mask overlay for validation
 	float fMLSkyStrength = 0.6f;    // sky tone-leg blend amount [0, 1]
 	// Person skin protection (stage 4; class 11|12 of the same segmentation)
-	bool  bMLPersonEnabled = true;
+	bool  bMLPersonEnabled = false; // default OFF (pick up stage-5 work later)
 	float fMLPersonStrength = 1.0f; // LUT-only-inside-people gate [0,1]; 0 = legacy
 	bool  bMLPersonDebugVis = false; // magenta person-mask overlay (validation)
 	float fMLSkinPreserve = 0.0f;    // stage-5 skin tone: source-structure keep-scale [0,1] (default OFF)
@@ -288,7 +288,7 @@ struct Settings_t {
 		bMLSkyEnabled                   = false;
 		bMLSkyDebugVis                  = false;
 		fMLSkyStrength                  = 0.6f;
-		bMLPersonEnabled                = true;
+		bMLPersonEnabled                = false;
 		fMLPersonStrength               = 1.0f;
 		bMLPersonDebugVis               = false;
 		bMLHuntEnabled                  = true;

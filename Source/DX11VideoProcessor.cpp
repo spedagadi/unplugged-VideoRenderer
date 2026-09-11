@@ -2162,7 +2162,8 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 									// bilinearly, so this is visually identical but
 									// ~4x cheaper per Jacobi iteration)
 	constexpr float lw_r = 0.2126f, lw_g = 0.7152f, lw_b = 0.0722f;
-	const bool bTiming = (m_gateCalls++ % 3 == 0);   // time every 3rd call
+	static UINT64 s_gateCalls = 0;      // timing cadence
+	const bool bTiming = (++s_gateCalls % 3 == 0);   // time every 3rd call
 	const auto gqpc = []() -> double {
 		static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
 		LARGE_INTEGER c; QueryPerformanceCounter(&c);
