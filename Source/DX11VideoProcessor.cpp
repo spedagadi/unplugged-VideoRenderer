@@ -1668,11 +1668,12 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 					m_PersonFrac = person.personFrac;
 					// Temporal stability: blend the raw mask toward its smoothed twin so
 					// detection flicker (mirrors, weak silhouettes) can't pop the tone
-					// gate frame-to-frame. 75% old / 25% new per refresh.
+					// gate frame-to-frame. 62% old / 38% new per frame — enough to damp
+					// flicker without an obvious overlay ghost/trail under motion.
 					if (m_PersonMaskSm.size() != 640 * 360) m_PersonMaskSm = m_LastPersonMap;
 					else {
 						for (size_t _i = 0; _i < m_LastPersonMap.size(); _i++)
-							m_PersonMaskSm[_i] = (uint8_t)((3 * (int)m_PersonMaskSm[_i] + (int)m_LastPersonMap[_i]) >> 2);
+							m_PersonMaskSm[_i] = (uint8_t)((5 * (int)m_PersonMaskSm[_i] + 3 * (int)m_LastPersonMap[_i]) >> 3);
 					}
 					if (!person.map.empty()) m_LastPersonMap = person.map;
 				} else {
