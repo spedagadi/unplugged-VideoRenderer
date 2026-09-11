@@ -152,37 +152,39 @@ float4 main(PS_INPUT input) : SV_Target
 		luma_boost = lerp(MLChromaNeutral, MLChromaFire, pow(t, 1.5));
 	}
 
-	// Suppress boost on skin (person-gated LUT weight)
+	// Suppress boost on skin (person-gated LUT weight). The LUT is the chroma
+	// authority OUTSIDE people and at preserve=0 (bit-identical legacy path).
 	float chroma_scalar = lerp(luma_boost, 1.0,
 	                           saturate(eff * MLChromaSkinProtect));
 	chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);
 
-	// Keep the ORIGINAL Ct/Cp — gamma/MC never touch chroma, so ictcp.yz before
-	// the boost ARE the source chrominance. Tone preservation (stage 5) is done
-	// where vision can't see the boundary (chroma, not luma).
-	float origCt = ictcp.y;
-	float origCp = ictcp.z;
-
-	// Scale Ct/Cp — perceptually uniform chroma boost
-	ictcp.y *= chroma_scalar;
-	ictcp.z *= chroma_scalar;
-
-	// Skin tone-preservation (stage 5): restore the SOURCE Ct/Cp on the person
-	// rather than re-anchoring luma. The tone curve stays global everywhere (no
-	// spatial boundary in I → no seam), and this pass is the LAST color authority,
-	// so nothing re-boosts after. The mask edge in Ct/Cp is invisible — the eye's
-	// chroma resolution is far too low to see the silhouette here, which is the
-	// whole trick: the seam lives in luma, and we never touch luma by mask.
-	// w = person mask × strength × preserve → preserve 0 = bit-identical legacy.
+	// Skin tone-preservation (stage 5): on the PERSON the mask replaces the LUT
+	// as the chroma authority. preserve sweeps the person's Ct/Cp from the legacy
+	// boost back to the SOURCE chroma — multiplying by one scalar does exactly
+	// that (the boost is multiplicative in Ct/Cp). This gives the slider a real
+	// range precisely where the LUT failed to protect (graded/backlit skin, hair,
+	// clothing), and the pass is the LAST color authority so nothing re-saturates.
+	// The mask edge in chroma is invisible (the eye's chroma resolution is far too
+	// low to see the silhouette) — luma is never touched by mask, so no seam.
 	if (MLSkinPreserve > 0.001) {
 		float2 cuv = (input.Tex - float2(MLSkyUVOffX, MLSkyUVOffY))
 			/ max(float2(MLSkyUVScX, MLSkyUVScY), 0.001f);
 		const float inContent = (all(cuv >= 0.0) && all(cuv <= 1.0)) ? 1.0 : 0.0;
-		float P = sky_mask.Sample(sampSky, saturate(cuv)).g * inContent;
-		float w = saturate(P * MLSkinPersonStrength) * MLSkinPreserve;
-		ictcp.y = lerp(ictcp.y, origCt, w);
-		ictcp.z = lerp(ictcp.z, origCp, w);
+		const float P = sky_mask.Sample(sampSky, saturate(cuv)).g * inContent;
+		// Person authority weight: mask × strength × preserve.
+		const float personW = saturate(P * MLSkinPersonStrength * MLSkinPreserve);
+		const float personScalar = lerp(luma_boost, 1.0, personW);
+		// Bridge legacy-LUT → person-authority continuously over the low end of
+		// the slider (preserve=0 stays exactly legacy; strength=0 → no authority).
+		const float bridge = saturate(P * MLSkinPersonStrength)
+		                   * smoothstep(0.0f, 0.10f, MLSkinPreserve);
+		chroma_scalar = lerp(chroma_scalar, personScalar, bridge);
+		chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);
 	}
+
+	// Scale Ct/Cp — perceptually uniform chroma boost (restore folds into the scalar)
+	ictcp.y *= chroma_scalar;
+	ictcp.z *= chroma_scalar;
 
 	// Inverse: ICtCp → linear nits → output
 	float3 rgb_out = ictcp_to_linear(ictcp);
