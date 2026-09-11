@@ -1670,18 +1670,47 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 				if (wantPerson && m_pPersonSeg && m_pPersonSeg->IsReady() &&
 					m_pPersonSeg->DetectPersons((const uint8_t*)segMr.pData, 640, 360, segMr.RowPitch, person)) {
 					m_PersonFrac = person.personFrac;
-					// Temporal stability: blend the raw mask toward its smoothed twin so
-					// detection flicker (mirrors, weak silhouettes) can't pop the tone
-					// gate frame-to-frame. 62% old / 38% new per frame — enough to damp
-					// flicker without an obvious overlay ghost/trail under motion.
-					if (m_PersonMaskSm.size() != 640 * 360) m_PersonMaskSm = m_LastPersonMap;
-					else {
+					// Camera-cut detector: the new frame's person mask vs the previous
+					// raw — a cut has ~zero overlap (different scene, unrelated people).
+					// On a cut SNAP the smoothed mask to the new raw (no blend → the old
+					// scene's silhouette cannot linger as a shadow). No tracker needed:
+					// instance IDs exist in yolo26n-seg but a cut is a mismatch, not a
+					// continuity failure — the mask itself is the discontinuity signal.
+					float overlap = 1.0f;
+					if (!m_LastPersonMap.empty() && m_LastPersonMap.size() == person.map.size()) {
+						long long inter = 0, uni = 0;
+						for (size_t _i = 0; _i < person.map.size(); _i++) {
+							const bool a = person.map[_i] > 0, b = m_LastPersonMap[_i] > 0;
+							if (a && b) inter++;
+							if (a || b) uni++;
+						}
+						overlap = uni ? (float)inter / (float)uni : 1.0f;
+					}
+					const bool bCut = overlap < 0.20f;
+					// Update the raw FIRST so the blend below always targets the current
+					// frame (the old ordering blended against the previous frame's raw —
+					// a permanent 1-frame-late mask).
+					if (!person.map.empty()) m_LastPersonMap = person.map;
+					if (m_PersonMaskSm.size() != 640 * 360 || bCut) {
+						m_PersonMaskSm = m_LastPersonMap;          // snap (first frame / cut)
+					} else {
+						// Temporal stability: 62% old / 38% new — damps detection flicker
+						// (mirrors, weak silhouettes) within a shot without ghost/trail.
 						for (size_t _i = 0; _i < m_LastPersonMap.size(); _i++)
 							m_PersonMaskSm[_i] = (uint8_t)((5 * (int)m_PersonMaskSm[_i] + 3 * (int)m_LastPersonMap[_i]) >> 3);
 					}
-					if (!person.map.empty()) m_LastPersonMap = person.map;
+					if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 30 == 0) {
+						fwprintf(m_pMLDebugFile, L"MASK_WATCH overlap=%.3f cut=%d pfrac=%.4f\n",
+							(double)overlap, (int)bCut, (double)m_PersonFrac);
+						fflush(m_pMLDebugFile);
+					}
 				} else {
+					// No person this frame (e.g. camera cut to a person-less scene): the
+					// masks MUST clear — leaving them made the old scene's silhouette
+					// persist as a shadow on the new scene indefinitely.
 					m_PersonFrac = 0.0f;
+					if (!m_LastPersonMap.empty()) std::fill(m_LastPersonMap.begin(), m_LastPersonMap.end(), 0);
+					if (!m_PersonMaskSm.empty())  std::fill(m_PersonMaskSm.begin(), m_PersonMaskSm.end(), 0);
 				}
 				// R=sky (persists between refreshes), G=person (fresh every frame).
 				// Independent channels: zero-fill whichever model is unavailable.
