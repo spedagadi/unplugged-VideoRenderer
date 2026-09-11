@@ -1779,7 +1779,12 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 				}
 				// Skin-tone anchor + Poisson gate (production — no frame log needed):
 		// anchor = source skin-set mean luma; gate = relaxed person×skin field (gamma t4).
-		if (wantPerson && segMr.pData) {
+		// The gate (t4) is ONLY consumed by the shader's skin leg, which is gated on
+		// MLSkinPreserve — so with preserve=0 the whole 160x90 build (luma, Sobel,
+		// per-instance σ, 100-iter Jacobi, upload) is PURE WASTE and was the
+		// per-frame stutter. Skip both when the leg is off: bit-identical result,
+		// the gate texture simply keeps its last nonzero value (irrelevant at 0).
+		if (wantPerson && segMr.pData && m_bMLFeaturesReady && m_fMLSkinPreserve > 0.001f) {
 			UpdateSkinAnchor((const uint8_t*)segMr.pData, segMr.RowPitch);
 			UpdateSkinGate((const uint8_t*)segMr.pData, segMr.RowPitch);
 		}
@@ -2157,6 +2162,14 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 									// bilinearly, so this is visually identical but
 									// ~4x cheaper per Jacobi iteration)
 	constexpr float lw_r = 0.2126f, lw_g = 0.7152f, lw_b = 0.0722f;
+	const bool bTiming = (m_gateCalls++ % 3 == 0);   // time every 3rd call
+	const auto gqpc = []() -> double {
+		static LARGE_INTEGER f = [] { LARGE_INTEGER x; QueryPerformanceFrequency(&x); return x; }();
+		LARGE_INTEGER c; QueryPerformanceCounter(&c);
+		return 1000.0 * (double)c.QuadPart / (double)f.QuadPart;
+	};
+	double tkA = bTiming ? gqpc() : 0.0;   // frame start
+	double tkB = 0, tkC = 0;
 
 	// 1a) Source luma at gate resolution (4x4 average of the BGRA preview).
 	std::vector<float> lum(GW * GH, 0.0f);
@@ -2196,6 +2209,7 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 				      + Es[o + GW - 1] + Es[o + GW] + Es[o + GW + 1]) * (1.0f / 9.0f);
 			}
 	}
+	if (bTiming) tkB = gqpc();    // ← luma/edge phase end
 
 	// 1) Half-res gate seed = 4x4 max of the RAW per-frame person mask.
 	std::vector<float> g(GW * GH, 0.0f);
@@ -2246,6 +2260,7 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 		}
 		m_instSmInit = true;
 	}
+	if (bTiming) tkC = gqpc();    // ← σ/inst phase end
 	for (int y = 0; y < 360; y += 4) {
 		for (int x = 0; x < 640; x += 4) {
 			float mx = 0.0f;
@@ -2361,11 +2376,17 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 		for (int i = 0; i < GW * GH; i++) { sum += u[i]; if (u[i] > 0.01f) cnt++; eSum += E[i]; if (E[i] > kappa) eCnt++; }
 		// per-instance amplitudes: A≈1 (face) / A≈0 (clothes-only) is the gate's
 		// decision — person B cannot penalize person A when both are on screen.
-		fwprintf(m_pMLDebugFile, L"GATE u_mean=%.4f u_posFrac=%.4f e_mean=%.4f e_strFrac=%.4f  amp1=%.3f amp2=%.3f amp3=%.3f sig1=%.3f sig2=%.3f\n",
+		fwprintf(m_pMLDebugFile, L"GATE u_mean=%.4f u_posFrac=%.4f e_mean=%.4f e_strFrac=%.4f  amp1=%.3f amp2=%.3f amp3=%.3f sig1=%.3f sig2=%.3f",
 			(float)(sum / (GW * GH)), (float)((double)cnt / (GW * GH)),
 			(float)(eSum / (GW * GH)), (float)((double)eCnt / (GW * GH)),
 			(double)m_instAmp[1], (double)m_instAmp[2], (double)m_instAmp[3],
 			(double)m_instSkinSm[1], (double)m_instSkinSm[2]);
+		if (bTiming && tkC > 0) {   // per-phase ms split: luma+edge / σ+inst / solve+upload
+			const double e2 = gqpc();
+			fwprintf(m_pMLDebugFile, L"  [lum=%.2fms σ=%.2fms solve=%.2fms tot≈%.2fms]",
+				tkB - tkA, tkC - tkB, e2 - tkC, e2 - tkA);
+		}
+		fwprintf(m_pMLDebugFile, L"\n");
 		fflush(m_pMLDebugFile);
 	}
 }
