@@ -4986,6 +4986,22 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				hrs[3] = TextureCopyRect(*pInputTexture, pRT, rect, rect,
 					bCopy ? m_pPS_Simple.p : m_pPSMLChroma.p,
 					m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
+				if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 30 == 15) {
+					fwprintf(m_pMLDebugFile,
+						L"CHROMA_DRAW shader=%s lut=%s maskT2=%s gate=%.2f chN=%.3f chF=%.3f knee=%.3f skinP=%.3f pStr=%.3f pres=%.3f pfrac=%.3f\n",
+						(m_bMLDebugCopy ? L"copy" : L"chroma"),
+						(m_SkinLUTSRV ? L"skin" : L"NULL"),
+						(m_SkyMaskSRV ? L"mask" : L"NULL"),
+						(double)m_lastMLParams.MLChromaGate,
+						(double)m_lastMLParams.MLChromaNeutral,
+						(double)m_lastMLParams.MLChromaFire,
+						(double)m_lastMLParams.MLChromaKnee,
+						(double)m_lastMLParams.MLChromaSkinProtect,
+						(double)m_lastMLParams.MLSkinPersonStrength,
+						(double)m_lastMLParams.MLSkinPreserve,
+						(double)m_PersonFrac);
+					fflush(m_pMLDebugFile);
+				}
 				ID3D11ShaderResourceView* nullSRVs[2] = {};
 				m_pDeviceContext->PSSetShaderResources(1, 2, nullSRVs);
 			}
