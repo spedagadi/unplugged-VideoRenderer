@@ -264,7 +264,9 @@ bool CPersonSeg::DetectPersons(const uint8_t* bgra, int width, int height, int s
     if (m_mask160.size() != n160) m_mask160.assign(n160, 0.0f);
     if (m_mask640.size() != n640) m_mask640.assign(n640, 0.0f);
     if (m_map640.size() != n640) m_map640.assign(n640, 0);
+    if (m_inst640.size() != n640) m_inst640.assign(n640, 0);
     std::fill(m_map640.begin(), m_map640.end(), 0);
+    std::fill(m_inst640.begin(), m_inst640.end(), 0);
 
     const float scoreThr = 0.25f;
     Result::Box pendingBoxes[8];
@@ -308,21 +310,30 @@ bool CPersonSeg::DetectPersons(const uint8_t* bgra, int width, int height, int s
         // The tone gate's edge-pin (UpdateSkinGate) does the fine boundary, so the
         // added spill is clamped by the source luma, not printed by the mask.
         BilinearResize(m_mask160.data(), protoW, protoH, m_mask640.data(), mW, mH);
+        // 1-based instance label (>=1): the union keeps the LAST-accepted instance's
+        // label on overlap — video people rarely overlap, so per-person identity is
+        // preserved for the gate (person A face ↔ 1, person B waist ↔ 2).
+        const uint8_t instLabel = (uint8_t)std::min(nPending, 8);  // nPending is 1-based post-increment
         for (int y = iy1; y < iy2; y++)
             for (int xx = ix1; xx < ix2; xx++)
-                if (m_mask640[(size_t)y * mW + xx] > 0.25f)
+                if (m_mask640[(size_t)y * mW + xx] > 0.25f) {
                     m_map640[(size_t)y * mW + xx] = 255;
+                    m_inst640[(size_t)y * mW + xx] = instLabel;
+                }
     }
 
     // crop the letterbox padding -> content-aligned person map (like the sky map)
     out.mapW = sW;
     out.mapH = sH;
     out.map.assign((size_t)sH * sW, 0);
+    out.instMap.assign((size_t)sH * sW, 0);
     long long nPerson = 0;
     for (int ry = 0; ry < sH; ry++)
         for (int rx = 0; rx < sW; rx++) {
-            const uint8_t v = m_map640[(size_t)(ry + padY) * mW + (rx + padX)];
+            const size_t srcO = (size_t)(ry + padY) * mW + (rx + padX);
+            const uint8_t v = m_map640[srcO];
             out.map[(size_t)ry * sW + rx] = v;
+            out.instMap[(size_t)ry * sW + rx] = m_inst640[srcO];
             if (v) nPerson++;
         }
     out.personFrac = (float)nPerson / (float)((size_t)sH * sW);

@@ -283,6 +283,10 @@ private:
 	                                // a smooth curve after a scene change (Bay montage safe).
 	float   m_maskEnv = 1.0f;       // = smoothstep(0.25, 0.80, m_maskTrust), applied to preserve
 	int     m_framesSinceGood = 0;  // consecutive mismatch frames (whip-pan vs cut disambig)
+	std::vector<uint8_t> m_LastInstMap; // per-pixel person-instance label (0=bg, else 1..8)
+	float   m_instSkinSm[9] = {0};  // per-instance IIR of skin fraction σ_j (label-indexed)
+	float   m_instAmp[9] = {0};     // per-instance amplitude = smoothstep(0.03,0.12,σ) skin gate
+	bool    m_instSmInit = false;   // first-frame / cut force-reset of m_instSkinSm
 	// ByteTrack multi-object tracker (Kalman + Hungarian)
 	std::unique_ptr<BYTETracker> m_pByteTracker;
 	static constexpr int FACE_DETECT_W = 480;

@@ -1697,6 +1697,11 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 					if (bCut) {
 						m_maskTrust = fmaxf(0.0f, m_maskTrust - 0.35f);
 						m_framesSinceGood = 0;
+						// Labels are NOT consistent across a cut — reset the per-instance
+						// skin-fraction IIR so re-emerging people start from a clean σ
+						// (4ms of stale σ on a face would dip its gate for ~5 frames).
+						m_instSmInit = false;
+						for (int ji = 1; ji <= 8; ji++) m_instSkinSm[ji] = 0.0f;
 					} else {
 						// recovery only after the scene has been good for a couple frames
 						// (a 1-frame dip = noise; don't chase it)
@@ -1711,6 +1716,7 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 					// frame (the old ordering blended against the previous frame's raw —
 					// a permanent 1-frame-late mask).
 					if (!person.map.empty()) m_LastPersonMap = person.map;
+					if (!person.instMap.empty()) m_LastInstMap = person.instMap;
 					if (m_PersonMaskSm.size() != 640 * 360 || bCut) {
 						m_PersonMaskSm = m_LastPersonMap;          // snap (first frame / cut)
 					} else {
@@ -1735,8 +1741,11 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 					m_framesSinceGood = 0;
 					const float t = (m_maskTrust - 0.25f) / (0.80f - 0.25f);
 					m_maskEnv = t <= 0.0f ? 0.0f : (t >= 1.0f ? 1.0f : t * t * (3.0f - 2.0f * t));
+					m_instSmInit = false;
+					for (int ji = 1; ji <= 8; ji++) m_instSkinSm[ji] = 0.0f;
 					if (!m_LastPersonMap.empty()) std::fill(m_LastPersonMap.begin(), m_LastPersonMap.end(), 0);
 					if (!m_PersonMaskSm.empty())  std::fill(m_PersonMaskSm.begin(), m_PersonMaskSm.end(), 0);
+					if (!m_LastInstMap.empty())   std::fill(m_LastInstMap.begin(), m_LastInstMap.end(), 0);
 				}
 				// R=sky (persists between refreshes), G=person (fresh every frame).
 				// Independent channels: zero-fill whichever model is unavailable.
@@ -2183,14 +2192,65 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 
 	// 1) Half-res gate seed = 4x4 max of the RAW per-frame person mask.
 	std::vector<float> g(GW * GH, 0.0f);
+	std::vector<float> instAmpAt(GW * GH, 1.0f);  // plateau amplitude per cell (skin-presence gate)
 	bool anyPerson = false;
+	// Per-instance skin fraction σ_j = (person ∩ skin-LUT) / (person) per label,
+	// sampled at 640x360 (stride 3 to bound cost). IIR'd per label (memory) and
+	// shaped through smoothstep(0.03, 0.12, σ) → a per-instance amplitude A_j:
+	//   person A (face, σ≈1)  → A≈1  → full tone preservation
+	//   person B (waist, σ≈0) → A≈0  → gate off for that person only
+	// NO global pooling — each person self-gates, so A can't be penalized by B.
+	{
+		const int N = m_SkinLutN;
+		const float cr0 = m_fSkinLUTCR0, cr1 = m_fSkinLUTCR1, cb0 = m_fSkinLUTCB0, cb1 = m_fSkinLUTCB1;
+		long long pTot[9] = {}, sTot[9] = {};    // [0..8], label 0 unused
+		for (int y = 0; y < 360; y += 3)
+			for (int x = 0; x < 640; x += 3) {
+				const size_t o = (size_t)y * 640 + x;
+				const uint8_t lab = (m_LastInstMap.size() == 640 * 360) ? m_LastInstMap[o] : 1;
+				if (lab < 1 || lab > 8) continue;      // background
+				if (pm[o] == 0) continue;              // inside its instance?
+				pTot[lab]++;
+				const uint8_t* p = bgra + (size_t)y * stride + (size_t)x * 4;
+				const float r = p[2] / 255.0f, gr = p[1] / 255.0f, b = p[0] / 255.0f;
+				const float Y = 0.2126f * r + 0.7152f * gr + 0.0722f * b;
+				const float cr = (r - Y) / 1.5748f, cb = (b - Y) / 1.8556f;
+				const float uu = (cr - cr0) / (cr1 - cr0), vv = (cb - cb0) / (cb1 - cb0);
+				float lutW = 0.0f;
+				if (uu >= 0.0f && uu <= 1.0f && vv >= 0.0f && vv <= 1.0f && N > 0) {
+					const float fu = uu * (N - 1), fv = vv * (N - 1);
+					const int iu = (int)fu, iv = (int)fv, iu1 = std::min(N - 1, iu + 1), iv1 = std::min(N - 1, iv + 1);
+					const float wu = fu - iu, wv = fv - iv;
+					const auto L = [&](int ci, int ri) { return (float)m_SkinLutCpu[(size_t)ri * N + ci] / 255.0f; };
+					lutW = L(iu, iv) * (1 - wu) * (1 - wv) + L(iu1, iv) * wu * (1 - wv)
+						 + L(iu, iv1) * (1 - wu) * wv + L(iu1, iv1) * wu * wv;
+				}
+				if (lutW > 0.5f) sTot[lab]++;
+			}
+		for (int j = 1; j <= 8; j++) {
+			const float sig = (pTot[j] > 0) ? (float)sTot[j] / (float)pTot[j] : 0.0f;
+			// IIR per label; on cut/no-person the seg block resets m_instSmInit
+			// so re-emerging people start clean.
+			if (!m_instSmInit) m_instSkinSm[j] = sig;
+			else               m_instSkinSm[j] = 0.85f * m_instSkinSm[j] + 0.15f * sig;
+			// shaped amplitude: needs a decisive skin share to engage
+			const float t = (m_instSkinSm[j] - 0.03f) / (0.12f - 0.03f);
+			m_instAmp[j] = t <= 0.0f ? 0.0f : (t >= 1.0f ? 1.0f : t * t * (3.0f - 2.0f * t));
+		}
+		m_instSmInit = true;
+	}
 	for (int y = 0; y < 360; y += 4) {
 		for (int x = 0; x < 640; x += 4) {
 			float mx = 0.0f;
+			uint8_t labBest = 0;
 			for (int dy = 0; dy < 4 && (y + dy) < 360; dy++)
-				for (int dx = 0; dx < 4 && (x + dx) < 640; dx++)
-					mx = std::max(mx, pm[(size_t)(y + dy) * 640 + (x + dx)] / 255.0f);
+				for (int dx = 0; dx < 4 && (x + dx) < 640; dx++) {
+					const size_t o = (size_t)(y + dy) * 640 + (x + dx);
+					const float v = pm[o] / 255.0f;
+					if (v > mx) { mx = v; labBest = (m_LastInstMap.size() == 640 * 360) ? m_LastInstMap[o] : 1; }
+				}
 			g[(size_t)(y / 4) * GW + (x / 4)] = mx;
+			instAmpAt[(size_t)(y / 4) * GW + (x / 4)] = m_instAmp[labBest > 0 && labBest <= 8 ? labBest : 1];
 			if (mx > 0.01f) anyPerson = true;
 		}
 	}
@@ -2263,7 +2323,11 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 			for (int x = 1; x <= GW; x++) {
 				const size_t o = (size_t)y * TW + x;
 				const size_t gix = (size_t)(y - 1) * GW + (x - 1);
-				if (er[gix] >= 0.80f) { pad2[o] = 1.0f; continue; }   // solid interior
+				// Interior pin = per-instance skin-presence amplitude (person A face
+				// ~1, person B waist ~0 → that plateau collapses) so the harmonic tail
+				// falls from A_j to 0 exactly as it did from 1.0 — indistinguishable
+				// for full-face people, fully off for clothes-only people.
+				if (er[gix] >= 0.80f) { pad2[o] = instAmpAt[gix]; continue; }   // solid interior
 				if (gDil[gix] <= 0.05f) { pad2[o] = 0.0f; continue; } // clear exterior
 				const float cn = cond(gix, gix - GW), cs = cond(gix, gix + GW);
 				const float ce = cond(gix, gix + 1),  cw = cond(gix, gix - 1);
@@ -2288,9 +2352,13 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 	if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 30 == 0) {
 		float sum = 0; long long cnt = 0, eCnt = 0; float eSum = 0;
 		for (int i = 0; i < GW * GH; i++) { sum += u[i]; if (u[i] > 0.01f) cnt++; eSum += E[i]; if (E[i] > kappa) eCnt++; }
-		fwprintf(m_pMLDebugFile, L"GATE u_mean=%.4f u_posFrac=%.4f e_mean=%.4f e_strFrac=%.4f\n",
+		// per-instance amplitudes: A≈1 (face) / A≈0 (clothes-only) is the gate's
+		// decision — person B cannot penalize person A when both are on screen.
+		fwprintf(m_pMLDebugFile, L"GATE u_mean=%.4f u_posFrac=%.4f e_mean=%.4f e_strFrac=%.4f  amp1=%.3f amp2=%.3f amp3=%.3f sig1=%.3f sig2=%.3f\n",
 			(float)(sum / (GW * GH)), (float)((double)cnt / (GW * GH)),
-			(float)(eSum / (GW * GH)), (float)((double)eCnt / (GW * GH)));
+			(float)(eSum / (GW * GH)), (float)((double)eCnt / (GW * GH)),
+			(double)m_instAmp[1], (double)m_instAmp[2], (double)m_instAmp[3],
+			(double)m_instSkinSm[1], (double)m_instSkinSm[2]);
 		fflush(m_pMLDebugFile);
 	}
 }

@@ -33,6 +33,8 @@ public:
         int             mapW = 0;    // person map dims = content rect (e.g. 640x360)
         int             mapH = 0;
         std::vector<unsigned char> map;   // R8-like: 255 = person, 0 = not
+        std::vector<unsigned char> instMap; // per-pixel instance label: 0 = not person,
+                                            // else 1..nBoxes (input to per-instance skin gate)
         float           personFrac = 0.0f; // fraction of valid-letterbox pixels == person
         struct Box { float x, y, w, h; };  // per-person boxes in content UV [0,1]
         Box             boxes[8];
@@ -76,4 +78,5 @@ private:
     std::vector<float>  m_mask160;   // sigmoid mask at proto res (160x160)
     std::vector<float>  m_mask640;   // upscaled to model res
     std::vector<uint8_t> m_map640;    // union person mask at model res
+    std::vector<uint8_t> m_inst640;   // per-instance label at model res (0 = bg, else 1..N)
 };
