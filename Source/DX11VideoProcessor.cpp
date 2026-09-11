@@ -1635,10 +1635,16 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	const bool wantPerson = m_bPersonEnabled || m_bPersonDebugVis;
 	const bool wantSky    = m_bSkyEnabled || m_bSkyDebugVis;
 	const bool wantMask   = wantPerson || wantSky;
-	// Person: every frame (fresh masks for fast zooms/pans). Sky: every 5 frames.
-	const bool doSky = wantSky && (m_nSkyFrame - m_nSkyLastFrame >= 5);
+	// Cadence (render-thread frame counter m_nSkyFrame; NOT m_MLDebugFrame which is
+	// pinned at 0 without the frame log):
+	//   - Person: every 2 frames (mask updates are EMA/snap-stabilized and the τ
+	//     envelope riders out a couple stale frames; every-frame DirectML + a GPU
+	//     readback per frame was the stutter — the mask does not need 60 fps).
+	//   - Sky: every 5 frames.
+	const bool doPerson = wantPerson && (m_nSkyFrame - m_nPersonLastFrame >= 2);
+	const bool doSky    = wantSky && (m_nSkyFrame - m_nSkyLastFrame >= 5);
 	if (wantMask && (m_pPersonSeg && m_pPersonSeg->IsReady() || m_pSkySeg && m_pSkySeg->IsReady()) &&
-		m_SkyMaskSRV && m_SegDownsample && m_SegStaging && (wantPerson || doSky)) {
+		m_SkyMaskSRV && m_SegDownsample && m_SegStaging && (doPerson || doSky)) {
 		// Preview is rendered from the PRESENTED content rect in Process (the mask is
 		// keyed to the presentation, so it stays aligned even under player crop /
 		// zoom / pillarbox on any display aspect). Stage + detect here, 1 frame latent.
@@ -1747,6 +1753,7 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 					if (!m_PersonMaskSm.empty())  std::fill(m_PersonMaskSm.begin(), m_PersonMaskSm.end(), 0);
 					if (!m_LastInstMap.empty())   std::fill(m_LastInstMap.begin(), m_LastInstMap.end(), 0);
 				}
+				if (doPerson) m_nPersonLastFrame = m_nSkyFrame;   // cadence reset after the attempt
 				// R=sky (persists between refreshes), G=person (fresh every frame).
 				// Independent channels: zero-fill whichever model is unavailable.
 				const bool haveSky = !m_LastSkyMap.empty();

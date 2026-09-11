@@ -267,6 +267,7 @@ private:
 	float   m_SkyLuma = 0.0f;      // last decode: mean gamma-2.2 luma of sky pixels
 	uint64_t m_nSkyFrame = 0;      // render-frame counter for cadence (incremented per frame)
 	uint64_t m_nSkyLastFrame = 0;  // last frame a mask refresh was uploaded
+	uint64_t m_nPersonLastFrame = 0; // last frame the person inference + gate ran (every 2)
 	bool    m_bSkyEnabled = false; // sky segmentation + tone leg — default OFF
 	bool    m_bSkyDebugVis = false; // cyan overlay of the sky mask (validation)
 	float   m_fMLSkyStrength = 0.6f; // sky tone-leg blend amount [0, 1]
