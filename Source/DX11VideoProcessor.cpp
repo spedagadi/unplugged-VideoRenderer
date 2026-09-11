@@ -2057,20 +2057,26 @@ void CDX11VideoProcessor::UpdateSkinAnchor(const uint8_t* bgra, UINT stride)
 void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 {
 	// Poisson-relaxed PERSON-mask gate for the gamma skin-tone leg (t4).
-	// Pure mask — NO skin LUT: the LUT evidence made the gate plateau spatially
-	// noisy and re-morph at ~10 fps cadence (shimmer). A uniform mask plateau is
-	// temporally stable, and the Laplace solve still gives the seamless C1 tail:
-	//   1) g = personMask  (640x360, downsampled 2x2-max → 320x180)
-	//   2) Dirichlet + FREE-RELAX boundary: u = 1.0 deep inside (g >= 0.80),
-	//      u = 0.0 clearly outside (g <= 0.05), everything between HARMONIC
-	//      (Jacobi → analytic tail) — the correction turns on with gradient
-	//      continuity, so no luma step at any strength.
-	// Runs beside UpdateSkinAnchor in the seg block (~person cadence).
+	// Pure mask — NO skin LUT, NO EMA: the LUT caused shimmer, and the EMA masks
+	// caused the boundary to lag a moving person (the mask "follows with latency").
+	// Person inference already runs EVERY frame → feed the gate the RAW per-frame
+	// map so the boundary tracks the person exactly.
+	//
+	//   1) g = RAW personMask (640x360 → 2x2-max → 320x180)
+	//   2) Erode the plateau pin DEEP INSIDE the silhouette (3x3-min iterations):
+	//      u = 1.0 only where the erosed field shows solid interior — the harmonic
+	//      tail then bridges from THAT interior plateau to 0 at the true silhouette,
+	//      i.e. the whole brightness transition happens AGAINST PERSON PIXELS, not
+	//      against the background. At/just outside the real edge, u≈0 already, so
+	//      no glow can print on the background (the bright-daylight seam case).
+	//      u = 0.0 where the raw mask is clear (<= 0.05); everything between relaxes.
+	// Runs beside UpdateSkinAnchor in the seg block (every frame for person).
 	if (!m_SkinGate) return;
-	const std::vector<uint8_t>& pm = m_PersonMaskSm.empty() ? m_LastPersonMap : m_PersonMaskSm;
+	const std::vector<uint8_t>& pm = m_LastPersonMap.empty() ? m_PersonMaskSm : m_LastPersonMap;
 	if (pm.size() != 640 * 360) return;
+	(void)bgra; (void)stride;   // mask-only gate; bgra/stride unused now
 
-	// 1) Half-res gate seed = 2x2 max of the EMA-smoothed person mask.
+	// 1) Half-res gate seed = 2x2 max of the RAW per-frame person mask.
 	constexpr int GW = 320, GH = 180;   // half-res gate grid
 	std::vector<float> g(GW * GH, 0.0f);
 	for (int y = 0; y < 360; y += 2) {
@@ -2083,9 +2089,27 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 		}
 	}
 
-	// 2) Solve: u = 1.0 on the interior plateau (g≥0.8), 0.0 far outside (g≤0.05),
-	//    HARMONIC between (Jacobi averaging → C1 tail, no spatial step).
-	(void)bgra; (void)stride;   // mask-only gate; bgra/stride unused now
+	// 2) Eroded plateau: 3x3-min iterations on the half-res grid. Each iteration
+	//    pulls the u=1 pin a gate texel (~2 source px) inside the silhouette, so
+	//    the brightness tail is forced to spend itself on the person's interior.
+	std::vector<float> er = g, er2 = g;
+	constexpr int ER = 3;                    // 3 gate texels ≈ 6 raw px ≈ ~30-40 px at 4K
+	for (int it = 0; it < ER; it++) {
+		for (int y = 1; y < GH - 1; y++)
+			for (int x = 1; x < GW - 1; x++) {
+				const size_t o = (size_t)y * GW + x;
+				er2[o] = std::min(std::min(er[o - GW], er[o + GW]),
+				                  std::min(std::min(er[o - 1], er[o + 1]), er[o]));
+			}
+		er.swap(er2);
+	}
+
+	// 3) Solve: u = 1.0 where the ERODED plateau is solid (er ≥ 0.80, deep inside);
+	//    u = 0.0 where the RAW mask is already outside (g ≤ 0.05, at/just beyond the
+	//    true silhouette); the annulus between = the person's rim → HARMONIC (C1
+	//    tail that spends itself on the person's interior, see §2). Pins read the
+	//    FIXED seeds (g/er at the cell), never the live field, so the interior
+	//    magnitude follows the raw mask and can't be dragged by the solve.
 	std::vector<float> u = g;
 	const int TW = GW + 2, TH = GH + 2;              // padded grid (zero ring)
 	std::vector<float> pad(TW * TH, 0.0f), pad2(TW * TH, 0.0f);
@@ -2096,11 +2120,12 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 		for (int y = 1; y <= GH; y++) {
 			for (int x = 1; x <= GW; x++) {
 				const size_t o = (size_t)y * TW + x;
-				const float gv = pad[o];
-				// Dirichlet pins: plateau stays 1, far exterior stays 0 → the solved
-				// band between them is the harmonic tail. Interior magnitude = g.
-				if (gv >= 0.80f)      { pad2[o] = 1.0f; continue; }
-				if (gv <= 0.05f)      { pad2[o] = 0.0f; continue; }
+				const size_t gix = (size_t)(y - 1) * GW + (x - 1);
+				const float gv = g[gix];   // raw mask seed: the outside pin
+				const float ev = er[gix];  // eroded seed: the interior pin
+				// Dirichlet pins from the fixed seeds (never pad itself):
+				if (ev >= 0.80f)      { pad2[o] = 1.0f; continue; }   // solid interior
+				if (gv <= 0.05f)      { pad2[o] = 0.0f; continue; }   // clear exterior
 				pad2[o] = 0.25f * (pad[o - TW] + pad[o + TW] + pad[o - 1] + pad[o + 1]);
 			}
 		}
@@ -2108,7 +2133,7 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 	}
 	for (int i = 0; i < GW * GH; i++) u[i] = pad[(size_t)(i / GW + 1) * TW + (i % GW) + 1];
 
-	// 3) Upload R8 to m_SkinGate (gamma t4): u in [0,1].
+	// 4) Upload R8 to m_SkinGate (gamma t4): u in [0,1].
 	std::vector<uint8_t> out(GW * GH);
 	for (int i = 0; i < GW * GH; i++) {
 		float uv = u[i] * 255.0f;                    // already ~[0,1]; also clamp
@@ -2120,8 +2145,10 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 	if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 30 == 0) {
 		float sum = 0; long long cnt = 0;
 		for (int i = 0; i < GW * GH; i++) { sum += u[i]; if (u[i] > 0.01f) cnt++; }
-		fwprintf(m_pMLDebugFile, L"GATE u_mean=%.4f u_posFrac=%.4f g_peak=%.4f\n",
-			(float)(sum / (GW * GH)), (float)((double)cnt / (GW * GH)), (double)*std::max_element(g.begin(), g.end()));
+		fwprintf(m_pMLDebugFile, L"GATE u_mean=%.4f u_posFrac=%.4f g_peak=%.4f er_peak=%.4f\n",
+			(float)(sum / (GW * GH)), (float)((double)cnt / (GW * GH)),
+			(double)*std::max_element(g.begin(), g.end()),
+			(double)*std::max_element(er.begin(), er.end()));
 		fflush(m_pMLDebugFile);
 	}
 }
