@@ -11,6 +11,10 @@ Texture2D tex : register(t0);
 SamplerState samp : register(s0);
 Texture2D sky_mask : register(t2);   // 640x360 R8G8 semseg (R=sky, G=person)
 SamplerState sampSky : register(s2);
+Texture2D src_tex : register(t3);    // pre-grade source (convert output) for the skin tone leg
+SamplerState sampSrc : register(s3);
+Texture2D skin_gate : register(t4);  // 320x180 R8 Poisson-relaxed person×skin gate (C1 -> 0)
+SamplerState sampGate : register(s4);
 
 struct PS_INPUT
 {
@@ -84,10 +88,23 @@ cbuffer MLParams : register(b0)
 	float _padPerson1;
 	// Skin tone-preservation (stage 5) — appended tail
 	float MLSkinAnchor;    // skin-set mean source luma (IIR, gamma-2.2)
-	float MLSkinPreserve;  // 0..1 restore source Ct/Cp on the person (chroma, no luma seam)
+	float MLSkinPreserve;  // 0..1 luma re-anchor toward source skin tone (Poisson-gated)
 	float MLSkinPad0;
 	float MLSkinPad1;
 };
+
+static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
+
+// Source gamma-2.2 luma at a content uv (SDR-ized the same way as the seg preview).
+float srcLumAt(float2 uv)
+{
+	float3 r = src_tex.Sample(sampSrc, saturate(uv)).rgb;
+	if (IsPQ > 0.5) {
+		float3 l = ST2084ToLinear(float4(r, 0.0), 10000.0).rgb;
+		return dot(pow(saturate(l / 400.0f), 1.0f / 2.2f), luma_w);
+	}
+	return dot(max(r, 0.0), luma_w);
+}
 
 // Unified tone curve: shadow toe → gamma (sky-relaxed guard) → highlight rolloff →
 // sky cloud-band lift. Operates on I_norm; returns graded I_norm. `sky` = S *
@@ -164,11 +181,32 @@ float4 main(PS_INPUT input) : SV_Target
 	float S = (MLSkyStrength > 0.001) ? rawS : 0.0f;
 
 	// === UNIFIED TONE CURVE (shadow toe → gamma → highlight rolloff) ===
-	// Global, applied to EVERY pixel identically — no person/skin gating of I, so
-	// there is no spatial boundary to seam. (Stage 5 moved skin preservation to
-	// CHROMA, see ps_ml_chroma.) S=0 reproduces the global path exactly.
+	// Global — applied to every pixel identically; S=0 reproduces the global path.
 	const float skyT = S * MLSkyStrength;
 	I_norm = applyToneCurve(I_norm, skyT);
+
+	// Skin tone-preservation (stage 5): steer the WHOLE person region's luma back
+	// toward the source skin tone. The gate is a POISSON-RELAXED field (t4): 1 on a
+	// safe plateau deep inside the person·skin region, 0 outside, and the harmonic
+	// tail between is C1-smooth — so the correction has NO spatial step at the
+	// silhouette (the seam is gone at any strength), while the interior keeps the
+	// full strength-scaled re-anchor (the visible sweep is back). skinEv (LUT) is
+	// folded into the CPU-built gate, so it concentrates on skin, not hair/clothing.
+	// OFF by default (MLSkinPreserve = 0 → bit-identical legacy).
+	if (MLSkinPersonStrength > 0.001 && MLSkinPreserve > 0.001 && MLSkinAnchor > 0.01f) {
+		const float u = skin_gate.Sample(sampGate, saturate(cuv)).r * inContent;
+		if (u > 0.005) {
+			// post-curve OUTPUT luma (reconstruct the grade result, not the input)
+			float3 icOut = ictcp; icOut.x = I_norm * I_peak;
+			float3 linOut = ictcp_to_linear(icOut);
+			float outLum = (IsPQ > 0.5) ? pow(max(dot(linOut, luma_w), 0.0), 1.0f / 2.2f)
+			                            : dot(pow(saturate(linOut / SDR_PEAK_NITS), 1.0f / 2.2f), luma_w);
+			const float srcLum = srcLumAt(cuv);
+			float desired = clamp(MLSkinAnchor + (srcLum - MLSkinAnchor) * MLSkinPreserve, 0.0, 1.0);
+			float corr = clamp(desired - outLum, -0.10f, 0.10f);
+			I_norm = saturate(I_norm + corr * u * MLSkinPersonStrength * 0.32f);
+		}
+	}
 	ictcp.x = I_norm * I_peak;
 
 	// Inverse: ICtCp → linear nits → output encoding

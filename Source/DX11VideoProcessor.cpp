@@ -868,6 +868,9 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_SkyMask.Release();
 	m_SkyMaskSRV.Release();
 	m_pSamplerSky.Release();
+	m_SkinGate.Release();
+	m_SkinGateSRV.Release();
+	m_pSamplerGate.Release();
 	m_SegDownsample.Release();
 	m_SegStaging.Release();
 	m_MaskProbe.Release();
@@ -1196,6 +1199,7 @@ void CDX11VideoProcessor::InitMLResources()
 	if (FAILED(CreateSkyMaskTexture())) {
 		DLog(L"CDX11VideoProcessor::InitMLResources() sky mask texture failed; overlay disabled");
 	}
+	CreateSkinGateTexture();   // Poisson skin gate (t4); created fresh even on device reset
 	if (FAILED(CreateSkySegTextures())) {
 		DLog(L"CDX11VideoProcessor::InitMLResources() sky seg preview textures failed; seg disabled");
 	}
@@ -1702,8 +1706,12 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 						fflush(m_pMLDebugFile);
 					}
 				}
-				// Skin-tone anchor (production — no frame log needed): source skin-set mean luma.
-		if (wantPerson && segMr.pData) UpdateSkinAnchor((const uint8_t*)segMr.pData, segMr.RowPitch);
+				// Skin-tone anchor + Poisson gate (production — no frame log needed):
+		// anchor = source skin-set mean luma; gate = relaxed person×skin field (gamma t4).
+		if (wantPerson && segMr.pData) {
+			UpdateSkinAnchor((const uint8_t*)segMr.pData, segMr.RowPitch);
+			UpdateSkinGate((const uint8_t*)segMr.pData, segMr.RowPitch);
+		}
 		m_pDeviceContext->Unmap(m_SegStaging, 0);
 			}
 	}
@@ -1853,6 +1861,37 @@ HRESULT CDX11VideoProcessor::CreateSkyMaskTexture()
 	desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 	hr = m_pDevice->CreateTexture2D(&desc, nullptr, &m_MaskProbe);
 	return hr;
+}
+
+void CDX11VideoProcessor::CreateSkinGateTexture()
+{
+	// 320x180 R8_UNORM — the half-res Poisson-relaxed person×skin gate consumed on
+	// gamma t4. CPU-written every person-cadence update (m_SkinGate == 0 = first
+	// create; release then recreate so a device reset re-builds it cleanly).
+	if (!m_pDevice) return;
+	m_SkinGate.Release();
+	m_SkinGateSRV.Release();
+	m_pSamplerGate.Release();
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = 320;
+	desc.Height = 180;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_R8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+	std::vector<uint8_t> zero(320 * 180, 0);
+	D3D11_SUBRESOURCE_DATA init = { zero.data(), (UINT)320, 0 };
+	if (FAILED(m_pDevice->CreateTexture2D(&desc, &init, &m_SkinGate))) return;
+	if (FAILED(m_pDevice->CreateShaderResourceView(m_SkinGate, nullptr, &m_SkinGateSRV))) return;
+
+	D3D11_SAMPLER_DESC sd = {};
+	sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+	sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	m_pDevice->CreateSamplerState(&sd, &m_pSamplerGate);
 }
 
 HRESULT CDX11VideoProcessor::CreateSkySegTextures()
@@ -2012,6 +2051,98 @@ void CDX11VideoProcessor::UpdateSkinAnchor(const uint8_t* bgra, UINT stride)
 		const double m = sy / (double)n;
 		if (!m_skinAnchorValid) { m_skinAnchorSmooth = m; m_skinAnchorValid = true; }
 		else                     { m_skinAnchorSmooth = 0.88 * m_skinAnchorSmooth + 0.12 * m; }
+	}
+}
+
+void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
+{
+	// Poisson-relaxed person×skin gate for the gamma skin-tone leg (t4).
+	// The naive gate (mask ramp) has a hard spatial step at the silhouette →
+	// a brightness seam wherever person and background meet. Instead we solve a
+	// Laplace BVP whose solution u is C1-smooth:
+	//   1) g = personMask × skinEvidence  (640x360, mask × LUT)
+	//   2) pool to 320x180
+	//   3) Dirichlet + FREE-RELAX boundary: u = 1.0 deep inside (g >= 0.80),
+	//      u = 0.0 clearly outside (g <= 0.05), everything between HARMONIC
+	//      (Jacobi → analytic tail) — the correction now turns on with
+	//      gradient continuity, so no luma step at any strength.
+	// Runs beside UpdateSkinAnchor in the seg block (~person cadence). If nothing
+	// to gate or the texture isn't ready, the upload keeps the last field (or zero).
+	if (!bgra || m_SkinLutN <= 0 || !m_SkinGate) return;
+	const std::vector<uint8_t>& pm = m_PersonMaskSm.empty() ? m_LastPersonMap : m_PersonMaskSm;
+	if (pm.size() != 640 * 360) return;
+	const int N = m_SkinLutN;
+	const float cr0 = m_fSkinLUTCR0, cr1 = m_fSkinLUTCR1, cb0 = m_fSkinLUTCB0, cb1 = m_fSkinLUTCB1;
+
+	// 1) Full-res evidence field (reuses the SKINMET LUT bilinear; masked to person).
+	constexpr int GW = 320, GH = 180;   // half-res gate grid
+	std::vector<float> g(GW * GH, 0.0f);
+	const int kro = 2;                  // stride over 640x360 (every 2nd pixel; 320x180 taps)
+	for (int y = 0; y < 360; y += 2) {
+		for (int x = 0; x < 640; x += 2) {
+			const float mask = pm[(size_t)y * 640 + x] / 255.0f;
+			if (mask <= 0.01f) continue;
+			const uint8_t* p = bgra + (size_t)y * stride + (size_t)x * 4;
+			const float r = p[2] / 255.0f, gr = p[1] / 255.0f, b = p[0] / 255.0f;
+			const float Y = 0.2126f * r + 0.7152f * gr + 0.0722f * b;
+			const float cr = (r - Y) / 1.5748f, cb = (b - Y) / 1.8556f;
+			const float uu = (cr - cr0) / (cr1 - cr0), vv = (cb - cb0) / (cb1 - cb0);
+			float lutW = 0.0f;
+			if (uu >= 0.0f && uu <= 1.0f && vv >= 0.0f && vv <= 1.0f) {
+				const float fu = uu * (N - 1), fv = vv * (N - 1);
+				const int iu = (int)fu, iv = (int)fv, iu1 = std::min(N - 1, iu + 1), iv1 = std::min(N - 1, iv + 1);
+				const float wu = fu - iu, wv = fv - iv;
+				const auto L = [&](int ci, int ri) { return (float)m_SkinLutCpu[(size_t)ri * N + ci] / 255.0f; };
+				lutW = L(iu, iv) * (1 - wu) * (1 - wv) + L(iu1, iv) * wu * (1 - wv)
+					 + L(iu, iv1) * (1 - wu) * wv + L(iu1, iv1) * wu * wv;
+			}
+			// same soft skin evidence as the old shader (concentrates on skin,
+			// kills hair/clothing/mirror); g = mask × evidence
+			const float skinEv = std::max(0.0f, std::min(1.0f, (lutW - 0.25f) / (0.70f - 0.25f)));
+			g[(size_t)(y / 2) * GW + (x / 2)] = std::max(g[(size_t)(y / 2) * GW + (x / 2)], mask * skinEv);
+		}
+	}
+
+	// 2) Solve: u = 1.0 on the interior plateau (g≥0.8), 0.0 far outside (g≤0.05),
+	//    HARMONIC between (Jacobi averaging → C1 tail, no spatial step).
+	std::vector<float> u = g;
+	std::vector<float> u2 = u;
+	const int TW = GW + 2, TH = GH + 2;              // padded grid (zero ring)
+	std::vector<float> pad(TW * TH, 0.0f), pad2(TW * TH, 0.0f);
+	for (int i = 0; i < GW * GH; i++) pad[(size_t)(i / GW + 1) * TW + (i % GW) + 1] = u[i];
+	constexpr int ITERS = 96;
+	for (int it = 0; it < ITERS; it++) {
+		pad2 = pad;
+		for (int y = 1; y <= GH; y++) {
+			for (int x = 1; x <= GW; x++) {
+				const size_t o = (size_t)y * TW + x;
+				const float gv = pad[o];
+				// Dirichlet pins: plateau stays 1, far exterior stays 0 → the solved
+				// band between them is the harmonic tail. Interior magnitude = g.
+				if (gv >= 0.80f)      { pad2[o] = 1.0f; continue; }
+				if (gv <= 0.05f)      { pad2[o] = 0.0f; continue; }
+				pad2[o] = 0.25f * (pad[o - TW] + pad[o + TW] + pad[o - 1] + pad[o + 1]);
+			}
+		}
+		pad.swap(pad2);
+	}
+	for (int i = 0; i < GW * GH; i++) u[i] = pad[(size_t)(i / GW + 1) * TW + (i % GW) + 1];
+
+	// 3) Upload R8 to m_SkinGate (gamma t4): u in [0,1].
+	std::vector<uint8_t> out(GW * GH);
+	for (int i = 0; i < GW * GH; i++) {
+		float uv = u[i] * 255.0f;                    // already ~[0,1]; also clamp
+		out[i] = (uint8_t)(uv < 0.0f ? 0 : (uv > 255.0f ? 255 : (unsigned)uv));
+	}
+	D3D11_BOX box = { 0, 0, 0, GW, GH, 1 };
+	m_pDeviceContext->UpdateSubresource(m_SkinGate, 0, &box, out.data(), GW, 0);
+
+	if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 30 == 0) {
+		float sum = 0; long long cnt = 0;
+		for (int i = 0; i < GW * GH; i++) { sum += u[i]; if (u[i] > 0.01f) cnt++; }
+		fwprintf(m_pMLDebugFile, L"GATE u_mean=%.4f u_posFrac=%.4f g_peak=%.4f\n",
+			(float)(sum / (GW * GH)), (float)((double)cnt / (GW * GH)), (double)*std::max_element(g.begin(), g.end()));
+		fflush(m_pMLDebugFile);
 	}
 }
 
@@ -4924,11 +5055,22 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 					TextureCopyRect(*pInputTexture, m_SegDownsample, rect, segRect, m_pPSFaceDown, m_pFaceDownParams, 0, false);
 				}
 			}
+			// Skin tone-preservation: pre-grade source (t3) for srcLumAt + the
+			// Poisson-relaxed person×skin gate (t4). Unbound right after the gamma
+			// draw; t2 stays for MC person .g.
+			if (m_TexConvertOutput.pShaderResource && m_pSamplerSky) {
+				m_pDeviceContext->PSSetShaderResources(3, 1, &m_TexConvertOutput.pShaderResource.p);
+				m_pDeviceContext->PSSetSamplers(3, 1, &m_pSamplerSky.p);
+			}
+			if (m_SkinGateSRV && m_pSamplerGate) {
+				m_pDeviceContext->PSSetShaderResources(4, 1, &m_SkinGateSRV.p);
+				m_pDeviceContext->PSSetSamplers(4, 1, &m_pSamplerGate.p);
+			}
 			hrs[1] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psGamma, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 			{
-				ID3D11ShaderResourceView* nul = nullptr;   // unbind t1 (LUT) + t3 (source); t2 stays for MC
-				m_pDeviceContext->PSSetShaderResources(1, 1, &nul);
+				ID3D11ShaderResourceView* nul = nullptr;   // unbind t3 (source) + t4 (gate); t2 stays for MC
 				m_pDeviceContext->PSSetShaderResources(3, 1, &nul);
+				m_pDeviceContext->PSSetShaderResources(4, 1, &nul);
 			}
 			if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
 				fwprintf(m_pMLDebugFile,

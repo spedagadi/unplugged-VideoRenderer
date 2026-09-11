@@ -244,6 +244,9 @@ private:
 	CComPtr<ID3D11Texture2D>          m_SkyMask;      // 640x360 R8G8_UNORM (R=sky, G=person)
 	CComPtr<ID3D11ShaderResourceView> m_SkyMaskSRV;
 	CComPtr<ID3D11SamplerState>       m_pSamplerSky;  // bilinear + clamp
+	CComPtr<ID3D11Texture2D>          m_SkinGate;     // 320x180 R8_UNORM Poisson-relaxed person×skin gate (t4)
+	CComPtr<ID3D11ShaderResourceView> m_SkinGateSRV;
+	CComPtr<ID3D11SamplerState>       m_pSamplerGate; // bilinear + clamp
 	CComPtr<ID3D11Texture2D>          m_SegDownsample; // 640x360 BGRA8 SDR-ized seg preview
 	CComPtr<ID3D11Texture2D>          m_SegStaging;    // CPU-readable copy
 	CComPtr<ID3D11Texture2D>          m_MaskProbe;     // CPU staging twin of m_SkyMask (diag readback)
@@ -251,9 +254,11 @@ private:
 	CComPtr<ID3D11Texture2D>          m_MetStaging;
 	HRESULT CreateSkyMaskTexture();
 	HRESULT CreateSkySegTextures();
+	void    CreateSkinGateTexture();
 	void    LogMaskProbe();
 	void    LogSkinMetric(ID3D11Texture2D* pRT, const CRect& rect);
 	void    UpdateSkinAnchor(const uint8_t* bgra, UINT stride);
+	void    UpdateSkinGate(const uint8_t* bgra, UINT stride);   // Poisson-relaxed person×skin gate (t4)
 	float   m_SkyFrac = 0.0f;      // last decode: fraction of valid pixels == sky
 	float   m_PersonFrac = 0.0f;   // last decode: fraction of valid pixels == person/rider
 	std::vector<uint8_t> m_LastSkyMap;     // CPU cache of last sky map (640x360) — R channel persists between refreshes

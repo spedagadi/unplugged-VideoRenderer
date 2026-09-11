@@ -87,7 +87,7 @@ cbuffer MLParams : register(b0)
 	float _padPerson1;
 	// Skin tone-preservation (stage 5) — appended tail
 	float MLSkinAnchor;    // skin-set mean source luma (IIR, gamma-2.2)
-	float MLSkinPreserve;  // 0..1 restore source Ct/Cp on the person (chroma, no luma seam)
+	float MLSkinPreserve;  // 0..1 luma re-anchor toward source skin tone (unused in chroma; gamma t4)
 	float MLSkinPad0;
 	float MLSkinPad1;
 };
@@ -152,38 +152,12 @@ float4 main(PS_INPUT input) : SV_Target
 		luma_boost = lerp(MLChromaNeutral, MLChromaFire, pow(t, 1.5));
 	}
 
-	// Suppress boost on skin (person-gated LUT weight). The LUT is the chroma
-	// authority OUTSIDE people and at preserve=0 (bit-identical legacy path).
+	// Suppress boost on skin (person-gated LUT weight)
 	float chroma_scalar = lerp(luma_boost, 1.0,
 	                           saturate(eff * MLChromaSkinProtect));
 	chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);
 
-	// Skin tone-preservation (stage 5): on the PERSON the mask replaces the LUT
-	// as the chroma authority. preserve sweeps the person's Ct/Cp from the legacy
-	// boost back to the SOURCE chroma — multiplying by one scalar does exactly
-	// that (the boost is multiplicative in Ct/Cp). This gives the slider a real
-	// range precisely where the LUT failed to protect (graded/backlit skin, hair,
-	// clothing), and the pass is the LAST color authority so nothing re-saturates.
-	// The mask edge in chroma is invisible (the eye's chroma resolution is far too
-	// low to see the silhouette) — luma is never touched by mask, so no seam.
-	if (MLSkinPreserve > 0.001) {
-		float2 cuv = (input.Tex - float2(MLSkyUVOffX, MLSkyUVOffY))
-			/ max(float2(MLSkyUVScX, MLSkyUVScY), 0.001f);
-		const float inContent = (all(cuv >= 0.0) && all(cuv <= 1.0)) ? 1.0 : 0.0;
-		const float P = sky_mask.Sample(sampSky, saturate(cuv)).g * inContent;
-		// Person authority weight: mask × strength × preserve.
-		// Anchor to the LEGACY chroma_scalar (LUT-suppressed boost), NOT the full
-		// luma_boost — anchoring to the full boost made the sweep non-monotonic on
-		// protected skin (0.5 raised saturation above the 0 value, then 1 dropped it
-		// below — read as "nothing happens"). This form is monotonic: on pixels the
-		// LUT already protects (scalar≈1.0) the range is small but correct; on the
-		// LUT-miss pixels (hair, graded/backlit skin) the sweep is the full 1.08→1.0.
-		const float personW = saturate(P * MLSkinPersonStrength) * MLSkinPreserve;
-		chroma_scalar = lerp(chroma_scalar, 1.0, personW);
-		chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);
-	}
-
-	// Scale Ct/Cp — perceptually uniform chroma boost (restore folds into the scalar)
+	// Scale Ct/Cp — perceptually uniform chroma boost
 	ictcp.y *= chroma_scalar;
 	ictcp.z *= chroma_scalar;
 
