@@ -208,8 +208,14 @@ float4 main(PS_INPUT input) : SV_Target
 				MLSkinLUTCR1 - MLSkinLUTCR0, MLSkinLUTCB1 - MLSkinLUTCB0));
 			const float skinEv = smoothstep(0.25f, 0.70f, skin_lut.Sample(sampSkin, skuv).r);
 			float srcLum = sy;
-			float outLum = (IsPQ > 0.5) ? pow(max(dot(lin, luma_w), 0.0), 1.0f / 2.2f)
-			                            : dot(max(color.rgb, 0.0), luma_w);
+			// outLum = the ACTUAL post-curve output luma (reconstruct the grade
+			// result), NOT the pre-curve input. This makes MLSkinPreserve a true
+			// linear weight between the tone-mapped output (0) and the source
+			// re-anchor (1): corr = (1-pres)·outLum-proxy, so 100% re-sources skin.
+			float3 icOut = ictcp; icOut.x = I_norm * I_peak;
+			float3 linOut = ictcp_to_linear(icOut);
+			float outLum = (IsPQ > 0.5) ? pow(max(dot(linOut, luma_w), 0.0), 1.0f / 2.2f)
+			                            : dot(pow(saturate(linOut / SDR_PEAK_NITS), 1.0f / 2.2f), luma_w);
 			float desired = clamp(MLSkinAnchor + (srcLum - MLSkinAnchor) * MLSkinPreserve, 0.0, 1.0);
 			float corr = clamp(desired - outLum, -0.10f, 0.10f);
 			I_norm = saturate(I_norm + corr * P * skinEv * MLSkinPersonStrength * 0.32f);
