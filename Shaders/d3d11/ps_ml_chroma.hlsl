@@ -87,7 +87,7 @@ cbuffer MLParams : register(b0)
 	float _padPerson1;
 	// Skin tone-preservation (stage 5) — appended tail
 	float MLSkinAnchor;    // skin-set mean source luma (IIR, gamma-2.2)
-	float MLSkinPreserve;  // 0..1 keep-scale of source skin structure
+	float MLSkinPreserve;  // 0..1 restore source Ct/Cp on the person (chroma, no luma seam)
 	float MLSkinPad0;
 	float MLSkinPad1;
 };
@@ -157,9 +157,32 @@ float4 main(PS_INPUT input) : SV_Target
 	                           saturate(eff * MLChromaSkinProtect));
 	chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);
 
+	// Keep the ORIGINAL Ct/Cp — gamma/MC never touch chroma, so ictcp.yz before
+	// the boost ARE the source chrominance. Tone preservation (stage 5) is done
+	// where vision can't see the boundary (chroma, not luma).
+	float origCt = ictcp.y;
+	float origCp = ictcp.z;
+
 	// Scale Ct/Cp — perceptually uniform chroma boost
 	ictcp.y *= chroma_scalar;
 	ictcp.z *= chroma_scalar;
+
+	// Skin tone-preservation (stage 5): restore the SOURCE Ct/Cp on the person
+	// rather than re-anchoring luma. The tone curve stays global everywhere (no
+	// spatial boundary in I → no seam), and this pass is the LAST color authority,
+	// so nothing re-boosts after. The mask edge in Ct/Cp is invisible — the eye's
+	// chroma resolution is far too low to see the silhouette here, which is the
+	// whole trick: the seam lives in luma, and we never touch luma by mask.
+	// w = person mask × strength × preserve → preserve 0 = bit-identical legacy.
+	if (MLSkinPreserve > 0.001) {
+		float2 cuv = (input.Tex - float2(MLSkyUVOffX, MLSkyUVOffY))
+			/ max(float2(MLSkyUVScX, MLSkyUVScY), 0.001f);
+		const float inContent = (all(cuv >= 0.0) && all(cuv <= 1.0)) ? 1.0 : 0.0;
+		float P = sky_mask.Sample(sampSky, saturate(cuv)).g * inContent;
+		float w = saturate(P * MLSkinPersonStrength) * MLSkinPreserve;
+		ictcp.y = lerp(ictcp.y, origCt, w);
+		ictcp.z = lerp(ictcp.z, origCp, w);
+	}
 
 	// Inverse: ICtCp → linear nits → output
 	float3 rgb_out = ictcp_to_linear(ictcp);

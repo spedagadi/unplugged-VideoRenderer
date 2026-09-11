@@ -9,12 +9,8 @@
 
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
-Texture2D skin_lut : register(t1);   // trained 96x96 skin LUT (stage-5 tone leg gate)
-SamplerState sampSkin : register(s1);
 Texture2D sky_mask : register(t2);   // 640x360 R8G8 semseg (R=sky, G=person)
 SamplerState sampSky : register(s2);
-Texture2D src_tex : register(t3);    // pre-grade source (convert output) for the skin tone leg
-SamplerState sampSrc : register(s3);
 
 struct PS_INPUT
 {
@@ -88,29 +84,14 @@ cbuffer MLParams : register(b0)
 	float _padPerson1;
 	// Skin tone-preservation (stage 5) — appended tail
 	float MLSkinAnchor;    // skin-set mean source luma (IIR, gamma-2.2)
-	float MLSkinPreserve;  // 0..1 keep-scale of source skin structure
+	float MLSkinPreserve;  // 0..1 restore source Ct/Cp on the person (chroma, no luma seam)
 	float MLSkinPad0;
 	float MLSkinPad1;
 };
 
-static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
-
-// Source gamma-2.2 luma at a content uv (SDR-ized the same way as the seg preview).
-float srcLumAt(float2 uv)
-{
-	float3 r = src_tex.Sample(sampSrc, saturate(uv)).rgb;
-	if (IsPQ > 0.5) {
-		float3 l = ST2084ToLinear(float4(r, 0.0), 10000.0).rgb;
-		return dot(pow(saturate(l / 400.0f), 1.0f / 2.2f), luma_w);
-	}
-	return dot(max(r, 0.0), luma_w);
-}
-
 // Unified tone curve: shadow toe → gamma (sky-relaxed guard) → highlight rolloff →
 // sky cloud-band lift. Operates on I_norm; returns graded I_norm. `sky` = S *
-// MLSkyStrength (0 when sky features are off → exactly the global path). The base
-// path and the skin tone-preservation envelope share this so the person is graded
-// by the SAME curve as the background (no seam).
+// MLSkyStrength (0 when sky features are off → exactly the global path).
 float applyToneCurve(float x, float sky)
 {
 	// 1. Shadow toe: DV L2 offset pedestal lift — raises dark end toward knee
@@ -183,82 +164,11 @@ float4 main(PS_INPUT input) : SV_Target
 	float S = (MLSkyStrength > 0.001) ? rawS : 0.0f;
 
 	// === UNIFIED TONE CURVE (shadow toe → gamma → highlight rolloff) ===
-	// One shared curve grades the frame AND the skin tone-preservation envelope
-	// (applyToneCurve below) — S=0 reproduces the global path exactly.
+	// Global, applied to EVERY pixel identically — no person/skin gating of I, so
+	// there is no spatial boundary to seam. (Stage 5 moved skin preservation to
+	// CHROMA, see ps_ml_chroma.) S=0 reproduces the global path exactly.
 	const float skyT = S * MLSkyStrength;
 	I_norm = applyToneCurve(I_norm, skyT);
-
-	// Skin tone-preservation (stage 5): frequency separation on the person region.
-	// The tone curve stays on the base everywhere; inside the person we grade the
-	// SOURCE ENVELOPE with the same curve and replay the source's bounded local
-	// contrast at full strength — the person keeps its source tone/shading instead
-	// of inheriting the tone curve's luma displacement. Gate = PERSON mask (bilinear
-	// → spatially smooth), soft skin-LUT evidence weights the detail. OFF by default.
-	// MLSkinAnchor (CPU IIR) is retained for SKINMET telemetry only.
-	if (MLSkinPersonStrength > 0.001 && MLSkinPreserve > 0.001 && MLSkinAnchor > 0.01f) {
-		// Blurred person gate: a raw mask edge would print the silhouettes into the
-		// tone field (discontinuity). Wide plus-blur (~3.5 mask texels, ~40 px at 4K)
-		// so the correction fades over a physically large span — bright-uniform
-		// backgrounds otherwise expose a residual seam at the silhouette.
-		uint mw, mh; sky_mask.GetDimensions(mw, mh);
-		const float2 mt = float2(1.0f / (float)mw, 1.0f / (float)mh) * 3.5f;
-		const float Pa = sky_mask.Sample(sampSky, saturate(cuv + float2(-mt.x, 0.0f))).g;
-		const float Pb = sky_mask.Sample(sampSky, saturate(cuv + float2(mt.x, 0.0f))).g;
-		const float Pc = sky_mask.Sample(sampSky, saturate(cuv + float2(0.0f, -mt.y))).g;
-		const float Pd = sky_mask.Sample(sampSky, saturate(cuv + float2(0.0f, mt.y))).g;
-		const float Pe = sky_mask.Sample(sampSky, saturate(cuv)).g;
-		const float PbS = (0.25f * (Pa + Pb + Pc + Pd) + 0.5f * Pe) * inContent;
-		// Erode + soften: the fade sits INSIDE the silhouette (no outer halo); the
-		// high plateau holds only deep inside so the boundary tail is long.
-		const float P = smoothstep(0.10f, 0.88f, PbS);
-		if (P > 0.005) {
-			float3 srcRGB = src_tex.Sample(sampSrc, saturate(cuv)).rgb;
-			float3 srcLin;
-			if (IsPQ > 0.5) srcLin = ST2084ToLinear(float4(srcRGB, 0.0), 10000.0).rgb;
-			else            srcLin = pow(max(srcRGB, 0.0), 2.2) * SDR_PEAK_NITS;
-			float3 sg22 = (IsPQ > 0.5) ? pow(saturate(srcLin / 400.0f), 1.0f / 2.2f) : max(srcRGB, 0.0f);
-			float sy = dot(sg22, luma_w);
-			// Soft skin evidence (continuous 0..1 — no hard gate → no patches): the
-			// correction concentrates on pixels that actually read as skin, so hair,
-			// clothing and mirror reflections get ~no re-anchor (kills reflection shimmer).
-			float2 skuv = saturate(float2(
-				(sg22.r - sy) / 1.5748f - MLSkinLUTCR0,
-				(sg22.b - sy) / 1.8556f - MLSkinLUTCB0) / float2(
-				MLSkinLUTCR1 - MLSkinLUTCR0, MLSkinLUTCB1 - MLSkinLUTCB0));
-			const float skinEv = smoothstep(0.25f, 0.70f, skin_lut.Sample(sampSkin, skuv).r);
-			const float srcLum = sy;
-			// SOURCE ENVELOPE (base): wide center-weighted 9-tap corner-plus. The ratio
-			// srcLum/baseSrc is the source's own local-contrast pattern — speculars,
-			// brow/subsurface shading, fine texture — DC-free by construction.
-			uint sw_, sh_; src_tex.GetDimensions(sw_, sh_);
-			const float2 stx = float2(1.0f / (float)sw_, 1.0f / (float)sh_) * 28.0f;
-			const float b1 = srcLumAt(cuv + float2(stx.x, 0.0f));
-			const float b2 = srcLumAt(cuv - float2(stx.x, 0.0f));
-			const float b3 = srcLumAt(cuv + float2(0.0f, stx.y));
-			const float b4 = srcLumAt(cuv - float2(0.0f, stx.y));
-			const float b5 = srcLumAt(cuv + float2(stx.x, stx.y));
-			const float b6 = srcLumAt(cuv - float2(stx.x, stx.y));
-			const float b7 = srcLumAt(cuv + float2(-stx.x, stx.y));
-			const float b8 = srcLumAt(cuv - float2(-stx.x, stx.y));
-			const float baseSrc = (4.0f * srcLum + 2.0f * (b1 + b2 + b3 + b4) + (b5 + b6 + b7 + b8)) * (1.0f / 16.0f);
-			// Bounded source-contrast ratio (soft-curve compressor — the MC-proven form):
-			// on speculars log(src/base) explodes, but |logr|/(1+|logr|) saturates, so
-			// full preserve can never hotspot/crater the skin (max ~×1.45 / ×0.66).
-			const float logr = clamp(log(srcLum / max(baseSrc, 1e-4f)), -1.0f, 1.0f);
-			const float ratio = exp(0.75f * logr / (1.0f + abs(logr)));
-			// TRUE frequency separation: grade the SOURCE ENVELOPE with the SAME tone
-			// curve as the background (seamless — the person's mean rides the global
-			// mapping), then replay the source contrast at full strength under it. The
-			// envelope has no RGB, so linearize its gamma-2.2 luma as neutral chroma.
-			float baseLin = (IsPQ > 0.5) ? (400.0f * pow(saturate(baseSrc), 2.2f))
-			                             : (pow(saturate(baseSrc), 2.2f) * SDR_PEAK_NITS);
-			const float baseI = linear_to_ictcp(float3(baseLin, baseLin, baseLin)).x;
-			const float baseT = applyToneCurve(saturate(baseI / I_peak), skyT);
-			// detailW = gate × soft skin evidence × person weight × preserve (0 → identity)
-			const float detailW = P * skinEv * MLSkinPersonStrength * MLSkinPreserve;
-			I_norm = lerp(I_norm, saturate(baseT * ratio), detailW);
-		}
-	}
 	ictcp.x = I_norm * I_peak;
 
 	// Inverse: ICtCp → linear nits → output encoding

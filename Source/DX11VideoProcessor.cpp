@@ -4910,16 +4910,6 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				m_pDeviceContext->PSSetShaderResources(2, 1, &m_SkyMaskSRV.p);
 				m_pDeviceContext->PSSetSamplers(2, 1, &m_pSamplerSky.p);
 			}
-			// Skin tone-preservation leg: trained skin LUT (t1) + pre-grade source (t3)
-			// bound for the gamma pass. Unbound right after (t2 stays for MC person .g).
-			if (m_SkinLUTSRV && m_pSamplerSkin) {
-				m_pDeviceContext->PSSetShaderResources(1, 1, &m_SkinLUTSRV.p);
-				m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerSkin.p);
-			}
-			if (m_TexConvertOutput.pShaderResource && m_pSamplerSky) {
-				m_pDeviceContext->PSSetShaderResources(3, 1, &m_TexConvertOutput.pShaderResource.p);
-				m_pDeviceContext->PSSetSamplers(3, 1, &m_pSamplerSky.p);
-			}
 			// Seg preview = the PRESENTED content rect (the same geometry cuv samples in
 			// the shaders). Keying the mask to the presentation — not the full source
 			// convert — keeps it aligned under player crop/zoom/pillarbox on any display
