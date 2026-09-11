@@ -95,6 +95,17 @@ cbuffer MLParams : register(b0)
 
 static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
 
+// Source gamma-2.2 luma at a content uv (SDR-ized the same way as the seg preview).
+float srcLumAt(float2 uv)
+{
+	float3 r = src_tex.Sample(sampSrc, saturate(uv)).rgb;
+	if (IsPQ > 0.5) {
+		float3 l = ST2084ToLinear(float4(r, 0.0), 10000.0).rgb;
+		return dot(pow(saturate(l / 400.0f), 1.0f / 2.2f), luma_w);
+	}
+	return dot(max(r, 0.0), luma_w);
+}
+
 float4 main(PS_INPUT input) : SV_Target
 {
 	float4 color = tex.Sample(samp, input.Tex);
@@ -208,17 +219,21 @@ float4 main(PS_INPUT input) : SV_Target
 				MLSkinLUTCR1 - MLSkinLUTCR0, MLSkinLUTCB1 - MLSkinLUTCB0));
 			const float skinEv = smoothstep(0.25f, 0.70f, skin_lut.Sample(sampSkin, skuv).r);
 			float srcLum = sy;
-			// outLum = the ACTUAL post-curve output luma (reconstruct the grade
-			// result), NOT the pre-curve input. This makes MLSkinPreserve a true
-			// linear weight between the tone-mapped output (0) and the source
-			// re-anchor (1): corr = (1-pres)·outLum-proxy, so 100% re-sources skin.
-			float3 icOut = ictcp; icOut.x = I_norm * I_peak;
-			float3 linOut = ictcp_to_linear(icOut);
-			float outLum = (IsPQ > 0.5) ? pow(max(dot(linOut, luma_w), 0.0), 1.0f / 2.2f)
-			                            : dot(pow(saturate(linOut / SDR_PEAK_NITS), 1.0f / 2.2f), luma_w);
-			float desired = clamp(MLSkinAnchor + (srcLum - MLSkinAnchor) * MLSkinPreserve, 0.0, 1.0);
-			float corr = clamp(desired - outLum, -0.10f, 0.10f);
-			I_norm = saturate(I_norm + corr * P * skinEv * MLSkinPersonStrength * 0.32f);
+			// Ratio-injection (stage 5, restart): tone-mapped base EVERYWHERE (no
+			// seam), plus the SOURCE's local-contrast pattern replayed on the person.
+			// base = wide envelope of the source (crude 5-tap, ~22 full-res px);
+			// ratio = srcLum/base → speculars, brow/subsurface shading, fine texture.
+			// detailW = gate × soft skin evidence × strength × preserve (linear).
+			uint sw_, sh_; src_tex.GetDimensions(sw_, sh_);
+			const float2 stx = float2(1.0f / (float)sw_, 1.0f / (float)sh_) * 22.0f;
+			const float b1 = srcLumAt(cuv + float2(stx.x, 0.0f));
+			const float b2 = srcLumAt(cuv - float2(stx.x, 0.0f));
+			const float b3 = srcLumAt(cuv + float2(0.0f, stx.y));
+			const float b4 = srcLumAt(cuv - float2(0.0f, stx.y));
+			const float baseSrc = (2.0f * srcLum + b1 + b2 + b3 + b4) * (1.0f / 6.0f);
+			const float ratio = clamp(srcLum / max(baseSrc, 1e-4f), 0.4f, 2.5f);
+			const float detailW = P * skinEv * MLSkinPersonStrength * MLSkinPreserve;
+			I_norm = saturate(I_norm * pow(ratio, detailW));
 		}
 	}
 	ictcp.x = I_norm * I_peak;
