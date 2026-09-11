@@ -277,6 +277,12 @@ private:
 	float   m_fMLSkinPreserve = 0.0f;  // stage-5 skin tone keep-scale (default OFF)
 	double  m_skinAnchorSmooth = 0.0f; // IIR skin-set mean source luma (gamma-2.2)
 	bool    m_skinAnchorValid = false;
+	float   m_maskTrust = 1.0f;     // scene-confidence scalar (0..1): falls fast on mask
+	                                // mismatch (cut/pan), recovers slowly on stability —
+	                                // MLSkinPreserve *= env so the tone blend fades in with
+	                                // a smooth curve after a scene change (Bay montage safe).
+	float   m_maskEnv = 1.0f;       // = smoothstep(0.25, 0.80, m_maskTrust), applied to preserve
+	int     m_framesSinceGood = 0;  // consecutive mismatch frames (whip-pan vs cut disambig)
 	// ByteTrack multi-object tracker (Kalman + Hungarian)
 	std::unique_ptr<BYTETracker> m_pByteTracker;
 	static constexpr int FACE_DETECT_W = 480;

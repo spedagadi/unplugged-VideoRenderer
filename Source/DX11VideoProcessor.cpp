@@ -1515,7 +1515,7 @@ void CDX11VideoProcessor::SetMLParams()
 	// Skin tone-preservation (stage 5): CPU IIR skin-set mean source luma (from the
 	// SKINMET readback cadence) anchors the shader's skin remap; strength 0 = inert.
 	params.MLSkinAnchor   = m_skinAnchorValid ? (float)m_skinAnchorSmooth : 0.0f;
-	params.MLSkinPreserve = fminf(1.0f, fmaxf(0.0f, m_fMLSkinPreserve));
+	params.MLSkinPreserve = fminf(1.0f, fmaxf(0.0f, m_fMLSkinPreserve)) * m_maskEnv;
 
 	// Snapshot the FULL struct AFTER the appended tails (sky/person) are set.
 	// Process() re-uploads m_lastMLParams every frame for the UV remap, so the
@@ -1687,6 +1687,26 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 						overlap = uni ? (float)inter / (float)uni : 1.0f;
 					}
 					const bool bCut = overlap < 0.20f;
+					// Scene-confidence scalar (τ): falls fast on SUSTAINED mismatch
+					// (a real cut / montage), recovers slowly on stability. A whip pan
+					// dips for 1-3 frames then recovers → τ blips but the tone blend
+					// barely moves; a real cut keeps τ low for a while → preserve fades
+					// out and re-fades in smoothly after masks+anchor settle.
+					// Decay on bad: -0.35/frame (reaches ~0 in ~3 bad frames).
+					// Recover on good: +0.08/frame (~13 frames back to full).
+					if (bCut) {
+						m_maskTrust = fmaxf(0.0f, m_maskTrust - 0.35f);
+						m_framesSinceGood = 0;
+					} else {
+						// recovery only after the scene has been good for a couple frames
+						// (a 1-frame dip = noise; don't chase it)
+						if (m_framesSinceGood >= 2)
+							m_maskTrust = fminf(1.0f, m_maskTrust + 0.08f);
+						m_framesSinceGood++;
+					}
+					// env = smoothstep passes through ~0 below 0.25 trust, ~1 above 0.80
+					const float t = (m_maskTrust - 0.25f) / (0.80f - 0.25f);
+					m_maskEnv = t <= 0.0f ? 0.0f : (t >= 1.0f ? 1.0f : t * t * (3.0f - 2.0f * t));
 					// Update the raw FIRST so the blend below always targets the current
 					// frame (the old ordering blended against the previous frame's raw —
 					// a permanent 1-frame-late mask).
@@ -1700,15 +1720,21 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 							m_PersonMaskSm[_i] = (uint8_t)((5 * (int)m_PersonMaskSm[_i] + 3 * (int)m_LastPersonMap[_i]) >> 3);
 					}
 					if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 30 == 0) {
-						fwprintf(m_pMLDebugFile, L"MASK_WATCH overlap=%.3f cut=%d pfrac=%.4f\n",
-							(double)overlap, (int)bCut, (double)m_PersonFrac);
+						fwprintf(m_pMLDebugFile, L"MASK_WATCH overlap=%.3f cut=%d trust=%.3f env=%.3f pfrac=%.4f\n",
+							(double)overlap, (int)bCut, (double)m_maskTrust, (double)m_maskEnv, (double)m_PersonFrac);
 						fflush(m_pMLDebugFile);
 					}
 				} else {
 					// No person this frame (e.g. camera cut to a person-less scene): the
 					// masks MUST clear — leaving them made the old scene's silhouette
-					// persist as a shadow on the new scene indefinitely.
+					// persist as a shadow on the new scene indefinitely. τ also decays
+					// (scene changed); masks cleared → gate is zero → preserve can't act
+					// anyway, but the fade-in state should reset for the next scene.
 					m_PersonFrac = 0.0f;
+					m_maskTrust = fmaxf(0.0f, m_maskTrust - 0.35f);
+					m_framesSinceGood = 0;
+					const float t = (m_maskTrust - 0.25f) / (0.80f - 0.25f);
+					m_maskEnv = t <= 0.0f ? 0.0f : (t >= 1.0f ? 1.0f : t * t * (3.0f - 2.0f * t));
 					if (!m_LastPersonMap.empty()) std::fill(m_LastPersonMap.begin(), m_LastPersonMap.end(), 0);
 					if (!m_PersonMaskSm.empty())  std::fill(m_PersonMaskSm.begin(), m_PersonMaskSm.end(), 0);
 				}
