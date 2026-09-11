@@ -222,6 +222,8 @@ private:
 	float m_fMLShadowZoneCeil = 0.20f;
 	float m_fMLShadowSkinProtect = 0.65f;
 	float m_fMLShadowRatioCap = 1.40f;
+	float m_fMLShadowDehaze = 0.0f;   // 0..1 scale-down of the model's shadow-toe lift (haze control)
+	float m_MLShadowDehazeApplied = 0.0f; // what was actually applied (telemetry)
 	bool  m_bMLContrastEnabled = true;
 	float m_fMLContrast = 0.15f; // micro-contrast clarity strength (exponent) — overwritten by config
 	float m_fMLContrastZoneLo = 0.15f;

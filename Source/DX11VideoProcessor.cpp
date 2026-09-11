@@ -416,6 +416,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_iMLMode               = config.iMLMode;
 	m_fMLGamma              = config.fMLGamma;
 	m_fMLShadow             = config.fMLShadow;
+	m_fMLShadowDehaze       = config.fMLShadowDehaze;
 	m_fMLHighlight          = config.fMLHighlight;
 	m_bMLDebugCopy          = config.bMLDebugCopy;
 	m_bMLDebug              = config.bMLDebugLog;
@@ -1312,7 +1313,17 @@ void CDX11VideoProcessor::SetMLParams()
 		float shadowPred = 0.0f;
 		if (m_MLShadowModel.Predict(m_MLFeatures, ML_FEATURE_DIM, shadowPred)) {
 			shadow = fmaxf(0.0f, fminf(0.5f, shadowPred));
+			// Shadow dehaze: 0..1 scale DOWN the model's shadow-toe lift. The model
+			// predicts a toe that lifts the dark end (x += toe·x·t²) — at high values
+			// this reads as lifted-black haze. dehaze multiplies the toe target by
+			// (1−dehaze): 0 = model as-is; 1 = model fully suppressed (toe→0, the
+			// shader's >0.005 gate then skips the whole step → bit-identical no-lift).
+			const float dehaze = fminf(1.0f, fmaxf(0.0f, m_fMLShadowDehaze));
+			shadow *= (1.0f - dehaze);
+			m_MLShadowDehazeApplied = dehaze;
 		}
+	} else if (m_bMLShadowEnabled) {
+		m_MLShadowDehazeApplied = 0.0f;
 	}
 
 	// Adaptive highlight guard from the scene peak (same formula as ml_render.c).
@@ -2587,7 +2598,7 @@ void CDX11VideoProcessor::InitMLDebug()
 			L"frame,time_100ns,active,mode,gamma,shadow,highlight,"
 			L"ispq,swapcs,swfmt,steps,tmactive,winW,winH,srcW,srcH,vidL,vidT,vidR,vidB,"
 			L"mlmin,mlmax,mlavg,clipfrac,edgefrac,logCOPY,"
-			L"featReady,stale,convSeen,texConv,feat0,feat1,pred\n");
+			L"featReady,stale,convSeen,texConv,feat0,feat1,pred,dehaze\n");
 		fwprintf(m_pMLDebugFile, L"# debug on (ML enabled=%d, copy=%d)\n", (m_bML ? 1 : 0), (m_bMLDebugCopy ? 1 : 0));
 		fflush(m_pMLDebugFile);
 	}
@@ -2615,7 +2626,7 @@ void CDX11VideoProcessor::LogMLFrame()
 
 	fwprintf(m_pMLDebugFile,
 		L"%llu,%lld,%d,%d,%.4f,%.4f,%.4f,%d,%s,%d,%u,%d,%d,%d,%u,%u,%d,%d,%d,%d,"
-		L"%u,%u,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f\n",
+		L"%u,%u,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f\n",
 		m_MLDebugFrame,
 		(long long)m_rtStart,
 		(m_bMLActive ? 1 : 0),
@@ -2633,7 +2644,7 @@ void CDX11VideoProcessor::LogMLFrame()
 		(double)m_MLDebugLastAvg, (double)m_MLDebugLastClipF, (double)m_MLDebugLastEdgeF,
 		(m_bMLDebugCopy ? 1 : 0),
 		m_MLDebugFeatReady, m_MLDebugStale, m_MLDebugConvertSeen, m_MLDebugTexConv,
-		(double)m_MLDebugFeat0, (double)m_MLDebugFeat1, (double)m_MLDebugPred);
+		(double)m_MLDebugFeat0, (double)m_MLDebugFeat1, (double)m_MLDebugPred, (double)m_MLShadowDehazeApplied);
 	fflush(m_pMLDebugFile);
 }
 
@@ -6040,7 +6051,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	}
 
 	if (config.bMLEnabled != m_bML || config.iMLMode != m_iMLMode ||
-			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow ||
+			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow || config.fMLShadowDehaze != m_fMLShadowDehaze ||
 			config.fMLHighlight != m_fMLHighlight ||
 			config.bMLGammaEnabled != m_bMLGammaEnabled ||
 			config.bMLShadowEnabled != m_bMLShadowEnabled ||
@@ -6071,6 +6082,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_iMLMode      = config.iMLMode;
 		m_fMLGamma     = config.fMLGamma;
 		m_fMLShadow    = config.fMLShadow;
+		m_fMLShadowDehaze = config.fMLShadowDehaze;
 		m_fMLHighlight = config.fMLHighlight;
 		m_bMLToneCurveEnabled = config.bMLToneCurveEnabled;
 		m_bMLGammaEnabled   = config.bMLGammaEnabled;
