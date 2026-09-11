@@ -178,18 +178,20 @@ float4 main(PS_INPUT input) : SV_Target
 	// OFF by default (MLSkinPreserve = 0 → bit-identical).
 	if (MLSkinPersonStrength > 0.001 && MLSkinPreserve > 0.001 && MLSkinAnchor > 0.01f) {
 		// Blurred person gate: a raw mask edge would print the silhouettes into the
-		// tone field (discontinuity). Plus-shape blur over ~2 mask texels (~20+ px at
-		// 4K) makes the correction fade smoothly across the silhouette.
+		// tone field (discontinuity). Wide plus-blur (~3.5 mask texels, ~40 px at 4K)
+		// so the correction fades over a physically large span — bright-uniform
+		// backgrounds otherwise expose a residual seam at the silhouette.
 		uint mw, mh; sky_mask.GetDimensions(mw, mh);
-		const float2 mt = float2(1.0f / (float)mw, 1.0f / (float)mh) * 2.0f;
+		const float2 mt = float2(1.0f / (float)mw, 1.0f / (float)mh) * 3.5f;
 		const float Pa = sky_mask.Sample(sampSky, saturate(cuv + float2(-mt.x, 0.0f))).g;
 		const float Pb = sky_mask.Sample(sampSky, saturate(cuv + float2(mt.x, 0.0f))).g;
 		const float Pc = sky_mask.Sample(sampSky, saturate(cuv + float2(0.0f, -mt.y))).g;
 		const float Pd = sky_mask.Sample(sampSky, saturate(cuv + float2(0.0f, mt.y))).g;
 		const float Pe = sky_mask.Sample(sampSky, saturate(cuv)).g;
 		const float PbS = (0.25f * (Pa + Pb + Pc + Pd) + 0.5f * Pe) * inContent;
-		// Erode + soften: the fade sits INSIDE the silhouette (no outer halo).
-		const float P = smoothstep(0.10f, 0.72f, PbS);
+		// Erode + soften: the fade sits INSIDE the silhouette (no outer halo); the
+		// high plateau holds only deep inside so the boundary tail is long.
+		const float P = smoothstep(0.10f, 0.88f, PbS);
 		if (P > 0.005) {
 			float3 srcRGB = src_tex.Sample(sampSrc, saturate(cuv)).rgb;
 			float3 srcLin;
@@ -209,8 +211,8 @@ float4 main(PS_INPUT input) : SV_Target
 			float outLum = (IsPQ > 0.5) ? pow(max(dot(lin, luma_w), 0.0), 1.0f / 2.2f)
 			                            : dot(max(color.rgb, 0.0), luma_w);
 			float desired = clamp(MLSkinAnchor + (srcLum - MLSkinAnchor) * MLSkinPreserve, 0.0, 1.0);
-			float corr = clamp(desired - outLum, -0.12f, 0.12f);
-			I_norm = saturate(I_norm + corr * P * skinEv * MLSkinPersonStrength * 0.45f);
+			float corr = clamp(desired - outLum, -0.10f, 0.10f);
+			I_norm = saturate(I_norm + corr * P * skinEv * MLSkinPersonStrength * 0.32f);
 		}
 	}
 	ictcp.x = I_norm * I_peak;
