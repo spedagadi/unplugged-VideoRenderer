@@ -172,13 +172,14 @@ float4 main(PS_INPUT input) : SV_Target
 		const float inContent = (all(cuv >= 0.0) && all(cuv <= 1.0)) ? 1.0 : 0.0;
 		const float P = sky_mask.Sample(sampSky, saturate(cuv)).g * inContent;
 		// Person authority weight: mask × strength × preserve.
-		const float personW = saturate(P * MLSkinPersonStrength * MLSkinPreserve);
-		const float personScalar = lerp(luma_boost, 1.0, personW);
-		// Bridge legacy-LUT → person-authority continuously over the low end of
-		// the slider (preserve=0 stays exactly legacy; strength=0 → no authority).
-		const float bridge = saturate(P * MLSkinPersonStrength)
-		                   * smoothstep(0.0f, 0.10f, MLSkinPreserve);
-		chroma_scalar = lerp(chroma_scalar, personScalar, bridge);
+		// Anchor to the LEGACY chroma_scalar (LUT-suppressed boost), NOT the full
+		// luma_boost — anchoring to the full boost made the sweep non-monotonic on
+		// protected skin (0.5 raised saturation above the 0 value, then 1 dropped it
+		// below — read as "nothing happens"). This form is monotonic: on pixels the
+		// LUT already protects (scalar≈1.0) the range is small but correct; on the
+		// LUT-miss pixels (hair, graded/backlit skin) the sweep is the full 1.08→1.0.
+		const float personW = saturate(P * MLSkinPersonStrength) * MLSkinPreserve;
+		chroma_scalar = lerp(chroma_scalar, 1.0, personW);
 		chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);
 	}
 
