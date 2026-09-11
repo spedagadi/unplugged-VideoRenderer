@@ -2056,28 +2056,72 @@ void CDX11VideoProcessor::UpdateSkinAnchor(const uint8_t* bgra, UINT stride)
 
 void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 {
-	// Poisson-relaxed PERSON-mask gate for the gamma skin-tone leg (t4).
-	// Pure mask — NO skin LUT, NO EMA: the LUT caused shimmer, and the EMA masks
-	// caused the boundary to lag a moving person (the mask "follows with latency").
-	// Person inference already runs EVERY frame → feed the gate the RAW per-frame
-	// map so the boundary tracks the person exactly.
+	// Edge-pinned Poisson gate for the gamma skin-tone leg (t4) — the boundary is
+	// attached to the CURRENT-FRAME source luma, not to the (late under motion)
+	// semantic mask. This fixes both residual artifacts at once:
+	//   - under-coverage shimmer: when two hugging people separate, the mask edge
+	//     lands INSIDE the face (mask = late). No mask erode/smooth can fix that;
+	//     the source luma edge of the CURRENT frame is always right — so the tail
+	//     is held by anisotropic diffusion that BLOCKS on strong luma contours:
+	//     u stays ≈1 across the face up to the real silhouette, then falls. The
+	//     edge map is per-frame → no temporal wobble (no shimmer).
+	//   - rim glow on flat background: the plateau is eroded deep inside, the
+	//     zero-pin sits beyond a DILATED mask (+3 texels, so it is safely outside
+	//     the true boundary even when the mask lags), and conductivity is ~0
+	//     across strong edges → the whole brightness turn happens exactly at the
+	//     person's real contour, not on the background.
 	//
-	//   1) g = RAW personMask (640x360 → 2x2-max → 320x180)
-	//   2) Erode the plateau pin DEEP INSIDE the silhouette (3x3-min iterations):
-	//      u = 1.0 only where the erosed field shows solid interior — the harmonic
-	//      tail then bridges from THAT interior plateau to 0 at the true silhouette,
-	//      i.e. the whole brightness transition happens AGAINST PERSON PIXELS, not
-	//      against the background. At/just outside the real edge, u≈0 already, so
-	//      no glow can print on the background (the bright-daylight seam case).
-	//      u = 0.0 where the raw mask is clear (<= 0.05); everything between relaxes.
-	// Runs beside UpdateSkinAnchor in the seg block (every frame for person).
-	if (!m_SkinGate) return;
+	// Pins: u=1 where eroded-mask solid (er≥0.80); u=0 where dilated-mask clear
+	// (gDil≤0.05). Annulus between: ANISOTROPIC Jacobi, weights c=1/(1+(E/κ)²)
+	// where E = smoothed Sobel gradient of the source luma at gate resolution.
+	// Runs every frame for person (bgra = the 640x360 SDR-ized seg preview).
+	if (!m_SkinGate || !bgra) return;
 	const std::vector<uint8_t>& pm = m_LastPersonMap.empty() ? m_PersonMaskSm : m_LastPersonMap;
 	if (pm.size() != 640 * 360) return;
-	(void)bgra; (void)stride;   // mask-only gate; bgra/stride unused now
+
+	constexpr int GW = 320, GH = 180;   // half-res gate grid
+	constexpr float lw_r = 0.2126f, lw_g = 0.7152f, lw_b = 0.0722f;
+
+	// 1a) Source luma at gate resolution (2x2 average of the BGRA preview).
+	std::vector<float> lum(GW * GH, 0.0f);
+	for (int y = 0; y < 360; y += 2) {
+		const int gy = y / 2;
+		const uint8_t* p = bgra + (size_t)y * stride;
+		for (int x = 0; x < 640; x += 2) {
+			float s = 0; const int gx = x / 2;
+			for (int dy = 0; dy < 2; dy++) {
+				const uint8_t* q = p + (size_t)dy * stride;
+				for (int dx = 0; dx < 2; dx++) {
+					const uint8_t* c = q + (size_t)(x + dx) * 4;
+					s += lw_r * (c[2] / 255.0f) + lw_g * (c[1] / 255.0f) + lw_b * (c[0] / 255.0f);
+				}
+			}
+			lum[(size_t)gy * GW + gx] = s * 0.25f;
+		}
+	}
+	// 1b) Smoothed Sobel gradient magnitude -> edge conductivity.
+	std::vector<float> E(GW * GH, 0.0f);
+	for (int y = 1; y < GH - 1; y++)
+		for (int x = 1; x < GW - 1; x++) {
+			const size_t o = (size_t)y * GW + x;
+			const float gx = (lum[o - GW - 1] + 2 * lum[o - 1] + lum[o + GW - 1])
+			               - (lum[o - GW + 1] + 2 * lum[o + 1] + lum[o + GW + 1]);
+			const float gy = (lum[o - GW - 1] + 2 * lum[o - GW] + lum[o - GW + 1])
+			               - (lum[o + GW - 1] + 2 * lum[o + GW] + lum[o + GW + 1]);
+			E[o] = sqrtf(gx * gx + gy * gy);
+		}
+	{                                           // 3x3 box smooth of E to de-speckle
+		std::vector<float> Es = E;
+		for (int y = 1; y < GH - 1; y++)
+			for (int x = 1; x < GW - 1; x++) {
+				const size_t o = (size_t)y * GW + x;
+				E[o] = (Es[o - GW - 1] + Es[o - GW] + Es[o - GW + 1]
+				      + Es[o - 1]      + Es[o]      + Es[o + 1]
+				      + Es[o + GW - 1] + Es[o + GW] + Es[o + GW + 1]) * (1.0f / 9.0f);
+			}
+	}
 
 	// 1) Half-res gate seed = 2x2 max of the RAW per-frame person mask.
-	constexpr int GW = 320, GH = 180;   // half-res gate grid
 	std::vector<float> g(GW * GH, 0.0f);
 	for (int y = 0; y < 360; y += 2) {
 		for (int x = 0; x < 640; x += 2) {
@@ -2089,11 +2133,10 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 		}
 	}
 
-	// 2) Eroded plateau: 3x3-min iterations on the half-res grid. Each iteration
-	//    pulls the u=1 pin a gate texel (~2 source px) inside the silhouette, so
-	//    the brightness tail is forced to spend itself on the person's interior.
+	// 2) Eroded plateau pin: 3x3-min x ER — u=1 lives DEEP inside the silhouette,
+	//    so the brightness tail spends itself on the face interior.
 	std::vector<float> er = g, er2 = g;
-	constexpr int ER = 3;                    // 3 gate texels ≈ 6 raw px ≈ ~30-40 px at 4K
+	constexpr int ER = 3;
 	for (int it = 0; it < ER; it++) {
 		for (int y = 1; y < GH - 1; y++)
 			for (int x = 1; x < GW - 1; x++) {
@@ -2103,30 +2146,50 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 			}
 		er.swap(er2);
 	}
+	// 2b) Dilated zero-pin: 3x3-max x DIL — u=0 sits BEYOND the true boundary, so
+	//     under motion the gate covers the whole face instead of the stale mask.
+	std::vector<float> gDil = g, gD2 = g;
+	constexpr int DIL = 3;
+	for (int it = 0; it < DIL; it++) {
+		for (int y = 1; y < GH - 1; y++)
+			for (int x = 1; x < GW - 1; x++) {
+				const size_t o = (size_t)y * GW + x;
+				gD2[o] = std::max(std::max(gDil[o - GW], gDil[o + GW]),
+				                  std::max(std::max(gDil[o - 1], gDil[o + 1]), gDil[o]));
+			}
+		gDil.swap(gD2);
+	}
 
-	// 3) Solve: u = 1.0 where the ERODED plateau is solid (er ≥ 0.80, deep inside);
-	//    u = 0.0 where the RAW mask is already outside (g ≤ 0.05, at/just beyond the
-	//    true silhouette); the annulus between = the person's rim → HARMONIC (C1
-	//    tail that spends itself on the person's interior, see §2). Pins read the
-	//    FIXED seeds (g/er at the cell), never the live field, so the interior
-	//    magnitude follows the raw mask and can't be dragged by the solve.
+	// 2c) Edge-conductivity at the 4 neighbor faces (c = 1/(1+(E/κ)²); blocked
+	//     across strong luma contours → the tail CLAMPS to the person boundary).
+	const float kappa = 0.60f;
+	constexpr int cmin = 8;             // low-conductivity clamp (×1/8) — prevents
+	const float cLow = 1.0f / (float)cmin;   // numerically dead neighbors
+	auto cond = [&](size_t a, size_t b) {
+		float e = std::max(E[a], E[b]);
+		float c = 1.0f / (1.0f + (e / kappa) * (e / kappa));
+		return std::max(c, cLow);
+	};
+
+	// 3) Anisotropic Jacobi solve. Pins read the FIXED seeds (er/gDil at the cell),
+	//    never the live field → interior magnitude stays raw-mask-driven.
 	std::vector<float> u = g;
-	const int TW = GW + 2, TH = GH + 2;              // padded grid (zero ring)
+	const int TW = GW + 2, TH = GH + 2;
 	std::vector<float> pad(TW * TH, 0.0f), pad2(TW * TH, 0.0f);
 	for (int i = 0; i < GW * GH; i++) pad[(size_t)(i / GW + 1) * TW + (i % GW) + 1] = u[i];
-	constexpr int ITERS = 96;
-	for (int it = 0; it < ITERS; it++) {
+	for (int it = 0; it < 120; it++) {
 		pad2 = pad;
 		for (int y = 1; y <= GH; y++) {
 			for (int x = 1; x <= GW; x++) {
 				const size_t o = (size_t)y * TW + x;
 				const size_t gix = (size_t)(y - 1) * GW + (x - 1);
-				const float gv = g[gix];   // raw mask seed: the outside pin
-				const float ev = er[gix];  // eroded seed: the interior pin
-				// Dirichlet pins from the fixed seeds (never pad itself):
-				if (ev >= 0.80f)      { pad2[o] = 1.0f; continue; }   // solid interior
-				if (gv <= 0.05f)      { pad2[o] = 0.0f; continue; }   // clear exterior
-				pad2[o] = 0.25f * (pad[o - TW] + pad[o + TW] + pad[o - 1] + pad[o + 1]);
+				if (er[gix] >= 0.80f) { pad2[o] = 1.0f; continue; }   // solid interior
+				if (gDil[gix] <= 0.05f) { pad2[o] = 0.0f; continue; } // clear exterior
+				const float cn = cond(gix, gix - GW), cs = cond(gix, gix + GW);
+				const float ce = cond(gix, gix + 1),  cw = cond(gix, gix - 1);
+				const float den = cn + cs + ce + cw;
+				pad2[o] = (cn * pad[o - TW] + cs * pad[o + TW]
+				         + ce * pad[o + 1] + cw * pad[o - 1]) / den;
 			}
 		}
 		pad.swap(pad2);
@@ -2136,19 +2199,18 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 	// 4) Upload R8 to m_SkinGate (gamma t4): u in [0,1].
 	std::vector<uint8_t> out(GW * GH);
 	for (int i = 0; i < GW * GH; i++) {
-		float uv = u[i] * 255.0f;                    // already ~[0,1]; also clamp
+		float uv = u[i] * 255.0f;
 		out[i] = (uint8_t)(uv < 0.0f ? 0 : (uv > 255.0f ? 255 : (unsigned)uv));
 	}
 	D3D11_BOX box = { 0, 0, 0, GW, GH, 1 };
 	m_pDeviceContext->UpdateSubresource(m_SkinGate, 0, &box, out.data(), GW, 0);
 
 	if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 30 == 0) {
-		float sum = 0; long long cnt = 0;
-		for (int i = 0; i < GW * GH; i++) { sum += u[i]; if (u[i] > 0.01f) cnt++; }
-		fwprintf(m_pMLDebugFile, L"GATE u_mean=%.4f u_posFrac=%.4f g_peak=%.4f er_peak=%.4f\n",
+		float sum = 0; long long cnt = 0, eCnt = 0; float eSum = 0;
+		for (int i = 0; i < GW * GH; i++) { sum += u[i]; if (u[i] > 0.01f) cnt++; eSum += E[i]; if (E[i] > kappa) eCnt++; }
+		fwprintf(m_pMLDebugFile, L"GATE u_mean=%.4f u_posFrac=%.4f e_mean=%.4f e_strFrac=%.4f\n",
 			(float)(sum / (GW * GH)), (float)((double)cnt / (GW * GH)),
-			(double)*std::max_element(g.begin(), g.end()),
-			(double)*std::max_element(er.begin(), er.end()));
+			(float)(eSum / (GW * GH)), (float)((double)eCnt / (GW * GH)));
 		fflush(m_pMLDebugFile);
 	}
 }
