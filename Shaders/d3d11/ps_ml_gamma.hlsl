@@ -106,6 +106,51 @@ float srcLumAt(float2 uv)
 	return dot(max(r, 0.0), luma_w);
 }
 
+// Unified tone curve: shadow toe → gamma (sky-relaxed guard) → highlight rolloff →
+// sky cloud-band lift. Operates on I_norm; returns graded I_norm. `sky` = S *
+// MLSkyStrength (0 when sky features are off → exactly the global path). The base
+// path and the skin tone-preservation envelope share this so the person is graded
+// by the SAME curve as the background (no seam).
+float applyToneCurve(float x, float sky)
+{
+	// 1. Shadow toe: DV L2 offset pedestal lift — raises dark end toward knee
+	if (MLShadowToe > 0.005 && x < MLShadowKnee && x > 0.0) {
+		float t = 1.0 - x / max(MLShadowKnee, 0.01);
+		x += MLShadowToe * x * t * t;
+		x = saturate(x);
+	}
+
+	// 2. Gamma with a sky-relaxed guard leg. Both legs use the SAME curve family
+	// and differ only in the highlight guard, so they coincide below the guard band.
+	if (MLGamma != 1.0 && x > 0.001 && x < 0.999) {
+		float fade = smoothstep(0.08, 0.45, x);
+		float hi_g = smoothstep(MLGuard, 0.98, x);
+		float hi_s = smoothstep(MLSkyGuard, 0.98, x);
+		float p = pow(x, 1.0 / MLGamma);
+		float I_g = lerp(x, p, fade * (1.0 - hi_g));
+		float I_s = lerp(x, p, fade * (1.0 - hi_s));
+		x = lerp(I_g, I_s, sky);
+	}
+
+	// 3. Highlight rolloff — softened inside sky so the shoulder keeps the sky's
+	// luminance structure instead of crushing it.
+	if (abs(MLHighlightRolloff) > 0.005 && x > MLHighlightKnee && x < 0.995) {
+		float span = max(1.0 - MLHighlightKnee, 0.01);
+		float t = (x - MLHighlightKnee) / span;
+		float shoulder = MLHighlightRolloff * t * t * (1.0 - x);
+		float skyScale = 1.0 - 0.5 * sky;
+		x = saturate(x + shoulder * skyScale);
+	}
+
+	// 4. Sky cloud-band lift — range re-allocation inside sky.
+	{
+		float band = smoothstep(0.40f, 0.55f, x) * (1.0f - smoothstep(0.85f, 0.95f, x));
+		x += sky * 0.06f * band;
+		x = saturate(x);
+	}
+	return x;
+}
+
 float4 main(PS_INPUT input) : SV_Target
 {
 	float4 color = tex.Sample(samp, input.Tex);
@@ -138,55 +183,18 @@ float4 main(PS_INPUT input) : SV_Target
 	float S = (MLSkyStrength > 0.001) ? rawS : 0.0f;
 
 	// === UNIFIED TONE CURVE (shadow toe → gamma → highlight rolloff) ===
+	// One shared curve grades the frame AND the skin tone-preservation envelope
+	// (applyToneCurve below) — S=0 reproduces the global path exactly.
+	const float skyT = S * MLSkyStrength;
+	I_norm = applyToneCurve(I_norm, skyT);
 
-	// 1. Shadow toe: DV L2 offset pedestal lift — raises dark end toward knee
-	if (MLShadowToe > 0.005 && I_norm < MLShadowKnee && I_norm > 0.0) {
-		float t = 1.0 - I_norm / max(MLShadowKnee, 0.01);
-		I_norm += MLShadowToe * I_norm * t * t;
-		I_norm = saturate(I_norm);
-	}
-
-	// 2. Gamma with a sky-relaxed guard leg. Both legs use the SAME curve
-	// family and differ only in the highlight guard, so they coincide below
-	// the guard band (no seam) and S=0 reproduces the global path exactly.
-	float l2_gamma = MLGamma;
-	if (l2_gamma != 1.0 && I_norm > 0.001 && I_norm < 0.999) {
-		float fade = smoothstep(0.08, 0.45, I_norm);
-		float hi_g = smoothstep(MLGuard, 0.98, I_norm);
-		float hi_s = smoothstep(MLSkyGuard, 0.98, I_norm);
-		float p = pow(I_norm, 1.0 / l2_gamma);
-		float I_g = lerp(I_norm, p, fade * (1.0 - hi_g));
-		float I_s = lerp(I_norm, p, fade * (1.0 - hi_s));
-		I_norm = lerp(I_g, I_s, S * MLSkyStrength);
-	}
-
-	// 3. Highlight rolloff — softened inside sky so the shoulder keeps the
-	// sky's luminance structure instead of crushing it.
-	if (abs(MLHighlightRolloff) > 0.005 && I_norm > MLHighlightKnee && I_norm < 0.995) {
-		float span = max(1.0 - MLHighlightKnee, 0.01);
-		float t = (I_norm - MLHighlightKnee) / span;
-		float shoulder = MLHighlightRolloff * t * t * (1.0 - I_norm);
-		float skyScale = 1.0 - 0.5 * S * MLSkyStrength;
-		I_norm = saturate(I_norm + shoulder * skyScale);
-	}
-
-	// 4. Sky cloud-band lift: the guard-only leg cannot reach I < MLSkyGuard,
-	// which is exactly where clouds live — so give the upper-mid luma band a
-	// small extra allocation inside sky. Range re-allocation, not re-curving.
-	{
-		float band = smoothstep(0.40f, 0.55f, I_norm) * (1.0f - smoothstep(0.85f, 0.95f, I_norm));
-		I_norm += S * MLSkyStrength * 0.06f * band;
-		I_norm = saturate(I_norm);
-	}
-
-	// Face blending disabled — testing pure ICtCp output
-	float skin_blend = 0.0;
-
-	// Skin tone-preservation (stage 5): steer the WHOLE person region's luma toward
-	// the source skin tone. Gate = PERSON mask (bilinear → spatially smooth, no
-	// skin-LUT boundaries → no hot spots/patches). The skin subset only defines
-	// the target: MLSkinAnchor (CPU IIR skin-set mean source luma). Bounded, and
-	// OFF by default (MLSkinPreserve = 0 → bit-identical).
+	// Skin tone-preservation (stage 5): frequency separation on the person region.
+	// The tone curve stays on the base everywhere; inside the person we grade the
+	// SOURCE ENVELOPE with the same curve and replay the source's bounded local
+	// contrast at full strength — the person keeps its source tone/shading instead
+	// of inheriting the tone curve's luma displacement. Gate = PERSON mask (bilinear
+	// → spatially smooth), soft skin-LUT evidence weights the detail. OFF by default.
+	// MLSkinAnchor (CPU IIR) is retained for SKINMET telemetry only.
 	if (MLSkinPersonStrength > 0.001 && MLSkinPreserve > 0.001 && MLSkinAnchor > 0.01f) {
 		// Blurred person gate: a raw mask edge would print the silhouettes into the
 		// tone field (discontinuity). Wide plus-blur (~3.5 mask texels, ~40 px at 4K)
@@ -218,12 +226,10 @@ float4 main(PS_INPUT input) : SV_Target
 				(sg22.b - sy) / 1.8556f - MLSkinLUTCB0) / float2(
 				MLSkinLUTCR1 - MLSkinLUTCR0, MLSkinLUTCB1 - MLSkinLUTCB0));
 			const float skinEv = smoothstep(0.25f, 0.70f, skin_lut.Sample(sampSkin, skuv).r);
-			float srcLum = sy;
-			// Ratio-injection (stage 5, restart): tone-mapped base EVERYWHERE (no
-			// seam), plus the SOURCE's local-contrast pattern replayed on the person.
-			// base = wide envelope of the source (crude 5-tap, ~22 full-res px);
-			// ratio = srcLum/base → speculars, brow/subsurface shading, fine texture.
-			// detailW = gate × soft skin evidence × strength × preserve (linear).
+			const float srcLum = sy;
+			// SOURCE ENVELOPE (base): wide center-weighted 9-tap corner-plus. The ratio
+			// srcLum/baseSrc is the source's own local-contrast pattern — speculars,
+			// brow/subsurface shading, fine texture — DC-free by construction.
 			uint sw_, sh_; src_tex.GetDimensions(sw_, sh_);
 			const float2 stx = float2(1.0f / (float)sw_, 1.0f / (float)sh_) * 28.0f;
 			const float b1 = srcLumAt(cuv + float2(stx.x, 0.0f));
@@ -234,15 +240,23 @@ float4 main(PS_INPUT input) : SV_Target
 			const float b6 = srcLumAt(cuv - float2(stx.x, stx.y));
 			const float b7 = srcLumAt(cuv + float2(-stx.x, stx.y));
 			const float b8 = srcLumAt(cuv - float2(-stx.x, stx.y));
-			// envelope = center-weighted 9-tap corner-plus (smoother base -> less ripple)
 			const float baseSrc = (4.0f * srcLum + 2.0f * (b1 + b2 + b3 + b4) + (b5 + b6 + b7 + b8)) * (1.0f / 16.0f);
-			// Soft-curve compressor in log space (the MC-proven form): the ratio can be
-			// huge on speculars, but |logr|/(1+|logr|) saturates -> max ~±30% excursion,
-			// so full preserve can never hotspot or crater the skin luma.
+			// Bounded source-contrast ratio (soft-curve compressor — the MC-proven form):
+			// on speculars log(src/base) explodes, but |logr|/(1+|logr|) saturates, so
+			// full preserve can never hotspot/crater the skin (max ~×1.45 / ×0.66).
 			const float logr = clamp(log(srcLum / max(baseSrc, 1e-4f)), -1.0f, 1.0f);
-			const float comp = logr / (1.0f + abs(logr));
+			const float ratio = exp(0.75f * logr / (1.0f + abs(logr)));
+			// TRUE frequency separation: grade the SOURCE ENVELOPE with the SAME tone
+			// curve as the background (seamless — the person's mean rides the global
+			// mapping), then replay the source contrast at full strength under it. The
+			// envelope has no RGB, so linearize its gamma-2.2 luma as neutral chroma.
+			float baseLin = (IsPQ > 0.5) ? (400.0f * pow(saturate(baseSrc), 2.2f))
+			                             : (pow(saturate(baseSrc), 2.2f) * SDR_PEAK_NITS);
+			const float baseI = linear_to_ictcp(float3(baseLin, baseLin, baseLin)).x;
+			const float baseT = applyToneCurve(saturate(baseI / I_peak), skyT);
+			// detailW = gate × soft skin evidence × person weight × preserve (0 → identity)
 			const float detailW = P * skinEv * MLSkinPersonStrength * MLSkinPreserve;
-			I_norm = saturate(I_norm * exp(detailW * 0.55f * comp));
+			I_norm = lerp(I_norm, saturate(baseT * ratio), detailW);
 		}
 	}
 	ictcp.x = I_norm * I_peak;
