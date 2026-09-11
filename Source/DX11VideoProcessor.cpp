@@ -2056,57 +2056,37 @@ void CDX11VideoProcessor::UpdateSkinAnchor(const uint8_t* bgra, UINT stride)
 
 void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 {
-	// Poisson-relaxed person×skin gate for the gamma skin-tone leg (t4).
-	// The naive gate (mask ramp) has a hard spatial step at the silhouette →
-	// a brightness seam wherever person and background meet. Instead we solve a
-	// Laplace BVP whose solution u is C1-smooth:
-	//   1) g = personMask × skinEvidence  (640x360, mask × LUT)
-	//   2) pool to 320x180
-	//   3) Dirichlet + FREE-RELAX boundary: u = 1.0 deep inside (g >= 0.80),
+	// Poisson-relaxed PERSON-mask gate for the gamma skin-tone leg (t4).
+	// Pure mask — NO skin LUT: the LUT evidence made the gate plateau spatially
+	// noisy and re-morph at ~10 fps cadence (shimmer). A uniform mask plateau is
+	// temporally stable, and the Laplace solve still gives the seamless C1 tail:
+	//   1) g = personMask  (640x360, downsampled 2x2-max → 320x180)
+	//   2) Dirichlet + FREE-RELAX boundary: u = 1.0 deep inside (g >= 0.80),
 	//      u = 0.0 clearly outside (g <= 0.05), everything between HARMONIC
-	//      (Jacobi → analytic tail) — the correction now turns on with
-	//      gradient continuity, so no luma step at any strength.
-	// Runs beside UpdateSkinAnchor in the seg block (~person cadence). If nothing
-	// to gate or the texture isn't ready, the upload keeps the last field (or zero).
-	if (!bgra || m_SkinLutN <= 0 || !m_SkinGate) return;
+	//      (Jacobi → analytic tail) — the correction turns on with gradient
+	//      continuity, so no luma step at any strength.
+	// Runs beside UpdateSkinAnchor in the seg block (~person cadence).
+	if (!m_SkinGate) return;
 	const std::vector<uint8_t>& pm = m_PersonMaskSm.empty() ? m_LastPersonMap : m_PersonMaskSm;
 	if (pm.size() != 640 * 360) return;
-	const int N = m_SkinLutN;
-	const float cr0 = m_fSkinLUTCR0, cr1 = m_fSkinLUTCR1, cb0 = m_fSkinLUTCB0, cb1 = m_fSkinLUTCB1;
 
-	// 1) Full-res evidence field (reuses the SKINMET LUT bilinear; masked to person).
+	// 1) Half-res gate seed = 2x2 max of the EMA-smoothed person mask.
 	constexpr int GW = 320, GH = 180;   // half-res gate grid
 	std::vector<float> g(GW * GH, 0.0f);
-	const int kro = 2;                  // stride over 640x360 (every 2nd pixel; 320x180 taps)
 	for (int y = 0; y < 360; y += 2) {
 		for (int x = 0; x < 640; x += 2) {
-			const float mask = pm[(size_t)y * 640 + x] / 255.0f;
-			if (mask <= 0.01f) continue;
-			const uint8_t* p = bgra + (size_t)y * stride + (size_t)x * 4;
-			const float r = p[2] / 255.0f, gr = p[1] / 255.0f, b = p[0] / 255.0f;
-			const float Y = 0.2126f * r + 0.7152f * gr + 0.0722f * b;
-			const float cr = (r - Y) / 1.5748f, cb = (b - Y) / 1.8556f;
-			const float uu = (cr - cr0) / (cr1 - cr0), vv = (cb - cb0) / (cb1 - cb0);
-			float lutW = 0.0f;
-			if (uu >= 0.0f && uu <= 1.0f && vv >= 0.0f && vv <= 1.0f) {
-				const float fu = uu * (N - 1), fv = vv * (N - 1);
-				const int iu = (int)fu, iv = (int)fv, iu1 = std::min(N - 1, iu + 1), iv1 = std::min(N - 1, iv + 1);
-				const float wu = fu - iu, wv = fv - iv;
-				const auto L = [&](int ci, int ri) { return (float)m_SkinLutCpu[(size_t)ri * N + ci] / 255.0f; };
-				lutW = L(iu, iv) * (1 - wu) * (1 - wv) + L(iu1, iv) * wu * (1 - wv)
-					 + L(iu, iv1) * (1 - wu) * wv + L(iu1, iv1) * wu * wv;
-			}
-			// same soft skin evidence as the old shader (concentrates on skin,
-			// kills hair/clothing/mirror); g = mask × evidence
-			const float skinEv = std::max(0.0f, std::min(1.0f, (lutW - 0.25f) / (0.70f - 0.25f)));
-			g[(size_t)(y / 2) * GW + (x / 2)] = std::max(g[(size_t)(y / 2) * GW + (x / 2)], mask * skinEv);
+			const float m11 = pm[(size_t)y * 640 + x] / 255.0f;
+			const float m12 = pm[(size_t)y * 640 + std::min(639, x + 1)] / 255.0f;
+			const float m21 = pm[(size_t)std::min(359, y + 1) * 640 + x] / 255.0f;
+			const float m22 = pm[(size_t)std::min(359, y + 1) * 640 + std::min(639, x + 1)] / 255.0f;
+			g[(size_t)(y / 2) * GW + (x / 2)] = std::max(std::max(m11, m12), std::max(m21, m22));
 		}
 	}
 
 	// 2) Solve: u = 1.0 on the interior plateau (g≥0.8), 0.0 far outside (g≤0.05),
 	//    HARMONIC between (Jacobi averaging → C1 tail, no spatial step).
+	(void)bgra; (void)stride;   // mask-only gate; bgra/stride unused now
 	std::vector<float> u = g;
-	std::vector<float> u2 = u;
 	const int TW = GW + 2, TH = GH + 2;              // padded grid (zero ring)
 	std::vector<float> pad(TW * TH, 0.0f), pad2(TW * TH, 0.0f);
 	for (int i = 0; i < GW * GH; i++) pad[(size_t)(i / GW + 1) * TW + (i % GW) + 1] = u[i];

@@ -186,13 +186,13 @@ float4 main(PS_INPUT input) : SV_Target
 	I_norm = applyToneCurve(I_norm, skyT);
 
 	// Skin tone-preservation (stage 5): steer the WHOLE person region's luma back
-	// toward the source skin tone. The gate is a POISSON-RELAXED field (t4): 1 on a
-	// safe plateau deep inside the person·skin region, 0 outside, and the harmonic
-	// tail between is C1-smooth — so the correction has NO spatial step at the
-	// silhouette (the seam is gone at any strength), while the interior keeps the
-	// full strength-scaled re-anchor (the visible sweep is back). skinEv (LUT) is
-	// folded into the CPU-built gate, so it concentrates on skin, not hair/clothing.
-	// OFF by default (MLSkinPreserve = 0 → bit-identical legacy).
+	// toward the source skin tone. The gate is a POISSON-RELAXED FIELD of the pure
+	// person mask (t4, built CPU-side in UpdateSkinGate — NO skin LUT): 1 on a
+	// safe plateau deep inside the person, 0 outside, and the harmonic tail
+	// between is C1-smooth — no spatial step at the silhouette (seam gone at any
+	// strength), interior keeps the full strength-scaled re-anchor (visible sweep).
+	// OFF by default (MLSkinPreserve = 0 → bit-identical legacy); src_tex (t3)
+	// still supplies the per-pixel source luma for the desired target.
 	if (MLSkinPersonStrength > 0.001 && MLSkinPreserve > 0.001 && MLSkinAnchor > 0.01f) {
 		const float u = skin_gate.Sample(sampGate, saturate(cuv)).r * inContent;
 		if (u > 0.005) {
