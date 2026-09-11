@@ -225,15 +225,24 @@ float4 main(PS_INPUT input) : SV_Target
 			// ratio = srcLum/base → speculars, brow/subsurface shading, fine texture.
 			// detailW = gate × soft skin evidence × strength × preserve (linear).
 			uint sw_, sh_; src_tex.GetDimensions(sw_, sh_);
-			const float2 stx = float2(1.0f / (float)sw_, 1.0f / (float)sh_) * 22.0f;
+			const float2 stx = float2(1.0f / (float)sw_, 1.0f / (float)sh_) * 28.0f;
 			const float b1 = srcLumAt(cuv + float2(stx.x, 0.0f));
 			const float b2 = srcLumAt(cuv - float2(stx.x, 0.0f));
 			const float b3 = srcLumAt(cuv + float2(0.0f, stx.y));
 			const float b4 = srcLumAt(cuv - float2(0.0f, stx.y));
-			const float baseSrc = (2.0f * srcLum + b1 + b2 + b3 + b4) * (1.0f / 6.0f);
-			const float ratio = clamp(srcLum / max(baseSrc, 1e-4f), 0.4f, 2.5f);
+			const float b5 = srcLumAt(cuv + float2(stx.x, stx.y));
+			const float b6 = srcLumAt(cuv - float2(stx.x, stx.y));
+			const float b7 = srcLumAt(cuv + float2(-stx.x, stx.y));
+			const float b8 = srcLumAt(cuv - float2(-stx.x, stx.y));
+			// envelope = center-weighted 9-tap corner-plus (smoother base -> less ripple)
+			const float baseSrc = (4.0f * srcLum + 2.0f * (b1 + b2 + b3 + b4) + (b5 + b6 + b7 + b8)) * (1.0f / 16.0f);
+			// Soft-curve compressor in log space (the MC-proven form): the ratio can be
+			// huge on speculars, but |logr|/(1+|logr|) saturates -> max ~±30% excursion,
+			// so full preserve can never hotspot or crater the skin luma.
+			const float logr = clamp(log(srcLum / max(baseSrc, 1e-4f)), -1.0f, 1.0f);
+			const float comp = logr / (1.0f + abs(logr));
 			const float detailW = P * skinEv * MLSkinPersonStrength * MLSkinPreserve;
-			I_norm = saturate(I_norm * pow(ratio, detailW));
+			I_norm = saturate(I_norm * exp(detailW * 0.55f * comp));
 		}
 	}
 	ictcp.x = I_norm * I_peak;
