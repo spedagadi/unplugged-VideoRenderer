@@ -301,11 +301,16 @@ bool CPersonSeg::DetectPersons(const uint8_t* bgra, int width, int height, int s
         for (size_t p = 0; p < n160; p++)
             m_mask160[p] = Sigmoid(m_mask160[p]);
 
-        // upscale to model res, threshold, OR into the union map
+        // upscale to model res, threshold, OR into the union map.
+        // LOW threshold (0.25 vs the naive 0.5): the mask becomes an OVER-inclusive
+        // prior — under complex interactions (a hug, people separating) it fattens
+        // around the true bodies, so it can never under-cover a face mid-motion.
+        // The tone gate's edge-pin (UpdateSkinGate) does the fine boundary, so the
+        // added spill is clamped by the source luma, not printed by the mask.
         BilinearResize(m_mask160.data(), protoW, protoH, m_mask640.data(), mW, mH);
         for (int y = iy1; y < iy2; y++)
             for (int xx = ix1; xx < ix2; xx++)
-                if (m_mask640[(size_t)y * mW + xx] > 0.5f)
+                if (m_mask640[(size_t)y * mW + xx] > 0.25f)
                     m_map640[(size_t)y * mW + xx] = 255;
     }
 

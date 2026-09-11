@@ -2133,10 +2133,12 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 		}
 	}
 
-	// 2) Eroded plateau pin: 3x3-min x ER — u=1 lives DEEP inside the silhouette,
-	//    so the brightness tail spends itself on the face interior.
+	// 2) Eroded plateau pin: 3x3-min x ER — u=1 lives DEEP INSIDE the silhouette, so
+	//    the brightness tail spends itself on the face interior. ER=5 (deeper than
+	//    the first edge-pin pass) so under a hug the boundary turns well inside the
+	//    person AND the low-threshold fat mask can never poke through.
 	std::vector<float> er = g, er2 = g;
-	constexpr int ER = 3;
+	constexpr int ER = 5;
 	for (int it = 0; it < ER; it++) {
 		for (int y = 1; y < GH - 1; y++)
 			for (int x = 1; x < GW - 1; x++) {
@@ -2149,7 +2151,7 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 	// 2b) Dilated zero-pin: 3x3-max x DIL — u=0 sits BEYOND the true boundary, so
 	//     under motion the gate covers the whole face instead of the stale mask.
 	std::vector<float> gDil = g, gD2 = g;
-	constexpr int DIL = 3;
+	constexpr int DIL = 4;
 	for (int it = 0; it < DIL; it++) {
 		for (int y = 1; y < GH - 1; y++)
 			for (int x = 1; x < GW - 1; x++) {
@@ -2162,8 +2164,10 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 
 	// 2c) Edge-conductivity at the 4 neighbor faces (c = 1/(1+(E/κ)²); blocked
 	//     across strong luma contours → the tail CLAMPS to the person boundary).
-	const float kappa = 0.60f;
-	constexpr int cmin = 8;             // low-conductivity clamp (×1/8) — prevents
+	//     κ lowered 0.60→0.45: softer contours (jaw, ear in shadow) now also block,
+	//     so the gate clings tighter to the real silhouette under closeup motion.
+	const float kappa = 0.45f;
+	constexpr int cmin = 6;             // low-conductivity clamp (×1/6) — prevents
 	const float cLow = 1.0f / (float)cmin;   // numerically dead neighbors
 	auto cond = [&](size_t a, size_t b) {
 		float e = std::max(E[a], E[b]);
@@ -2171,13 +2175,15 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 		return std::max(c, cLow);
 	};
 
-	// 3) Anisotropic Jacobi solve. Pins read the FIXED seeds (er/gDil at the cell),
-	//    never the live field → interior magnitude stays raw-mask-driven.
+	// 3) Anisotropic Jacobi solve (200 iters — stronger Poisson, so any residual
+	//    mask-edge pattern is fully dissolved into the smooth field). Pins read the
+	//    FIXED seeds (er/gDil at the cell), never the live field → interior
+	//    magnitude stays raw-mask-driven.
 	std::vector<float> u = g;
 	const int TW = GW + 2, TH = GH + 2;
 	std::vector<float> pad(TW * TH, 0.0f), pad2(TW * TH, 0.0f);
 	for (int i = 0; i < GW * GH; i++) pad[(size_t)(i / GW + 1) * TW + (i % GW) + 1] = u[i];
-	for (int it = 0; it < 120; it++) {
+	for (int it = 0; it < 200; it++) {
 		pad2 = pad;
 		for (int y = 1; y <= GH; y++) {
 			for (int x = 1; x <= GW; x++) {
