@@ -1920,17 +1920,19 @@ HRESULT CDX11VideoProcessor::CreateSkyMaskTexture()
 
 void CDX11VideoProcessor::CreateSkinGateTexture()
 {
-	// 320x180 R8_UNORM — the half-res Poisson-relaxed person×skin gate consumed on
-	// gamma t4. CPU-written every person-cadence update (m_SkinGate == 0 = first
-	// create; release then recreate so a device reset re-builds it cleanly).
+	// 160x90 R8_UNORM — the quarter-res Poisson-relaxed person gate consumed on
+	// gamma t4. CPU-written every person-cadence update; released + recreated on
+	// device reset. Kept small: the field is smooth and bilinearly sampled, so
+	// half-resolution of the old 320x180 grid is visually identical but ~4x
+	// cheaper per solve iteration (kills per-frame stutter).
 	if (!m_pDevice) return;
 	m_SkinGate.Release();
 	m_SkinGateSRV.Release();
 	m_pSamplerGate.Release();
 
 	D3D11_TEXTURE2D_DESC desc = {};
-	desc.Width = 320;
-	desc.Height = 180;
+	desc.Width = 160;
+	desc.Height = 90;
 	desc.MipLevels = 1;
 	desc.ArraySize = 1;
 	desc.Format = DXGI_FORMAT_R8_UNORM;
@@ -1938,8 +1940,8 @@ void CDX11VideoProcessor::CreateSkinGateTexture()
 	desc.Usage = D3D11_USAGE_DEFAULT;
 	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-	std::vector<uint8_t> zero(320 * 180, 0);
-	D3D11_SUBRESOURCE_DATA init = { zero.data(), (UINT)320, 0 };
+	std::vector<uint8_t> zero(160 * 90, 0);
+	D3D11_SUBRESOURCE_DATA init = { zero.data(), (UINT)160, 0 };
 	if (FAILED(m_pDevice->CreateTexture2D(&desc, &init, &m_SkinGate))) return;
 	if (FAILED(m_pDevice->CreateShaderResourceView(m_SkinGate, nullptr, &m_SkinGateSRV))) return;
 
@@ -2134,24 +2136,27 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 	const std::vector<uint8_t>& pm = m_LastPersonMap.empty() ? m_PersonMaskSm : m_LastPersonMap;
 	if (pm.size() != 640 * 360) return;
 
-	constexpr int GW = 320, GH = 180;   // half-res gate grid
+	constexpr int GW = 160, GH = 90;   // quarter-res gate grid (4x fewer cells than
+									// 320x180 — the gate is a smooth field sampled
+									// bilinearly, so this is visually identical but
+									// ~4x cheaper per Jacobi iteration)
 	constexpr float lw_r = 0.2126f, lw_g = 0.7152f, lw_b = 0.0722f;
 
-	// 1a) Source luma at gate resolution (2x2 average of the BGRA preview).
+	// 1a) Source luma at gate resolution (4x4 average of the BGRA preview).
 	std::vector<float> lum(GW * GH, 0.0f);
-	for (int y = 0; y < 360; y += 2) {
-		const int gy = y / 2;
+	for (int y = 0; y < 360; y += 4) {
+		const int gy = y / 4;
 		const uint8_t* p = bgra + (size_t)y * stride;
-		for (int x = 0; x < 640; x += 2) {
-			float s = 0; const int gx = x / 2;
-			for (int dy = 0; dy < 2; dy++) {
+		for (int x = 0; x < 640; x += 4) {
+			float s = 0; const int gx = x / 4;
+			for (int dy = 0; dy < 4; dy++) {
 				const uint8_t* q = p + (size_t)dy * stride;
-				for (int dx = 0; dx < 2; dx++) {
+				for (int dx = 0; dx < 4; dx++) {
 					const uint8_t* c = q + (size_t)(x + dx) * 4;
 					s += lw_r * (c[2] / 255.0f) + lw_g * (c[1] / 255.0f) + lw_b * (c[0] / 255.0f);
 				}
 			}
-			lum[(size_t)gy * GW + gx] = s * 0.25f;
+			lum[(size_t)gy * GW + gx] = s * (1.0f / 16.0f);
 		}
 	}
 	// 1b) Smoothed Sobel gradient magnitude -> edge conductivity.
@@ -2176,24 +2181,35 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 			}
 	}
 
-	// 1) Half-res gate seed = 2x2 max of the RAW per-frame person mask.
+	// 1) Half-res gate seed = 4x4 max of the RAW per-frame person mask.
 	std::vector<float> g(GW * GH, 0.0f);
-	for (int y = 0; y < 360; y += 2) {
-		for (int x = 0; x < 640; x += 2) {
-			const float m11 = pm[(size_t)y * 640 + x] / 255.0f;
-			const float m12 = pm[(size_t)y * 640 + std::min(639, x + 1)] / 255.0f;
-			const float m21 = pm[(size_t)std::min(359, y + 1) * 640 + x] / 255.0f;
-			const float m22 = pm[(size_t)std::min(359, y + 1) * 640 + std::min(639, x + 1)] / 255.0f;
-			g[(size_t)(y / 2) * GW + (x / 2)] = std::max(std::max(m11, m12), std::max(m21, m22));
+	bool anyPerson = false;
+	for (int y = 0; y < 360; y += 4) {
+		for (int x = 0; x < 640; x += 4) {
+			float mx = 0.0f;
+			for (int dy = 0; dy < 4 && (y + dy) < 360; dy++)
+				for (int dx = 0; dx < 4 && (x + dx) < 640; dx++)
+					mx = std::max(mx, pm[(size_t)(y + dy) * 640 + (x + dx)] / 255.0f);
+			g[(size_t)(y / 4) * GW + (x / 4)] = mx;
+			if (mx > 0.01f) anyPerson = true;
 		}
 	}
 
+	// 1z) No person on screen (empty scene / cut-to-no-one): skip the solve, leave
+	//     a zero gate — nothing to blend and no stutter spent solving it.
+	if (!anyPerson) {
+		std::vector<uint8_t> out(GW * GH, 0);
+		D3D11_BOX box = { 0, 0, 0, GW, GH, 1 };
+		m_pDeviceContext->UpdateSubresource(m_SkinGate, 0, &box, out.data(), GW, 0);
+		return;
+	}
+
 	// 2) Eroded plateau pin: 3x3-min x ER — u=1 lives DEEP INSIDE the silhouette, so
-	//    the brightness tail spends itself on the face interior. ER=5 (deeper than
-	//    the first edge-pin pass) so under a hug the boundary turns well inside the
-	//    person AND the low-threshold fat mask can never poke through.
+	//    the brightness tail spends itself on the face interior. ER=3 at 160x90
+	//    (= 12 src px, matching the 320x180 ER=5 footprint of ~10 px, so the visual
+	//    behavior is preserved at the coarser grid).
 	std::vector<float> er = g, er2 = g;
-	constexpr int ER = 5;
+	constexpr int ER = 3;
 	for (int it = 0; it < ER; it++) {
 		for (int y = 1; y < GH - 1; y++)
 			for (int x = 1; x < GW - 1; x++) {
@@ -2206,7 +2222,7 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 	// 2b) Dilated zero-pin: 3x3-max x DIL — u=0 sits BEYOND the true boundary, so
 	//     under motion the gate covers the whole face instead of the stale mask.
 	std::vector<float> gDil = g, gD2 = g;
-	constexpr int DIL = 4;
+	constexpr int DIL = 2;
 	for (int it = 0; it < DIL; it++) {
 		for (int y = 1; y < GH - 1; y++)
 			for (int x = 1; x < GW - 1; x++) {
@@ -2219,9 +2235,11 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 
 	// 2c) Edge-conductivity at the 4 neighbor faces (c = 1/(1+(E/κ)²); blocked
 	//     across strong luma contours → the tail CLAMPS to the person boundary).
-	//     κ lowered 0.60→0.45: softer contours (jaw, ear in shadow) now also block,
-	//     so the gate clings tighter to the real silhouette under closeup motion.
-	const float kappa = 0.45f;
+	//     Cells are 4 src px wide now (was 2), so a soft edge's Sobel reading is
+	//     ~2x — κ scaled 0.45→0.90 to keep the SAME physical clamping (the "good"
+	//     behavior verified at 320x180) at the coarser grid. Clamps tightest where
+	//     the person's real contour is; softer contours in shadow still block.
+	const float kappa = 0.90f;
 	constexpr int cmin = 6;             // low-conductivity clamp (×1/6) — prevents
 	const float cLow = 1.0f / (float)cmin;   // numerically dead neighbors
 	auto cond = [&](size_t a, size_t b) {
@@ -2230,15 +2248,16 @@ void CDX11VideoProcessor::UpdateSkinGate(const uint8_t* bgra, UINT stride)
 		return std::max(c, cLow);
 	};
 
-	// 3) Anisotropic Jacobi solve (200 iters — stronger Poisson, so any residual
-	//    mask-edge pattern is fully dissolved into the smooth field). Pins read the
-	//    FIXED seeds (er/gDil at the cell), never the live field → interior
-	//    magnitude stays raw-mask-driven.
+	// 3) Anisotropic Jacobi solve (100 iters at 160x90 = the same physical tail reach
+//    as 200 at 320x180 — each coarse cell diffuses 2x the distance, so half the
+//    iterations dissolve the same residual mask-edge pattern). Pins read the FIXED
+//    seeds (er/gDil at the cell), never the live field → interior magnitude stays
+//    raw-mask-driven.
 	std::vector<float> u = g;
 	const int TW = GW + 2, TH = GH + 2;
 	std::vector<float> pad(TW * TH, 0.0f), pad2(TW * TH, 0.0f);
 	for (int i = 0; i < GW * GH; i++) pad[(size_t)(i / GW + 1) * TW + (i % GW) + 1] = u[i];
-	for (int it = 0; it < 200; it++) {
+	for (int it = 0; it < 100; it++) {
 		pad2 = pad;
 		for (int y = 1; y <= GH; y++) {
 			for (int x = 1; x <= GW; x++) {

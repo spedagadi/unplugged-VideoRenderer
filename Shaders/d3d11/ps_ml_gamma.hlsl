@@ -13,7 +13,7 @@ Texture2D sky_mask : register(t2);   // 640x360 R8G8 semseg (R=sky, G=person)
 SamplerState sampSky : register(s2);
 Texture2D src_tex : register(t3);    // pre-grade source (convert output) for the skin tone leg
 SamplerState sampSrc : register(s3);
-Texture2D skin_gate : register(t4);  // 320x180 R8 Poisson-relaxed person×skin gate (C1 -> 0)
+Texture2D skin_gate : register(t4);  // 160x90 R8 Poisson-relaxed person×skin gate (C1 -> 0)
 SamplerState sampGate : register(s4);
 
 struct PS_INPUT
