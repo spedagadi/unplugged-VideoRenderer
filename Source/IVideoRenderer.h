@@ -164,6 +164,7 @@ struct Settings_t {
 	bool  bMLShadowEnabled = true;
 	float fMLShadow = 2.0f;      // shadow strength: 0=Off 1=Low 2=Med 3=High 4=VHi 5=Saturate
 	float fMLShadowDehaze = 0.0f; // 0..1 scale DOWN the model's shadow-toe lift (lifted-black haze control); 0 = model as-is
+	float fMLHighlightRolloffCtrl = 0.0f; // model-override: signed offset added to the model's rolloff in Auto (rim highlight softening); 0 = model as-is
 	bool  bMLHighlightEnabled = true;
 	float fMLHighlight = 0.0f;   // manual highlight roll-off [-0.3, 0.4]
 	bool  bMLDebugCopy = false;  // grade steps use the plain copy shader (shader-vs-plumbing bisect)
@@ -273,6 +274,7 @@ struct Settings_t {
 		bMLShadowEnabled                = true;
 		fMLShadow                       = 2.0f;
 		fMLShadowDehaze                 = 0.0f;
+		fMLHighlightRolloffCtrl         = 0.0f;
 		bMLHighlightEnabled             = true;
 		fMLHighlight                    = 0.0f;
 		bMLDebugCopy                    = false;

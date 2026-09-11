@@ -418,6 +418,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_fMLShadow             = config.fMLShadow;
 	m_fMLShadowDehaze       = config.fMLShadowDehaze;
 	m_fMLHighlight          = config.fMLHighlight;
+	m_fMLHighlightRolloffCtrl = config.fMLHighlightRolloffCtrl;
 	m_bMLDebugCopy          = config.bMLDebugCopy;
 	m_bMLDebug              = config.bMLDebugLog;
 	if (m_pFaceDetect) m_pFaceDetect->SetLogEnabled(m_bMLDebug);   // per-frame face lines follow the flag
@@ -1296,6 +1297,15 @@ void CDX11VideoProcessor::SetMLParams()
 		float highlightPred = 0.0f;
 		if (m_bMLHighlightModelLoaded && m_MLHighlightModel.Predict(m_MLFeatures, ML_FEATURE_DIM, highlightPred)) {
 			highlightPred = fmaxf(-0.30f, fminf(0.40f, highlightPred));
+			// Highlight shoulder override (model-override, mirrors dehaze): a signed
+			// offset the user adds to the model's rolloff IN AUTO — the model keeps
+			// shaping the per-scene shoulder, the slider just pulls the rim highlight
+			// back (negative = softer/earlier shoulder) without freezing per scene.
+			const float ctrl = fminf(0.20f, fmaxf(-0.20f, m_fMLHighlightRolloffCtrl));
+			highlightPred = fmaxf(-0.30f, fminf(0.40f, highlightPred + ctrl));
+			m_MLRolloffCtrlApplied = ctrl;
+		} else {
+			m_MLRolloffCtrlApplied = 0.0f;
 		}
 		rolloff = (m_bMLToneCurveEnabled && m_bMLHighlightEnabled) ? highlightPred : 0.0f;
 
@@ -2598,7 +2608,7 @@ void CDX11VideoProcessor::InitMLDebug()
 			L"frame,time_100ns,active,mode,gamma,shadow,highlight,"
 			L"ispq,swapcs,swfmt,steps,tmactive,winW,winH,srcW,srcH,vidL,vidT,vidR,vidB,"
 			L"mlmin,mlmax,mlavg,clipfrac,edgefrac,logCOPY,"
-			L"featReady,stale,convSeen,texConv,feat0,feat1,pred,dehaze\n");
+			L"featReady,stale,convSeen,texConv,feat0,feat1,pred,dehaze,rolloffCtl\n");
 		fwprintf(m_pMLDebugFile, L"# debug on (ML enabled=%d, copy=%d)\n", (m_bML ? 1 : 0), (m_bMLDebugCopy ? 1 : 0));
 		fflush(m_pMLDebugFile);
 	}
@@ -2626,7 +2636,7 @@ void CDX11VideoProcessor::LogMLFrame()
 
 	fwprintf(m_pMLDebugFile,
 		L"%llu,%lld,%d,%d,%.4f,%.4f,%.4f,%d,%s,%d,%u,%d,%d,%d,%u,%u,%d,%d,%d,%d,"
-		L"%u,%u,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f\n",
+		L"%u,%u,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f\n",
 		m_MLDebugFrame,
 		(long long)m_rtStart,
 		(m_bMLActive ? 1 : 0),
@@ -2644,7 +2654,7 @@ void CDX11VideoProcessor::LogMLFrame()
 		(double)m_MLDebugLastAvg, (double)m_MLDebugLastClipF, (double)m_MLDebugLastEdgeF,
 		(m_bMLDebugCopy ? 1 : 0),
 		m_MLDebugFeatReady, m_MLDebugStale, m_MLDebugConvertSeen, m_MLDebugTexConv,
-		(double)m_MLDebugFeat0, (double)m_MLDebugFeat1, (double)m_MLDebugPred, (double)m_MLShadowDehazeApplied);
+		(double)m_MLDebugFeat0, (double)m_MLDebugFeat1, (double)m_MLDebugPred, (double)m_MLShadowDehazeApplied, (double)m_MLRolloffCtrlApplied);
 	fflush(m_pMLDebugFile);
 }
 
@@ -6051,7 +6061,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	}
 
 	if (config.bMLEnabled != m_bML || config.iMLMode != m_iMLMode ||
-			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow || config.fMLShadowDehaze != m_fMLShadowDehaze ||
+			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow || config.fMLShadowDehaze != m_fMLShadowDehaze || config.fMLHighlightRolloffCtrl != m_fMLHighlightRolloffCtrl ||
 			config.fMLHighlight != m_fMLHighlight ||
 			config.bMLGammaEnabled != m_bMLGammaEnabled ||
 			config.bMLShadowEnabled != m_bMLShadowEnabled ||
@@ -6083,6 +6093,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_fMLGamma     = config.fMLGamma;
 		m_fMLShadow    = config.fMLShadow;
 		m_fMLShadowDehaze = config.fMLShadowDehaze;
+		m_fMLHighlightRolloffCtrl = config.fMLHighlightRolloffCtrl;
 		m_fMLHighlight = config.fMLHighlight;
 		m_bMLToneCurveEnabled = config.bMLToneCurveEnabled;
 		m_bMLGammaEnabled   = config.bMLGammaEnabled;
