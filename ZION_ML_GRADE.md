@@ -585,3 +585,56 @@ on, the ML render block writes `MLPASS … SKYUV=(uvOffX,uvOffY,uvScX,uvScY) sfr
 - s3_shell: `build_s3_shell.bat` via cl.exe (mpc-hc repo, branch `zion-s3-shell`)
 - Distribution: `_bin\MpcVideoRenderer-0.10.8.2603\` with Install/Uninstall scripts
 - Dependencies: ONNX Runtime + DirectML DLLs, YuNet + `yolo26n-sem.onnx` + `yolo26n-seg_op21.onnx` models, XGBoost `.plxgb` model files
+
+## Status checkpoint — 2026-09-12 (rev 0.10.8.2629, branch `zion-ml-phase0`)
+
+This branch is the HTPC DeckLink-ingest pipeline: s3_shell (mpc-hc `zion-s3-shell`)
+drives MPCVR `zion-ml-phase0` behind a DeckLink HDMI input. Companion docs live in
+the mpc-hc repo: `docs/Ingest-Architecture.md`, `docs/DeckLink-Integration-Status.md`,
+`docs/DeckLink-Capture-Low-Latency.md`, `docs/STATUS-2026-09-07.md`.
+
+### Parked: stage-5 skin-tone preservation (defaults OFF — resume procedure below)
+
+The additive luma re-anchor + edge-pinned anisotropic Poisson gate is **fully built
+but parked and default-disabled** (user decision, 2026-09-11):
+
+- `IVideoRenderer.h` / `MpcPlayer.h`: `bMLPersonEnabled=false`, `personEnabled=false`,
+  `skinPreserve=0.0` → the shader leg (`MLSkinPreserve`) is zero ⇒ invisible by default.
+- The CPU side (`UpdateSkinGate` 160×90 solve + `UpdateSkinAnchor`) is gated on
+  `MLSkinPreserve>0.001` and runs at a 2-frame cadence — both the stutter fixes
+  (root cause was the solve running at preserve=0; inference cadence fixed separately,
+  every ~6 frames).
+- Per-instance skin-presence amplitude: person A face (σ≈1) → full, person B waist
+  (σ≈0) → off per-person; τ confidence envelope delays re-engagement after a cut.
+
+**To resume:** flip `personEnabled`/`bMLPersonEnabled` on, set `skinPreserve` > 0 in
+the s3_shell PERSON SKIN section, then validate on HTPC (daylight seam + strength
+sweep). **Open gate before un-parking:** the gamma leg currently references pre-curve
+`lin` as `outLum` in the re-anchor term (`desired − outLum`), so the anchor never
+lands and dYs does not move — point it at the post-curve output, then re-run the
+SKINMET sweep. Full mechanics: the `person-skin-protection` memory file.
+
+### Model-override user controls (the dehaze pattern — live in Auto)
+
+Two knobs ride on top of the ML models rather than replacing them, so they stay
+correct in Auto mode (Manual-fixed sliders rejected — they damage the curve):
+
+| Control | Key | Range | Effect |
+|---|---|---|---|
+| Shadow dehaze | `fMLShadowDehaze` | 0–1 | Scales down the xgboost shadow-toe lift (lifted-black haze) |
+| Highlight shoulder | `fMLHighlightRolloffCtrl` | ±0.20 | Signed offset added to the model's highlight rolloff (rim softening) |
+
+s3_shell rows are marked `autoAdjustable` so they remain hittable in Auto
+(`UpdateGates`: `adjustable = masterAdj && (autoAdjustable || Manual)`).
+
+### Delivered since the stage-4/5 doc last pass
+
+- Sky + person masks share one `R8G8` t2 upload; seg runs ~10 fps (cadence bug fixed:
+  the old `m_MLDebugFrame % 10` gate ran inference EVERY frame in normal playback).
+- Person protection sets the skin-LUT gate on chroma + micro-contrast only.
+- Micro-contrast fine-band experiment (σ≈0.5, madVR-chasing) is **open, not started**.
+
+### Build
+
+Current dist is `_bin\MpcVideoRenderer-0.10.8.2629\` (stutter, dehaze, shoulder,
+person parking all in). `Source/onnxrt/` is vendored in-repo so a fresh clone builds.
