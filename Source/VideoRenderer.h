@@ -286,6 +286,7 @@ public:
 	STDMETHODIMP SaveSettings();
 
 	STDMETHODIMP_(void) GetMLStats(std::wstring& str);
+	STDMETHODIMP_(void) GetRenderStats(::RenderStats_t& stats);
 
 	// ISubRender (DX9)
 	STDMETHODIMP SetCallback(ISubRenderCallback* cb) override;

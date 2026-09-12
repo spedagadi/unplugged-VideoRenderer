@@ -134,9 +134,9 @@ IF DEFINED SEVENZIP (
 .\distrib\Uninstall_MPCVR_32.cmd ^
 .\distrib\Uninstall_MPCVR_64.cmd ^
 .\distrib\Reset_Settings.cmd ^
-.\models\xgb_gamma_model.plxgb ^
-.\models\xgb_shadow_recovery.plxgb ^
-.\models\xgb_highlight_rolloff.plxgb ^
+.\Source\onnxrt\xgb_gamma_model.plxgb ^
+.\Source\onnxrt\xgb_shadow_recovery.plxgb ^
+.\Source\onnxrt\xgb_highlight_rolloff.plxgb ^
 .\Readme.md ^
 .\history.txt ^
 .\LICENSE.txt

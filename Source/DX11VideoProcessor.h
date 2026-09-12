@@ -590,6 +590,7 @@ public:
 	void SetRotation(int value) override;
 	void SetStereo3dTransform(int value) override;
 	void GetMLStats(std::wstring& str) override;
+	void GetRenderStats(::RenderStats_t& stats) override;
 
 	void Flush() override;
 

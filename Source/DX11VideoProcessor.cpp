@@ -1924,6 +1924,17 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		inFmt, (int)m_srcRectWidth, (int)m_srcRectHeight, icsName);
 }
 
+void CDX11VideoProcessor::GetRenderStats(::RenderStats_t& stats)
+{
+	stats = ::RenderStats_t{};
+	stats.framesReceived = m_pFilter ? m_pFilter->m_FrameStats.GetFrames() : 0;
+	stats.framesDrawn   = m_pFilter ? m_pFilter->m_DrawStats.GetFrames() : 0;
+	stats.dropped       = m_pFilter ? m_pFilter->m_DrawStats.m_dropped : 0;
+	stats.skipped       = m_RenderStats.dropped2;
+	stats.failed        = m_RenderStats.failed;
+	if (m_pFilter) stats.drawFps = m_pFilter->m_DrawStats.GetAverageFps();
+}
+
 HRESULT CDX11VideoProcessor::CreateSkyMaskTexture()
 {
 	if (!m_pDevice) return E_FAIL;
@@ -3567,6 +3578,14 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 		if (FmtParams.CSType == CS_YUV && (vih2->dwControlFlags & (AMCONTROL_USED | AMCONTROL_COLORINFO_PRESENT))) {
 			m_decExFmt.value = vih2->dwControlFlags;
 			m_decExFmt.SampleFormat = AMCONTROL_USED | AMCONTROL_COLORINFO_PRESENT; // ignore other flags
+			if (m_pMLDebugFile) { // TEMP-DEBUG: does the media type carry HDR transfer?
+				fwprintf(m_pMLDebugFile, L"MT_XFMT transfer=%lu matrix=%lu prim=%lu flags=0x%08lx\n",
+					(unsigned long)m_decExFmt.VideoTransferFunction,
+					(unsigned long)m_decExFmt.VideoTransferMatrix,
+					(unsigned long)m_decExFmt.VideoPrimaries,
+					(unsigned long)vih2->dwControlFlags);
+				fflush(m_pMLDebugFile);
+			}
 		}
 		m_bInterlaced = (vih2->dwInterlaceFlags & AMINTERLACE_IsInterlaced);
 		m_rtAvgTimePerFrame = vih2->AvgTimePerFrame;

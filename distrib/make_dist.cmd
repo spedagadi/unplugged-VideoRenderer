@@ -67,12 +67,12 @@ COPY /Y "LICENSE.txt"                          "%DIST_DIR%\" >NUL
 COPY /Y "Readme.md"                            "%DIST_DIR%\" >NUL
 COPY /Y "history.txt"                          "%DIST_DIR%\" >NUL
 
-IF EXIST "models\xgb_gamma_model.plxgb" (
-  COPY /Y "models\xgb_gamma_model.plxgb" "%DIST_DIR%\" >NUL
-  COPY /Y "models\xgb_shadow_recovery.plxgb" "%DIST_DIR%\" >NUL
-  COPY /Y "models\xgb_highlight_rolloff.plxgb" "%DIST_DIR%\" >NUL
+IF EXIST "Source\onnxrt\xgb_gamma_model.plxgb" (
+  COPY /Y "Source\onnxrt\xgb_gamma_model.plxgb" "%DIST_DIR%\" >NUL
+  COPY /Y "Source\onnxrt\xgb_shadow_recovery.plxgb" "%DIST_DIR%\" >NUL
+  COPY /Y "Source\onnxrt\xgb_highlight_rolloff.plxgb" "%DIST_DIR%\" >NUL
 ) ELSE (
-  ECHO [WARN] models\*.plxgb not found - AUTO mode will be unavailable.
+  ECHO [WARN] Source\onnxrt\*.plxgb not found - AUTO mode will be unavailable.
 )
 
 IF EXIST "Source\onnxrt\onnxruntime.dll" (

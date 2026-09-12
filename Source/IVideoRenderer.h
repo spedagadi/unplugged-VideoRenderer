@@ -317,6 +317,17 @@ struct Settings_t {
 	}
 };
 
+// Renderer frame accounting (LIVE panel / PERFORMANCE): receive-side frame
+// counts + dropped/skipped/failed tallies from the draw pipeline.
+struct RenderStats_t {
+	unsigned framesReceived = 0;   // total input frames seen by the renderer
+	unsigned framesDrawn = 0;      // frames actually presented
+	unsigned dropped = 0;          // receive-side drops (m_DrawStats.m_dropped)
+	unsigned skipped = 0;          // double-rate skip path (m_RenderStats.dropped2)
+	unsigned failed = 0;           // render failures (m_RenderStats.failed)
+	double   drawFps = 0.0;        // presented frames per second (measured)
+};
+
 interface __declspec(uuid("1AB00F10-5F55-42AC-B53F-38649F11BE3E"))
 IVideoRenderer : public IUnknown {
 	STDMETHOD(GetVideoProcessorInfo) (std::wstring& str) PURE;
@@ -328,4 +339,5 @@ IVideoRenderer : public IUnknown {
 	STDMETHOD(SaveSettings()) PURE;
 
 	STDMETHOD_(void, GetMLStats)(std::wstring& str) PURE;
+	STDMETHOD_(void, GetRenderStats)(::RenderStats_t& stats) PURE;
 };

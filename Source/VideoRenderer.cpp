@@ -1386,6 +1386,15 @@ STDMETHODIMP_(void) CMpcVideoRenderer::GetMLStats(std::wstring& str)
 	}
 }
 
+STDMETHODIMP_(void) CMpcVideoRenderer::GetRenderStats(::RenderStats_t& stats)
+{
+	if (m_VideoProcessor) {
+		m_VideoProcessor->GetRenderStats(stats);
+	} else {
+		stats = ::RenderStats_t{};
+	}
+}
+
 // Dedicated message-only window class for the tray icon. Anchor the icon here
 // rather than on m_hWndWindow so tray lifetime is not coupled to the video
 // window (which may never be created, or be destroyed/recreated).

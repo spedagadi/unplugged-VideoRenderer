@@ -23,6 +23,7 @@
 #include <evr9.h>
 #include "DisplayConfig.h"
 #include "FrameStats.h"
+#include "IVideoRenderer.h"
 #include "SubPic/ISubPic.h"
 
 enum : int {
@@ -238,6 +239,14 @@ public:
 	void SetDisplayInfo(const DisplayConfig_t& dc, const bool primary, const bool exclusiveScreen);
 
 	virtual void GetMLStats(std::wstring& str) { str.clear(); }
+
+	// Renderer frame-accounting counters (LIVE panel / PERFORMANCE). IVideoRenderer
+	// exposes a ::RenderStats_t; the base returns zeros here and the concrete
+	// processors fill real numbers.
+	virtual void GetRenderStats(::RenderStats_t& stats)
+	{
+		stats = ::RenderStats_t{};
+	}
 
 	bool GetDoubleRate() { return m_bDoubleFrames; }
 
