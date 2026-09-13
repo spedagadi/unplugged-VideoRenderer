@@ -1226,7 +1226,11 @@ void CDX11VideoProcessor::UpdateMLActive()
 	InitMLDebug();
 
 	const bool bAutoReady = (m_iMLMode == ML_Auto) && m_bMLGammaModelLoaded;
-	const bool bActive = m_bML && SourceIsHDR() && (m_iMLMode == ML_Manual || bAutoReady);
+	// ML grade applies to both HDR and SDR sources: the grade shaders already
+	// select IsPQ=1/0 from the swapchain (never from SourceIsHDR), so native SDR
+	// (Blu-ray Rec.709/BT.1886) takes the gamma-2.2 SDR path identically to an
+	// HDR file after tone-mapping. Gate on enable + mode only.
+	const bool bActive = m_bML && (m_iMLMode == ML_Manual || bAutoReady);
 
 	// Only the ACTIVE flag toggles; the preloaded resources persist.
 	if (bActive == m_bMLActive) {
