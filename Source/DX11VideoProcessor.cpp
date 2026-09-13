@@ -3489,7 +3489,9 @@ bool CDX11VideoProcessor::ToggleHDR(const DisplayConfig_t& displayConfig, const 
 
 // Ideal cadence refreshes are integer multiples of the source rate: 2x = 48 Hz
 // for 23.976/24p (also 72, 96, 120, 144 ...). Iterated lowest-first so the
-// minimal multiple the display supports wins.
+// minimal multiple the display supports wins. 1x (the native source rate, e.g.
+// a projector's 23.976 Hz cinema mode) is only ever RECOGNIZED in place — it
+// is deliberately not a switch target, so the desktop never drops to ~24 Hz.
 static constexpr int kCadenceMultiples[] = { 2, 3, 4, 5, 6, 7 };
 
 void CDX11VideoProcessor::HandleRefreshRateForCadence()
@@ -3521,7 +3523,9 @@ void CDX11VideoProcessor::HandleRefreshRateForCadence()
 
 	auto IsIdealCadenceRefresh = [inputFps](const double hz) {
 		if (hz <= 0.0) return false;
-		for (const int mult : kCadenceMultiples) {
+		// 1x = the display already runs at the source rate (1:1 — e.g. the
+		// projector's 23.976 Hz cinema mode) or any clean multiple 2x..7x.
+		for (int mult = 1; mult <= 7; mult++) {
 			const double ideal = inputFps * mult;
 			if (std::abs(hz - ideal) / ideal <= 0.02) { // within ±2 %
 				return true;
@@ -3531,7 +3535,7 @@ void CDX11VideoProcessor::HandleRefreshRateForCadence()
 	};
 
 	if (bIs24p && IsIdealCadenceRefresh(displayHertz)) {
-		return; // display already at a clean multiple of the source rate
+		return; // display already at 1:1 or a clean multiple of the source rate
 	}
 	if (!bIs24p && !m_bRefreshOverrideActive) {
 		return; // nothing to do
