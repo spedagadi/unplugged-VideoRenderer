@@ -154,6 +154,14 @@ struct Settings_t {
 	int iHdrDisplayMaxNits;
 	bool bHDRPassthroughRaw = false; // skip tone map + ML: show the raw HDR/DV signal on SDR (demo)
 	int iInputColorSpace = ICS_Auto;  // forced input colour space for live HDMI capture (ICS_*)
+	// HTPC cadence: when the input is 23.976/24p, auto-switch the display
+	// refresh to a clean multiple of the source rate (2x = 48 Hz, 4x = 96 Hz,
+	// 5x = 120 Hz ...) so every source frame maps to an integer number of
+	// refreshes (no judder on pans). Prefers the lowest multiple the display
+	// actually offers; if none is supported it falls back to the display's own
+	// configured refresh. Restores the original refresh when the input stops
+	// being 24p or the renderer tears down. 0 = off, 1 = on.
+	int iRefreshSwitch24p = 0;
 
 	// Zion ML grade
 	bool  bMLEnabled = false;
@@ -266,6 +274,7 @@ struct Settings_t {
 		iHdrLocalToneMappingType        = 5;   // BT.2390 default
 		bHDRPassthroughRaw              = false;
 		iInputColorSpace                = ICS_Auto;
+		iRefreshSwitch24p               = 0;
 		bMLEnabled                      = false;
 		iMLMode                         = ML_Disable;
 		bMLToneCurveEnabled             = true;

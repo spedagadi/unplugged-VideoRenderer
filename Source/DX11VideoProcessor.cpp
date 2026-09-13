@@ -408,6 +408,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_iHdrDisplayMaxNits   = config.iHdrDisplayMaxNits;
 	m_bHDRPassthroughRaw   = config.bHDRPassthroughRaw;
 	m_iHdrToggleDisplay    = config.iHdrToggleDisplay;
+	m_iRefreshSwitch24p    = config.iRefreshSwitch24p;
 	m_iHdrOsdBrightness    = config.iHdrOsdBrightness;
 	m_bConvertToSdr        = config.bConvertToSdr;
 	m_iSDRDisplayNits      = config.iSDRDisplayNits;
@@ -583,6 +584,10 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 
 CDX11VideoProcessor::~CDX11VideoProcessor()
 {
+	// 24p cadence: never leave the display on a refresh we forced — restore the
+	// original mode even if the pipeline was torn down without a clean stop.
+	RestoreRefreshRateOverride();
+
 	for (const auto& [displayName, state] : m_hdrModeSavedState) {
 		DisplayConfig_t displayConfig = {};
 		if (GetDisplayConfig(displayName.c_str(), displayConfig)) {
@@ -3482,6 +3487,187 @@ bool CDX11VideoProcessor::ToggleHDR(const DisplayConfig_t& displayConfig, const 
 	return ret == ERROR_SUCCESS;
 }
 
+// Ideal cadence refreshes are integer multiples of the source rate: 2x = 48 Hz
+// for 23.976/24p (also 72, 96, 120, 144 ...). Iterated lowest-first so the
+// minimal multiple the display supports wins.
+static constexpr int kCadenceMultiples[] = { 2, 3, 4, 5, 6, 7 };
+
+void CDX11VideoProcessor::HandleRefreshRateForCadence()
+{
+	if (!m_iRefreshSwitch24p || m_bRefreshSwitchInProgress) {
+		return;
+	}
+
+	CAutoLock cRendererLock(&m_HDRToggleLock);
+
+	if (m_rtAvgTimePerFrame <= 0) { // no input rate known yet — make sure we are back at the original refresh
+		RestoreRefreshRateOverrideLocked();
+		return;
+	}
+
+	const double inputFps = 10000000.0 / (double)m_rtAvgTimePerFrame;
+	const bool bIs24p = inputFps >= 23.0 && inputFps <= 24.5;
+
+	MONITORINFOEXW mi = { sizeof(mi) };
+	GetMonitorInfoW(MonitorFromWindow(m_hWnd, MONITOR_DEFAULTTOPRIMARY), reinterpret_cast<LPMONITORINFO>(&mi));
+	DisplayConfig_t displayConfig = {};
+	if (!GetDisplayConfig(mi.szDevice, displayConfig)) {
+		RestoreRefreshRateOverrideLocked();
+		return;
+	}
+
+	const double displayHertz = displayConfig.refreshRate.Denominator
+		? (double)displayConfig.refreshRate.Numerator / (double)displayConfig.refreshRate.Denominator : 0.0;
+
+	auto IsIdealCadenceRefresh = [inputFps](const double hz) {
+		if (hz <= 0.0) return false;
+		for (const int mult : kCadenceMultiples) {
+			const double ideal = inputFps * mult;
+			if (std::abs(hz - ideal) / ideal <= 0.02) { // within ±2 %
+				return true;
+			}
+		}
+		return false;
+	};
+
+	if (bIs24p && IsIdealCadenceRefresh(displayHertz)) {
+		return; // display already at a clean multiple of the source rate
+	}
+	if (!bIs24p && !m_bRefreshOverrideActive) {
+		return; // nothing to do
+	}
+
+	DLog(L"HandleRefreshRateForCadence() : inputFps={:.2f} ({}) display {:.3f}Hz -> {}",
+		inputFps, bIs24p ? L"24p" : L"other", displayHertz, bIs24p ? L"cadence multiple" : L"restore original");
+
+	m_bHdrDisplaySwitching = true; // gate Reset(true) re-entrancy like ToggleHDR does
+	m_bRefreshSwitchInProgress = true;
+	bool bSwitched = false;
+	if (bIs24p) {
+		bSwitched = SetDisplayRefreshForCadenceLocked(displayConfig, inputFps);
+	}
+	if (!bSwitched) {
+		// Not 24p, or no clean multiple of the source rate is supported on this
+		// display — fall back to whatever the display prefers (its configured
+		// refresh). Also restores any override owed from an earlier switch.
+		RestoreRefreshRateOverrideLocked();
+	}
+	m_bRefreshSwitchInProgress = false;
+	m_bHdrDisplaySwitching = false;
+}
+
+bool CDX11VideoProcessor::SetDisplayRefreshForCadenceLocked(const DisplayConfig_t& displayConfig, const double inputFps)
+{
+	DEVMODEW current = {};
+	current.dmSize = sizeof(current);
+	if (!EnumDisplaySettingsW(displayConfig.displayName, ENUM_CURRENT_SETTINGS, &current)) {
+		DLog(L"SetDisplayRefreshForCadenceLocked() : EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS) failed");
+		return false;
+	}
+
+	if (!m_bRefreshOverrideActive) {
+		// Remember the pre-switch mode once — it is the restore target.
+		m_refreshSavedMode = current;
+		m_refreshSavedDisplayName = displayConfig.displayName;
+	}
+
+	// Find the lowest multiple of the source rate the display actually offers
+	// (48/72/96/120... for 24p; panels often list 47.952 or 48.000 Hz).
+	DEVMODEW mode = {};
+	DEVMODEW target = {};
+	for (const int mult : kCadenceMultiples) {
+		const double ideal = inputFps * mult;
+		float bestRel = 1e9f;
+		for (UINT i = 0; EnumDisplaySettingsExW(displayConfig.displayName, i, &mode, 0); i++) {
+			if (mode.dmPelsWidth != current.dmPelsWidth || mode.dmPelsHeight != current.dmPelsHeight
+					|| mode.dmBitsPerPel != current.dmBitsPerPel || mode.dmDisplayFrequency == 0) {
+				continue;
+			}
+			const double hz = (double)mode.dmDisplayFrequency;
+			const double rel = std::abs(hz - ideal) / ideal;
+			if (rel > 0.02) {
+				continue;
+			}
+			if (rel < bestRel) {
+				bestRel = (float)rel;
+				target = mode;
+			}
+		}
+		if (target.dmPelsWidth) {
+			break; // lowest multiple that matches wins
+		}
+	}
+
+	if (!target.dmPelsWidth) {
+		DLog(L"SetDisplayRefreshForCadenceLocked() : no {:.3f}Hz x2..x7 mode on '{}' — falling back to the display's configured refresh",
+			 inputFps, displayConfig.displayName);
+		return false;
+	}
+
+	LONG ret = ChangeDisplaySettingsExW(displayConfig.displayName, &target, nullptr, CDS_FULLSCREEN, nullptr);
+	if (ret != DISP_CHANGE_SUCCESSFUL) {
+		DLog(L"SetDisplayRefreshForCadenceLocked() : ChangeDisplaySettingsExW(cadence) failed with {}",
+			 HR2Str(HRESULT_FROM_WIN32(ret)));
+		return false;
+	}
+
+	m_bRefreshOverrideActive = true;
+	m_bDisplayModeChangeAfterRefreshSwitch = true; // absorb the WM_DISPLAYCHANGE we just caused
+	FillDisplayParams();
+	DLog(L"SetDisplayRefreshForCadenceLocked() : switched '{}' to {}x{}@{}Hz", displayConfig.displayName,
+		 target.dmPelsWidth, target.dmPelsHeight, target.dmDisplayFrequency);
+
+	return true;
+}
+
+void CDX11VideoProcessor::RestoreRefreshRateOverrideLocked()
+{
+	if (!m_bRefreshOverrideActive || m_refreshSavedDisplayName.empty()) {
+		return;
+	}
+
+	DEVMODEW current = {};
+	current.dmSize = sizeof(current);
+	if (EnumDisplaySettingsW(m_refreshSavedDisplayName.c_str(), ENUM_CURRENT_SETTINGS, &current)
+			&& current.dmPelsWidth == m_refreshSavedMode.dmPelsWidth
+			&& current.dmPelsHeight == m_refreshSavedMode.dmPelsHeight
+			&& current.dmDisplayFrequency == m_refreshSavedMode.dmDisplayFrequency) {
+		// Display is already back at the original mode (external change did it).
+		m_bRefreshOverrideActive = false;
+		m_refreshSavedDisplayName.clear();
+		m_refreshSavedMode = {};
+		return;
+	}
+
+	LONG ret = ChangeDisplaySettingsExW(m_refreshSavedDisplayName.c_str(), &m_refreshSavedMode, nullptr, CDS_FULLSCREEN, nullptr);
+	if (ret != DISP_CHANGE_SUCCESSFUL) {
+		DLog(L"RestoreRefreshRateOverrideLocked() : ChangeDisplaySettingsExW restore failed with {}",
+			 HR2Str(HRESULT_FROM_WIN32(ret)));
+		return;
+	}
+
+	m_bDisplayModeChangeAfterRefreshSwitch = true; // absorb the WM_DISPLAYCHANGE we just caused
+	FillDisplayParams();
+	DLog(L"RestoreRefreshRateOverrideLocked() : restored '{}' to {}x{}@{}Hz", m_refreshSavedDisplayName,
+		 m_refreshSavedMode.dmPelsWidth, m_refreshSavedMode.dmPelsHeight, m_refreshSavedMode.dmDisplayFrequency);
+
+	m_bRefreshOverrideActive = false;
+	m_refreshSavedDisplayName.clear();
+	m_refreshSavedMode = {};
+}
+
+void CDX11VideoProcessor::RestoreRefreshRateOverride()
+{
+	if (!m_bRefreshOverrideActive) {
+		return;
+	}
+
+	CAutoLock cRendererLock(&m_HDRToggleLock);
+	m_bHdrDisplaySwitching = true;
+	RestoreRefreshRateOverrideLocked();
+	m_bHdrDisplaySwitching = false;
+}
+
 void CDX11VideoProcessor::ApplyInputColorSpaceOverride()
 {
 	// Always-on trace (ml_debug.csv, opened at construction in release) so the
@@ -3714,6 +3900,11 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 	}
 
 	m_srcVideoTransferFunction = m_srcExFmt.VideoTransferFunction;
+
+	// 24p cadence: the input rate is now known (m_rtAvgTimePerFrame above), so
+	// the display refresh can be re-evaluated (DeckLink 23.976p -> 48 Hz, and
+	// back to the original when the source leaves 24p).
+	HandleRefreshRateForCadence();
 
 	HRESULT hr = E_NOT_VALID_STATE;
 
@@ -5579,6 +5770,19 @@ HRESULT CDX11VideoProcessor::Reset(bool bDisplayModeChange)
 {
 	DLog(L"CDX11VideoProcessor::Reset({})", bDisplayModeChange);
 
+	// 24p cadence, step 1 — absorb the display-mode change our own switch just
+	// caused, BEFORE anything could restore the refresh or tear down while the
+	// 24p content is still playing.
+	if (bDisplayModeChange && m_bDisplayModeChangeAfterRefreshSwitch) {
+		m_bDisplayModeChangeAfterRefreshSwitch = false;
+		return S_OK;
+	}
+
+	// 24p cadence, step 2 — any other pipeline / display reset is a chance to
+	// hand the display refresh back to the user's original mode (before taking
+	// the lock; RestoreRefreshRateOverride takes it itself, no deadlock).
+	RestoreRefreshRateOverride();
+
 	CAutoLock cRendererLock(&m_HDRToggleLock);
 
 	if (bDisplayModeChange) {
@@ -6052,6 +6256,15 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			changeHDR = true;
 		}
 		m_iHdrToggleDisplay = config.iHdrToggleDisplay;
+	}
+
+	if (config.iRefreshSwitch24p != m_iRefreshSwitch24p) {
+		m_iRefreshSwitch24p = config.iRefreshSwitch24p;
+		if (!config.iRefreshSwitch24p) {
+			RestoreRefreshRateOverride();     // turning it off: display back to original
+		} else {
+			HandleRefreshRateForCadence();    // turning it on: evaluate the current input
+		}
 	}
 
 	if (config.bConvertToSdr != m_bConvertToSdr) {

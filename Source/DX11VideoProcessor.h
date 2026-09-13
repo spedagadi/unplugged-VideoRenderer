@@ -499,6 +499,26 @@ private:
 	std::atomic_bool m_bDisplayModeChangeAfterHDRToggle = false;
 	CCritSec m_HDRToggleLock;
 
+	// HTPC 24p cadence: for a 23.976/24p input, switch the display refresh to the
+// lowest clean multiple of the source rate that the display offers (2x = 48 Hz,
+// 4x = 96 Hz, 5x = 120 Hz ...). When no such multiple exists it falls back to
+// the display's configured refresh, and the original refresh is restored when
+// the input stops being 24p or the renderer tears down. Mirrors the HDR-toggle
+// pattern: m_HDRToggleLock serializes, m_bHdrDisplaySwitching (IsInit) gates
+// re-entrant Reset, and the *_Switch flag absorbs the WM_DISPLAYCHANGE that
+// ChangeDisplaySettingsExW itself generates.
+	int  m_iRefreshSwitch24p = 0;            // 0 = off, 1 = auto cadence refresh
+	bool m_bRefreshOverrideActive = false;   // true = we forced a refresh, restore owed
+	bool m_bRefreshSwitchInProgress = false; // ChangeDisplaySettingsExW in flight
+	std::wstring m_refreshSavedDisplayName;  // monitor we switched ("" = none)
+	DEVMODEW m_refreshSavedMode = {};        // pre-switch mode, the restore target
+	std::atomic_bool m_bDisplayModeChangeAfterRefreshSwitch = false;
+
+	void HandleRefreshRateForCadence();      // evaluate after a media-type change
+	void RestoreRefreshRateOverride();       // force back to the pre-switch mode
+	bool SetDisplayRefreshForCadenceLocked(const DisplayConfig_t& dc, double inputFps); // -> lowest clean multiple
+	void RestoreRefreshRateOverrideLocked(); // lock expected to be held
+
 	bool m_bHDRModeChangeOutside = false;
 
 	void FillDisplayParams();
