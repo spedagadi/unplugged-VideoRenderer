@@ -68,6 +68,16 @@ protected:
 	bool m_bHdrLocalToneMapping            = false;
 	int  m_iHdrLocalToneMappingType        = 0;
 	int  m_iHdrDisplayMaxNits              = 1000;
+	float m_fHdrDisplayMinNits             = 0.0f;   // display black, nits (0 = assume ideal black)
+	int   m_iOutputGamut                   = 0;      // 0 = BT.709 SDR out, 1 = keep BT.2020
+	// Content peak, nits — the top of the range the tone curves map from. Distinct
+	// from m_iHdrDisplayMaxNits (the display's peak). Falls back to the HDR10
+	// nominal 1000 when the source carries no metadata, which is always on the
+	// DeckLink capture path.
+	float m_fHdrTitlePeakNits              = 1000.0f;
+	// Hable knee: display-relative light below which Hable is replaced by identity.
+	// 0 = pure Hable. See the full rationale in IVideoRenderer.h.
+	float m_fHdrHableKnee                  = 0.0f;
 	bool m_bHDRPassthroughRaw             = false; // demo: show raw HDR/DV on SDR
 
 	// Zion ML grade
@@ -225,6 +235,11 @@ public:
 
 	virtual HRESULT AddPreScaleShader(const std::wstring& name, const std::string& srcCode) { return E_NOTIMPL; };
 	virtual HRESULT AddPostScaleShader(const std::wstring& name, const std::string& srcCode) { return E_NOTIMPL; };
+
+	// Display calibration 3D LUT (.cube). Only DX11 has the final-pass stage to
+	// host it; DX9 reports E_NOTIMPL so the command is a harmless no-op there.
+	virtual HRESULT LoadCubeLut(const char* utf8Path) { return E_NOTIMPL; };
+	virtual void SetCubeLutMode(int mode) {};
 
 	virtual HRESULT GetCurentImage(long *pDIBImage) = 0;
 	virtual HRESULT GetDisplayedImage(BYTE **ppDib, unsigned *pSize) = 0;

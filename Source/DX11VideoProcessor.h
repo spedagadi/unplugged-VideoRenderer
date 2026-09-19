@@ -90,9 +90,61 @@ private:
 	// D3D11 Video Processor
 	CD3D11VP m_D3D11VP;
 
+	// Display calibration 3D LUT (see LoadCubeLut). Bound to t2/s2 of the final pass.
+	CComPtr<ID3D11Texture3D>          m_pCubeLut;
+	CComPtr<ID3D11ShaderResourceView> m_pCubeLutSRV;
+	CComPtr<ID3D11SamplerState>       m_pCubeLutSampler;
+	int  m_iCubeLutSize    = 0;      // N of LUT_3D_SIZE N; 0 == no LUT loaded
+	bool m_bCubeLutEnabled = false;
+	int  m_iCubeLutMode    = 3;      // default full 3D (the historical behaviour)
+	// The final pass is normally gated on dithering. A loaded LUT must run there
+	// regardless (it is the only display-referred stage), so the pass is forced on
+	// and the dither sample is skipped in the shader when it is not wanted.
+	bool m_bDitherActive   = false;
+
 	CComPtr<ID3D11Buffer> m_pCorrectionConstants;
 	CComPtr<ID3D11PixelShader> m_pPSCorrection;
 	const wchar_t* m_strCorrection = nullptr;
+
+	// Experimental tone mapping (libplacebo port — see namespace exptm in the .cpp).
+	// A 1D tone curve built on the CPU from the same per-frame scene statistics the
+	// Zion grade already extracts, sampled by the converter instead of evaluating a
+	// fixed curve per pixel. Bound to t1/s1 of the correction pass; 1D because the
+	// curve is applied per channel, matching the existing ToneMappingHable.
+	//
+	// Selecting none of these leaves the shipped tone mapping bit-identical: the
+	// shader branches on toneLutEnable, and the constant is 0 unless a mapper is on.
+	CComPtr<ID3D11Texture2D>          m_pToneLut;
+	CComPtr<ID3D11ShaderResourceView> m_pToneLutSRV;
+	CComPtr<ID3D11SamplerState>       m_pToneLutSampler;
+	int   m_iExperimentalToneMapper = 0;    // 0 = off (shipped path), 1 = spline
+	float m_fToneLutContrast = 0.50f;       // pl_tone_map_spline "Contrast", 0.00 .. 1.50
+
+	// Everything the curve is built from. Keeping the whole input set in one place is
+	// deliberate: the rebuild test used to name fields one at a time, which stops
+	// rebuilding the day a field is added — and the symptom is a control that does
+	// nothing. The comparison itself lives in UpdateToneLut() because the two
+	// scene statistics get a deadband and the configuration fields do not.
+	struct ToneLutKey {
+		float pqMin = 0.0f;        // index axis, PQ code values
+		float pqMax = 0.0f;
+		float pqAvg = 0.0f;        // scene average, PQ — drives the pivot
+		float contrast = -1.0f;
+		// Display white in NITS. Named for what it is because the obvious
+		// alternative — 10000/this — is LuminanceScale, and swapping the two
+		// silently scaled the whole curve by dispNits/(10000/dispNits).
+		float dispNits = 0.0f;
+		float blackNits = 0.0f;    // display black, nits
+	};
+	ToneLutKey m_ToneLutKey;
+	float m_MLToneMaxSmooth = -1.0f;        // IIR state, PQ
+	float m_MLToneAvgSmooth = -1.0f;
+	bool  m_bToneLutReady = false;
+	// How many times the curve has actually been regenerated. Reported in the ML
+	// stats line: "the mapper is selected" and "the mapper is producing a curve"
+	// are different claims, and the rebuild counter is what separates them.
+	unsigned long long m_nToneLutBuilds = 0;
+	unsigned long long m_nToneLutFrame = 0;   // rate-limit tick, see UpdateToneLut()
 
 	// HDR tonemapping
 	struct HDRParamsConstantBuffer_t {
@@ -102,7 +154,11 @@ private:
 		float maxFALL;
 		float displayMaxNits;
 		UINT selection; // 1 = ACES, 2 = Reinhard, 3 = Habel, 4 = Möbius, 5 = BT2390, 6 = ST 2094-10
-		float padding[2];
+		// Destination BLACK, nits. Consumes one of the two former padding floats,
+		// so the cbuffer size is unchanged and the .cso layout still matches.
+		// 0.0 = the mapping assumes an ideal black (previous behaviour).
+		float displayMinNits;
+		float padding[1];
 	};
 	struct DoViDynamicConstantsBuffer_t {
 		float trim_chroma_weight;
@@ -188,8 +244,17 @@ private:
 		float MLSkinPreserve; // 0..1 keep-scale of the source's internal skin structure
 		float _padSkin0;
 		float _padSkin1;
+		// Gamma top-up — the user's signed offset on the model's gamma, passed
+		// SEPARATELY rather than folded into MLGamma on the CPU. The gamma shader
+		// has to be able to gate it by the trained skin LUT, and it cannot do that
+		// to a term it cannot see. Appended tail: every offset above is unchanged,
+		// and only ps_ml_gamma.hlsl declares this far.
+		float MLGammaTopUp;
+		float _padGT0;
+		float _padGT1;
+		float _padGT2;
 	};
-	static_assert(sizeof(MLParams_t) == 336, "MLParams_t cbuffer size drift");
+	static_assert(sizeof(MLParams_t) == 352, "MLParams_t cbuffer size drift");
 	MLParams_t m_lastMLParams = {};
 	CComPtr<ID3D11Buffer> m_pMLParams;
 	CComPtr<ID3D11PixelShader> m_pPSMLGamma;
@@ -226,6 +291,7 @@ private:
 	float m_MLShadowDehazeApplied = 0.0f; // what was actually applied (telemetry)
 	float m_fMLHighlightRolloffCtrl = 0.0f; // signed offset on the model's rolloff in Auto (rim soften)
 	float m_MLRolloffCtrlApplied = 0.0f;   // what was actually applied (telemetry)
+	float m_fMLGammaTopUp = 0.0f;          // signed offset ADDED to the model's gamma in Auto (midtone lift)
 	bool  m_bMLContrastEnabled = true;
 	float m_fMLContrast = 0.15f; // micro-contrast clarity strength (exponent) — overwritten by config
 	float m_fMLContrastZoneLo = 0.15f;
@@ -356,6 +422,21 @@ private:
 	float m_MLPrevL1Max = -1.0f;
 	float m_MLRawTexture = 0.0f;    // BuildMLFeatures out-param (high-freq edge fraction)
 	float m_MLTextureSmooth = 0.0f; // IIR-filtered texture energy feeding the MC gate
+
+	// Per-scene source peak for the Hable curve, in nits.
+	//
+	// Measured from m_MLFeatures[0] — the per-scene PQ peak of the PRE-tone-map
+	// signal — then IIR-smoothed so the curve does not re-normalise every shot,
+	// and snapped on a scene cut so it does not ramp across one. Negative means
+	// "no reading yet"; the shader falls back to the static maxCLL until then.
+	float m_HableScenePeakNits = -1.0f;
+	float m_HablePrevPeakPq = -1.0f;        // previous raw PQ peak, for the cut test
+	float m_HableScenePeakApplied = -1.0f;  // value last pushed to the cbuffer
+
+	// The gamma top-up actually added on top of the model's prediction this frame
+	// (model-override in AUTO, mirrors m_MLRolloffCtrlApplied). Recorded so the
+	// debug log can show what was applied rather than only what was asked for.
+	float m_MLGammaTopUpApplied = 0.0f;
 
 	// D3D11 Shader Video Processor
 	CComPtr<ID3D11PixelShader> m_pPSConvertColor;
@@ -499,25 +580,13 @@ private:
 	std::atomic_bool m_bDisplayModeChangeAfterHDRToggle = false;
 	CCritSec m_HDRToggleLock;
 
-	// HTPC 24p cadence: for a 23.976/24p input, switch the display refresh to the
-// lowest clean multiple of the source rate that the display offers (2x = 48 Hz,
-// 4x = 96 Hz, 5x = 120 Hz ...). When no such multiple exists it falls back to
-// the display's configured refresh, and the original refresh is restored when
-// the input stops being 24p or the renderer tears down. Mirrors the HDR-toggle
-// pattern: m_HDRToggleLock serializes, m_bHdrDisplaySwitching (IsInit) gates
-// re-entrant Reset, and the *_Switch flag absorbs the WM_DISPLAYCHANGE that
-// ChangeDisplaySettingsExW itself generates.
-	int  m_iRefreshSwitch24p = 0;            // 0 = off, 1 = auto cadence refresh
-	bool m_bRefreshOverrideActive = false;   // true = we forced a refresh, restore owed
-	bool m_bRefreshSwitchInProgress = false; // ChangeDisplaySettingsExW in flight
-	std::wstring m_refreshSavedDisplayName;  // monitor we switched ("" = none)
-	DEVMODEW m_refreshSavedMode = {};        // pre-switch mode, the restore target
-	std::atomic_bool m_bDisplayModeChangeAfterRefreshSwitch = false;
-
-	void HandleRefreshRateForCadence();      // evaluate after a media-type change
-	void RestoreRefreshRateOverride();       // force back to the pre-switch mode
-	bool SetDisplayRefreshForCadenceLocked(const DisplayConfig_t& dc, double inputFps); // -> lowest clean multiple
-	void RestoreRefreshRateOverrideLocked(); // lock expected to be held
+	// Present-latency gauge (HTPC): how far the on-screen frame lags capture.
+	// Anchored at the first presented frame: lag = (wallNow - wallFirst) -
+	// (streamTimeNow - streamTimeFirst) — valid because the decklink stream
+	// time advances 1:1 with real capture time.
+	REFERENCE_TIME m_rtFirstPresent = -1;
+	long long m_wallFirstPresent100ns = 0;   // GetPreciseTick() converted to 100 ns
+	double m_presentLatencyMs = 0.0;
 
 	bool m_bHDRModeChangeOutside = false;
 
@@ -543,8 +612,49 @@ private:
 	void SetShaderConvertColorParams();
 	void SetShaderLuminanceParams();
 
+	// Display calibration 3D LUT (.cube, ArgyllCMS/DisplayCAL/Resolve format).
+	// Loaded into a TEXTURE3D and sampled in the final pass — the last stage
+	// before quantization, which is the only correct place for a display
+	// correction: after tone mapping, after the ML grade, after scaling.
+	// An empty path unloads and returns S_OK; a missing/corrupt file returns E_FAIL
+	// so the caller can tell "cleared" from "failed to load".
+	HRESULT LoadCubeLut(const char* utf8Path) override;
+	// 0 = off, 1 = gamma only, 2 = greyscale, 3 = full 3D. Separate from the load
+	// so the user can A/B the modes without re-parsing the file.
+	void SetCubeLutMode(int mode) override { m_iCubeLutMode = mode; }
+
 	void SetHDR10ShaderParams(float, float, float, float, float, int);
 	void SetDolbyVisionDynamicParams();
+
+	// Picks and creates the correction (converter) shader from the CURRENT source
+	// format and settings. Extracted from InitMediaType so a live settings change
+	// can re-run just the selection: bConvertToSdr decides WHICH shader is built
+	// rather than being a constant it feeds, so it cannot be pushed as a uniform.
+	void UpdateCorrectionShader();
+
+	// Rebuilds m_pToneLut from the current scene statistics. Cheap (1024 entries,
+	// one 4 KB upload) and only runs when the statistics actually moved, so it is
+	// safe to call every frame from SetMLParams().
+	void UpdateToneLut();
+	// True when the experimental mapper is selected AND has parameters ready, i.e.
+	// the converter must take the LUT branch. Single source of truth for the
+	// C++-side enable, so the cbuffer flag and the shader branch cannot disagree.
+	bool ToneLutActive() const {
+		return m_iExperimentalToneMapper != 0 && m_bToneLutReady && m_pToneLutSRV != nullptr;
+	}
+
+	// True when the per-frame scene statistics are needed — by the Zion grade, by
+	// AUTO mode warming up, or by the experimental tone mapper.
+	//
+	// This is deliberately ONE predicate rather than a condition repeated at each
+	// site. It used to be three separate conditions that had to agree, and they
+	// did not: the latch recording "a convert output exists" was gated on the Zion
+	// grade alone, so selecting the tone mapper with the grade off left the
+	// extractor never running, the features at zero, and the mapper permanently
+	// inactive — a setting that is applied, reported back, and does nothing.
+	bool MLStatsNeeded() const {
+		return m_bMLActive || (m_bML && m_iMLMode == ML_Auto) || m_iExperimentalToneMapper != 0;
+	}
 
 	void UpdateMLActive();
 	void SetMLParams();

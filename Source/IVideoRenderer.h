@@ -152,16 +152,46 @@ struct Settings_t {
 	bool bHdrLocalToneMapping;
 	int  iHdrLocalToneMappingType; // 1=ACES 2=Reinhard 3=Hable 4=Mobius 5=BT.2390 6=...
 	int iHdrDisplayMaxNits;
+	// Display BLACK level in nits — measured, e.g. 0.16 for a projector at bb1.0.
+	// The tone mapper builds its destination range as [min, max]; without this it
+	// assumes the display's black is absolute zero and compresses the shadow end
+	// into a range the panel cannot show. Float, not int: sub-1-nit blacks are the
+	// norm and 0.16 would round to 0. 0.0 == previous behaviour.
+	float fHdrDisplayMinNits = 0.0f;
+	// Output gamut of the tone-mapped SDR signal.
+	//   0 = convert BT.2020 -> BT.709 (the standard SDR target, default)
+	//   1 = keep BT.2020, so a display whose gamut exceeds Rec.709 shows the
+	//       source's real colour instead of having everything outside 709
+	//       mapped away. Not a standards target — it is the "use the panel's
+	//       full gamut" choice, and the display must be set to match.
+	int iOutputGamut = 0;
+	// The CONTENT's peak luminance, in nits — the top of the range the tone curves
+	// map FROM. Distinct from iHdrDisplayMaxNits, which is the DISPLAY's peak and is
+	// only read by the HDR-output path.
+	//
+	// This exists because the scene-referred curves (ACES, Reinhard, Mobius,
+	// BT.2390) normalise the signal by the content peak, and without a real value
+	// they fall back to a 1000-nit guess. On the DeckLink capture path that guess is
+	// all there is — the card's ST.2086 frame metadata is unsupported on HDMI, so
+	// MaxCLL never arrives. Feeding a range 5-10x larger than the content makes
+	// those curves render far too dark, which is what a user sees as "ACES looks
+	// broken".
+	//
+	// 1000 is the HDR10 nominal default and reproduces the previous behaviour.
+	float fHdrTitlePeakNits = 1000.0f;
 	bool bHDRPassthroughRaw = false; // skip tone map + ML: show the raw HDR/DV signal on SDR (demo)
 	int iInputColorSpace = ICS_Auto;  // forced input colour space for live HDMI capture (ICS_*)
-	// HTPC cadence: when the input is 23.976/24p, auto-switch the display
-	// refresh to a clean multiple of the source rate (2x = 48 Hz, 4x = 96 Hz,
-	// 5x = 120 Hz ...) so every source frame maps to an integer number of
-	// refreshes (no judder on pans). Prefers the lowest multiple the display
-	// actually offers; if none is supported it falls back to the display's own
-	// configured refresh. Restores the original refresh when the input stops
-	// being 24p or the renderer tears down. 0 = off, 1 = on.
-	int iRefreshSwitch24p = 0;
+
+	// Experimental tone mapping (libplacebo port). A SEPARATE axis from the
+	// shipped tone mapping, not a modification of it: 0 leaves every existing
+	// curve, control and quality decision untouched, which is what makes this
+	// safe to A/B on a calibrated display.
+	//   0 = off — the shipped PQ/HLG->SDR converters, bit-identical
+	//   1 = the libplacebo spline, built per scene on the CPU into a 1D table
+	int   iExperimentalToneMapper = 0;
+	// pl_tone_map_spline's "Contrast": higher is steeper (closer to clip),
+	// preserving midtones at the cost of shadow/highlight detail. 0.00 .. 1.50.
+	float fToneLutContrast = 0.50f;
 
 	// Zion ML grade
 	bool  bMLEnabled = false;
@@ -173,6 +203,33 @@ struct Settings_t {
 	float fMLShadow = 2.0f;      // shadow strength: 0=Off 1=Low 2=Med 3=High 4=VHi 5=Saturate
 	float fMLShadowDehaze = 0.0f; // 0..1 scale DOWN the model's shadow-toe lift (lifted-black haze control); 0 = model as-is
 	float fMLHighlightRolloffCtrl = 0.0f; // model-override: signed offset added to the model's rolloff in Auto (rim highlight softening); 0 = model as-is
+	// model-override: signed offset ADDED to the model's gamma exponent in Auto.
+	//
+	// The model keeps shaping the per-scene gamma; this moves it up or down on top
+	// of that judgement without freezing the scene adaptation — the same contract
+	// as fMLHighlightRolloffCtrl, and the reason it is additive rather than a
+	// multiplier (a multiplier cannot lift a scene the model judged neutral, since
+	// 1.0 is a fixed point).
+	//
+	// It rides the existing gamma block, so the shader's own guards bound where it
+	// acts: `fade` over the shadows and `hi_g` over the highlights, which keeps it
+	// a midtone move. 0 = model as-is.
+	float fMLGammaTopUp = 0.0f;
+	// Hable knee — the point, in display-relative light (1.0 = the display's
+	// white), below which the Hable curve is REPLACED BY IDENTITY.
+	//
+	// Hable has no knee: it is a global rational curve and compresses everywhere,
+	// which is what makes it highlight-safe and also why the whole picture sits
+	// low — the shadows and lower mids pay compression they do not need, because
+	// only the top of the range genuinely has to compress.
+	//
+	// Below `fHdrHableKnee` the value passes through untouched; above it Hable
+	// applies unchanged (still normalised by the measured per-scene peak, so the
+	// content peak still lands on white and the asymptote still protects). The
+	// transition is a smoothstep band, not a corner.
+	//
+	// 0 = pure Hable, i.e. exactly the behaviour before this existed.
+	float fHdrHableKnee = 0.0f;
 	bool  bMLHighlightEnabled = true;
 	float fMLHighlight = 0.0f;   // manual highlight roll-off [-0.3, 0.4]
 	bool  bMLDebugCopy = false;  // grade steps use the plain copy shader (shader-vs-plumbing bisect)
@@ -271,10 +328,14 @@ struct Settings_t {
 		bConvertToSdr                   = true;
 		iHdrOsdBrightness               = 0;
 		iSDRDisplayNits                 = SDR_NITS_DEF;
+		fHdrDisplayMinNits              = 0.0f; // 0 == the mapping assumes an ideal black
+		iOutputGamut                    = 0;    // 0 == Rec.709 SDR output
+		fHdrTitlePeakNits               = 1000.0f; // HDR10 nominal content peak
+		iExperimentalToneMapper         = 0;    // 0 == the shipped tone mapping
+		fToneLutContrast                = 0.50f; // pl_tone_map_spline default
 		iHdrLocalToneMappingType        = 5;   // BT.2390 default
 		bHDRPassthroughRaw              = false;
 		iInputColorSpace                = ICS_Auto;
-		iRefreshSwitch24p               = 0;
 		bMLEnabled                      = false;
 		iMLMode                         = ML_Disable;
 		bMLToneCurveEnabled             = true;
@@ -284,6 +345,8 @@ struct Settings_t {
 		fMLShadow                       = 2.0f;
 		fMLShadowDehaze                 = 0.0f;
 		fMLHighlightRolloffCtrl         = 0.0f;
+		fMLGammaTopUp                   = 0.0f;
+		fHdrHableKnee                   = 0.0f;
 		bMLHighlightEnabled             = true;
 		fMLHighlight                    = 0.0f;
 		bMLDebugCopy                    = false;
@@ -335,6 +398,9 @@ struct RenderStats_t {
 	unsigned skipped = 0;          // double-rate skip path (m_RenderStats.dropped2)
 	unsigned failed = 0;           // render failures (m_RenderStats.failed)
 	double   drawFps = 0.0;        // presented frames per second (measured)
+	double   presentLatencyMs = 0; // how far the frame on screen lags capture time
+	                               // (wall-clock delta minus stream-time delta since
+	                               // the first presented frame)
 };
 
 interface __declspec(uuid("1AB00F10-5F55-42AC-B53F-38649F11BE3E"))

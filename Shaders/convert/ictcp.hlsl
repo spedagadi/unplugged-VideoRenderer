@@ -47,3 +47,46 @@ float3 ictcp_to_linear(float3 ictcp)
 	float3 lms = ST2084ToLinear(float4(max(pq_lms, 0.0), 0.0), 10000.0).rgb;
 	return max(mul(lms2rgb, max(lms, 0.0)), 0.0);
 }
+
+// Inverse, desaturating ONLY as far as the gamut requires.
+//
+// Ct/Cp are ABSOLUTE chroma, not relative: tone-mapping I downward while handing
+// the original Ct/Cp back makes the colour relatively more saturated than the
+// source, and the reconstruction can leave the gamut. Plain ictcp_to_linear then
+// clamps negative L'M'S' to zero, which is a hue error rather than a graceful
+// falloff — the same family of failure as per-channel RGB clamping, one layer up.
+//
+// So pull the chroma toward the achromatic axis at the NEW intensity until the
+// RGB fits. This keeps the hue (the Ct/Cp ratio is scaled uniformly, so it is
+// unchanged) and keeps the tone-mapped intensity; only saturation gives.
+//
+// A search rather than a fixed factor because PQ decoding is nonlinear: there is
+// no closed form for the scale that just reaches the boundary. The in-gamut case
+// — almost every pixel — costs one reconstruction and zero iterations.
+// `maxNits` is the DISPLAY CEILING, in the same units ictcp_to_linear returns —
+// which is ABSOLUTE NITS, not normalised. Getting this wrong is not subtle: a
+// ceiling of 1.0 means "1 nit", so every pixel fails the test, the bisection runs
+// on all of them, and the picture goes black and white because the chroma scale
+// converges toward the achromatic axis. The caller knows the ceiling; this
+// function cannot.
+float3 ictcp_to_linear_gamut(float3 ictcp, float maxNits)
+{
+	float3 rgb = ictcp_to_linear(ictcp);
+	if (min(min(rgb.r, rgb.g), rgb.b) >= 0.0 &&
+	    max(max(rgb.r, rgb.g), rgb.b) <= maxNits)
+		return rgb;                       // in gamut: nothing to do
+
+	// Bisect on the chroma scale. s = 0 is the achromatic value of the same I,
+	// which is in gamut by construction: the curve bounds I, and zero chroma
+	// reconstructs that same bounded level on all three channels.
+	float sLo = 0.0, sHi = 1.0;
+	for (int i = 0; i < 5; ++i) {
+		const float s = 0.5 * (sLo + sHi);
+		const float3 c = ictcp_to_linear(float3(ictcp.x, ictcp.y * s, ictcp.z * s));
+		if (min(min(c.r, c.g), c.b) >= 0.0 && max(max(c.r, c.g), c.b) <= maxNits)
+			sLo = s;
+		else
+			sHi = s;
+	}
+	return ictcp_to_linear(float3(ictcp.x, ictcp.y * sLo, ictcp.z * sLo));
+}

@@ -68,6 +68,21 @@
 #define OPT_HdrLocaLToneMapping            L"HdrLocalToneMapping"
 #define OPT_HdrLocaLToneMappingType        L"HdrLocalToneMappingType"
 #define OPT_HdrDisplayNits                 L"HdrDisplayNits"
+// Stored as MILLINITS in a DWORD (0.16 nits -> 160): keeps every nits setting a
+// DWORD like its neighbours, and 1/1000 nit is ample resolution for a black level.
+#define OPT_HdrDisplayMinNits              L"HdrDisplayMinNits"
+#define OPT_OutputGamut                    L"OutputGamut"
+// Content peak, nits (the top of the range the tone curves map FROM), stored as
+// MILLINITS in a DWORD like HdrDisplayMinNits. Distinct from HdrDisplayNits, which
+// is the DISPLAY's peak.
+#define OPT_HdrTitlePeakNits               L"HdrTitlePeakNits"
+// Experimental tone mapping (libplacebo port). Separate keys from the shipped
+// tone mapping on purpose: turning the mapper off must restore exactly the
+// previous picture, which it cannot do if the two share a stored value.
+#define OPT_ExperimentalToneMapper         L"ExperimentalToneMapper"
+// Contrast as MILLI-units in a DWORD (0.50 -> 500), matching HdrDisplayMinNits:
+// keeps every one of these a DWORD like its neighbours.
+#define OPT_ToneLutContrast                L"ToneLutContrast"
 #define OPT_HdrToggleDisplay               L"HdrToggleDisplay"
 #define OPT_HdrOsdBrightness               L"HdrOsdBrightness"
 #define OPT_ConvertToSdr                   L"ConvertToSdr"
@@ -301,6 +316,21 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrDisplayNits, dw)) {
 			m_Sets.iHdrDisplayMaxNits = discard<int>(dw, HDR_NITS_DEF, HDR_NITS_MIN, HDR_NITS_MAX);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrDisplayMinNits, dw)) {
+			m_Sets.fHdrDisplayMinNits = discard<float>((float)dw / 1000.0f, 0.0f, 0.0f, (float)HDR_NITS_MIN);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_OutputGamut, dw)) {
+			m_Sets.iOutputGamut = discard<int>(dw, 0, 0, 1);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrTitlePeakNits, dw)) {
+			m_Sets.fHdrTitlePeakNits = discard<float>((float)dw / 1000.0f, 1000.0f, 100.0f, 4000.0f);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_ExperimentalToneMapper, dw)) {
+			m_Sets.iExperimentalToneMapper = discard<int>(dw, 0, 0, 1);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_ToneLutContrast, dw)) {
+			m_Sets.fToneLutContrast = discard<float>((float)dw / 1000.0f, 0.50f, 0.0f, 1.5f);
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrToggleDisplay, dw)) {
 			m_Sets.iHdrToggleDisplay = discard<int>(dw, HDRTD_On, HDRTD_Disabled, HDRTD_OnOff);
@@ -1639,6 +1669,11 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 		key.SetDWORDValue(OPT_HdrLocaLToneMapping, m_Sets.bHdrLocalToneMapping);
 		key.SetDWORDValue(OPT_HdrLocaLToneMappingType, m_Sets.iHdrLocalToneMappingType);
 		key.SetDWORDValue(OPT_HdrDisplayNits,      m_Sets.iHdrDisplayMaxNits);
+		key.SetDWORDValue(OPT_HdrDisplayMinNits,   (DWORD)(m_Sets.fHdrDisplayMinNits * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_OutputGamut,         m_Sets.iOutputGamut);
+		key.SetDWORDValue(OPT_HdrTitlePeakNits,    (DWORD)(m_Sets.fHdrTitlePeakNits * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_ExperimentalToneMapper, m_Sets.iExperimentalToneMapper);
+		key.SetDWORDValue(OPT_ToneLutContrast,     (DWORD)(m_Sets.fToneLutContrast * 1000.0f + 0.5f));
 		key.SetDWORDValue(OPT_HdrToggleDisplay,    m_Sets.iHdrToggleDisplay);
 		key.SetDWORDValue(OPT_HdrOsdBrightness,    m_Sets.iHdrOsdBrightness);
 		key.SetDWORDValue(OPT_ConvertToSdr,        m_Sets.bConvertToSdr);
@@ -1852,6 +1887,18 @@ STDMETHODIMP CMpcVideoRenderer::Flt_SetInt(LPCSTR field, int value)
 		}
 	}
 
+	// Display LUT mode: 0 = off, 1 = gamma only, 2 = greyscale, 3 = full 3D.
+	// Separate from the load so the modes can be A/B'd without re-parsing the file.
+	if (!strcmp(field, "cubeLutMode")) {
+		if (value >= 0 && value <= 3) {
+			CAutoLock cRendererLock(&m_RendererLock);
+
+			m_VideoProcessor->SetCubeLutMode(value);
+			return S_OK;
+		}
+		return E_INVALIDARG;
+	}
+
 	if (!strcmp(field, "stereo3dTransform")) {
 		if (value == STEREO3D_AsIs || value == STEREO3D_HalfOverUnder_to_Interlace) {
 			CAutoLock cRendererLock(&m_RendererLock);
@@ -1918,6 +1965,21 @@ STDMETHODIMP CMpcVideoRenderer::Flt_SetBin(LPCSTR field, LPVOID value, int size)
 
 				return m_VideoProcessor->AddPostScaleShader(shaderName, shaderCode);
 			}
+		}
+
+		// Display calibration 3D LUT. The blob is a UTF-8 file path; an empty
+		// path unloads. Loaded here rather than through Settings_t so the struct
+		// does not have to carry a 260-wchar path across the COM boundary, where
+		// a layout drift between engine and filter has bitten us before.
+		if (!strcmp(field, "cmd_loadCubeLut")) {
+			std::string path((const char*)value, (size_t)size);
+			while (!path.empty() && (path.back() == '\0' || path.back() == '\n' || path.back() == '\r')) {
+				path.pop_back();
+			}
+
+			CAutoLock cRendererLock(&m_RendererLock);
+
+			return m_VideoProcessor->LoadCubeLut(path.c_str());
 		}
 	}
 

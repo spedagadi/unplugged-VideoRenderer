@@ -15,6 +15,8 @@ Texture2D src_tex : register(t3);    // pre-grade source (convert output) for th
 SamplerState sampSrc : register(s3);
 Texture2D skin_gate : register(t4);  // 160x90 R8 Poisson-relaxed person×skin gate (C1 -> 0)
 SamplerState sampGate : register(s4);
+Texture2D skin_lut : register(t1);   // trained P(skin) LUT, sampled on gamma-2.2 Cr/Cb
+SamplerState sampSkin : register(s1);
 
 struct PS_INPUT
 {
@@ -91,6 +93,13 @@ cbuffer MLParams : register(b0)
 	float MLSkinPreserve;  // 0..1 luma re-anchor toward source skin tone (Poisson-gated)
 	float MLSkinPad0;
 	float MLSkinPad1;
+	// Appended tail (offsets above unchanged). Only this shader declares this far.
+	// The user's signed offset on the model's gamma, kept SEPARATE from MLGamma so
+	// it can be held back inside skin by the trained skin LUT below.
+	float MLGammaTopUp;
+	float _padGT0;
+	float _padGT1;
+	float _padGT2;
 };
 
 static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
@@ -109,7 +118,7 @@ float srcLumAt(float2 uv)
 // Unified tone curve: shadow toe → gamma (sky-relaxed guard) → highlight rolloff →
 // sky cloud-band lift. Operates on I_norm; returns graded I_norm. `sky` = S *
 // MLSkyStrength (0 when sky features are off → exactly the global path).
-float applyToneCurve(float x, float sky)
+float applyToneCurve(float x, float sky, float skinW)
 {
 	// 1. Shadow toe: DV L2 offset pedestal lift — raises dark end toward knee
 	if (MLShadowToe > 0.005 && x < MLShadowKnee && x > 0.0) {
@@ -120,11 +129,16 @@ float applyToneCurve(float x, float sky)
 
 	// 2. Gamma with a sky-relaxed guard leg. Both legs use the SAME curve family
 	// and differ only in the highlight guard, so they coincide below the guard band.
-	if (MLGamma != 1.0 && x > 0.001 && x < 0.999) {
+	// The user's top-up rides THIS block rather than a separate stage, so the
+	// fade/hi_g guards bound it too — it stays a midtone move and cannot reach the
+	// shadows or the highlights. It is held back inside skin so the lift lands on
+	// the picture and not on faces; the model's own MLGamma is untouched either way.
+	const float g = MLGamma + MLGammaTopUp * (1.0 - skinW);
+	if (g != 1.0 && x > 0.001 && x < 0.999) {
 		float fade = smoothstep(0.08, 0.45, x);
 		float hi_g = smoothstep(MLGuard, 0.98, x);
 		float hi_s = smoothstep(MLSkyGuard, 0.98, x);
-		float p = pow(x, 1.0 / MLGamma);
+		float p = pow(x, 1.0 / g);
 		float I_g = lerp(x, p, fade * (1.0 - hi_g));
 		float I_s = lerp(x, p, fade * (1.0 - hi_s));
 		x = lerp(I_g, I_s, sky);
@@ -162,6 +176,19 @@ float4 main(PS_INPUT input) : SV_Target
 	}
 	float3 ictcp = linear_to_ictcp(lin);
 
+	// Skin weight from the trained P(skin) LUT — the SAME derivation the chroma
+	// pass uses (gamma-2.2 Cr/Cb against the same grid bounds), so the two passes
+	// agree on what counts as skin. Sampled here rather than inside applyToneCurve
+	// because it needs `lin`, which only main() has.
+	float3 g22 = (IsPQ > 0.5) ? pow(max(lin, 0.0), 1.0 / 2.2) : color.rgb;
+	const float y_g22 = dot(g22, luma_w);
+	const float cr = (g22.r - y_g22) / 1.5748;
+	const float cb = (g22.b - y_g22) / 1.8556;
+	const float2 skin_uv = saturate(float2(
+		(cr - MLSkinLUTCR0) / (MLSkinLUTCR1 - MLSkinLUTCR0),
+		(cb - MLSkinLUTCB0) / (MLSkinLUTCB1 - MLSkinLUTCB0)));
+	const float skinW = skin_lut.Sample(sampSkin, skin_uv).r;
+
 	float I = ictcp.x;
 	float I_peak = (IsPQ > 0.5) ? max(MLL1Max, 0.01) : SDR_I_PEAK_PQ;
 	float I_norm = I / I_peak;
@@ -183,7 +210,7 @@ float4 main(PS_INPUT input) : SV_Target
 	// === UNIFIED TONE CURVE (shadow toe → gamma → highlight rolloff) ===
 	// Global — applied to every pixel identically; S=0 reproduces the global path.
 	const float skyT = S * MLSkyStrength;
-	I_norm = applyToneCurve(I_norm, skyT);
+	I_norm = applyToneCurve(I_norm, skyT, skinW);
 
 	// Skin tone-preservation (stage 5): steer the WHOLE person region's luma back
 	// toward the source skin tone. The gate is a POISSON-RELAXED FIELD of the pure

@@ -408,10 +408,12 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_iHdrDisplayMaxNits   = config.iHdrDisplayMaxNits;
 	m_bHDRPassthroughRaw   = config.bHDRPassthroughRaw;
 	m_iHdrToggleDisplay    = config.iHdrToggleDisplay;
-	m_iRefreshSwitch24p    = config.iRefreshSwitch24p;
 	m_iHdrOsdBrightness    = config.iHdrOsdBrightness;
 	m_bConvertToSdr        = config.bConvertToSdr;
 	m_iSDRDisplayNits      = config.iSDRDisplayNits;
+	m_fHdrDisplayMinNits   = config.fHdrDisplayMinNits;
+	m_fHdrTitlePeakNits    = config.fHdrTitlePeakNits;
+	m_fHdrHableKnee        = config.fHdrHableKnee;
 
 	m_bML                   = config.bMLEnabled;
 	m_iMLMode               = config.iMLMode;
@@ -420,6 +422,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_fMLShadowDehaze       = config.fMLShadowDehaze;
 	m_fMLHighlight          = config.fMLHighlight;
 	m_fMLHighlightRolloffCtrl = config.fMLHighlightRolloffCtrl;
+	m_fMLGammaTopUp         = config.fMLGammaTopUp;
 	m_bMLDebugCopy          = config.bMLDebugCopy;
 	m_bMLDebug              = config.bMLDebugLog;
 	if (m_pFaceDetect) m_pFaceDetect->SetLogEnabled(m_bMLDebug);   // per-frame face lines follow the flag
@@ -584,10 +587,6 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 
 CDX11VideoProcessor::~CDX11VideoProcessor()
 {
-	// 24p cadence: never leave the display on a refresh we forced — restore the
-	// original mode even if the pipeline was torn down without a clean stop.
-	RestoreRefreshRateOverride();
-
 	for (const auto& [displayName, state] : m_hdrModeSavedState) {
 		DisplayConfig_t displayConfig = {};
 		if (GetDisplayConfig(displayName.c_str(), displayConfig)) {
@@ -861,6 +860,22 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_pCorrectionConstants.Release();
 	m_pPostScaleConstants.Release();
 
+	m_pCubeLutSRV.Release();
+	m_pCubeLut.Release();
+	m_pCubeLutSampler.Release();
+	m_iCubeLutSize    = 0;
+	m_bCubeLutEnabled = false;
+
+	// The experimental tone curve belongs to the device too: these are D3D11
+	// objects, and leaving them alive across a device reset would hand the new
+	// device textures it never created. Rebuilt on the next frame from the
+	// statistics, so nothing is lost by releasing them here.
+	m_pToneLutSRV.Release();
+	m_pToneLut.Release();
+	m_pToneLutSampler.Release();
+	m_bToneLutReady = false;
+	m_MLToneMaxSmooth = -1.0f;
+
 	m_pHDR10ToneMappingConstants.Release();
 	m_pDoViDynamicConstants.Release();
 
@@ -1075,9 +1090,351 @@ void CDX11VideoProcessor::SetShaderConvertColorParams()
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Experimental tone mapping — ported from libplacebo src/tone_mapping.c
+//
+// libplacebo builds a 1D tone-curve LUT on the CPU and the shader SAMPLES it,
+// instead of evaluating a curve per pixel. That is both cheaper and better:
+// complex curves (splines, ST.2094) become practical, and each curve carries a
+// tunable parameter rather than being one fixed shape.
+//
+// Only what this port needs is here, and it lives entirely apart from the
+// shipped tone mapping — selecting none of these leaves that path bit-identical.
+// Where this and upstream disagree, UPSTREAM IS RIGHT: it is the reference.
+//
+// The scene statistics it needs are already computed per frame for the Zion
+// grade (ml_features.cpp, itself a port of libplacebo's extract_features_cpu):
+// features[0] = maxscl, features[1] = average. No new readback, no second
+// statistics path to keep in step.
+// ---------------------------------------------------------------------------
+// Entries in the experimental tone curve. libplacebo defaults to 256 and allows
+// up to 4096; 1024 keeps the 4 KB upload trivial while leaving the interpolated
+// curve indistinguishable from the closed form. Must match TONE_LUT_SIZE in the
+// converter shaders — the shader takes it from the constant buffer so the two
+// cannot silently disagree.
+static constexpr int kToneLutSize = 1024;
+
+namespace exptm {
+
+// PL_MIX / fclampf / pl_smoothstep, verbatim from libplacebo src/common.h. The
+// smoothstep matters: pl_smoothstep returns x >= edge0 (not a clamped ramp) when
+// the edges coincide, and st2094_pick_knee can hand it equal edges.
+static inline float mixf(float a, float b, float t) { return t * b + (1.0f - t) * a; }
+static inline float clampf(float x, float lo, float hi) {
+	return x < lo ? lo : (x > hi ? hi : x);
+}
+static inline float smoothstepf(float e0, float e1, float x) {
+	if (e0 == e1) {
+		return x >= e0 ? 1.0f : 0.0f;
+	}
+	x = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+	return x * x * (3.0f - 2.0f * x);
+}
+
+// ST.2084, matching pl_hdr_rescale() against PL_HDR_NITS (libplacebo
+// src/colorspace.c). Used only at the EDGES of this block: the params and the
+// table are PQ, because that is the domain libplacebo runs the spline in.
+static float PqToLinearNits(float x) {
+	const float m1 = 2610.0f / 16384.0f, m2 = 2523.0f / 4096.0f * 128.0f;
+	const float c1 = 3424.0f / 4096.0f, c2 = 2413.0f / 4096.0f * 32.0f, c3 = 2392.0f / 4096.0f * 32.0f;
+	x = powf(fmaxf(x, 0.0f), 1.0f / m2);
+	x = fmaxf(x - c1, 0.0f) / (c2 - c3 * x);
+	return powf(fmaxf(x, 0.0f), 1.0f / m1) * 10000.0f;
+}
+static float LinearNitsToPq(float y) {
+	const float m1 = 2610.0f / 16384.0f, m2 = 2523.0f / 4096.0f * 128.0f;
+	const float c1 = 3424.0f / 4096.0f, c2 = 2413.0f / 4096.0f * 32.0f, c3 = 2392.0f / 4096.0f * 32.0f;
+	y = powf(fmaxf(y / 10000.0f, 0.0f), m1);
+	return powf((c1 + c2 * y) / (1.0f + c3 * y), m2);
+}
+
+// PL_HDR_PQ code values — NOT nits. This is load-bearing: the spline's
+// `scaling` is PL_HDR_PQ and libplacebo's own colour-mapping shader sets
+// `input_scaling`/`output_scaling` to PL_HDR_PQ too (src/shaders/colorspace.c),
+// so the table's index axis, its values, and every param below live in PQ.
+// Its ML feature extractor does the same (src/ml_render.c feeds the spline
+// `features[0]`/`features[1]` — the same two numbers this renderer's extractor
+// produces — with no rescale at all).
+//
+// Running the same math in nits instead looks equivalent and is not: the pivot
+// and the knee are picked by interpolation along the index axis, so the axis
+// domain decides where the knee actually lands.
+struct Params {
+	// Defaults are PQ code values for the HDR10 reference case: 0.05 .. 1000
+	// nits input, 0 .. 203 nits output (PL_COLOR_SDR_WHITE).
+	float input_min = 0.0000f, input_max = 0.7518f, input_avg = 0.5081f;
+	float output_min = 0.0000f, output_max = 0.5806f;
+	// PL_TONE_MAP_CONSTANTS defaults (libplacebo tone_mapping.h), NOT guessed.
+	// slope_tuning/slope_offset are the two that shape the spline's knee slope.
+	float knee_minimum = 0.1f, knee_maximum = 0.8f, knee_default = 0.4f, knee_adaptation = 0.4f;
+	float slope_tuning = 1.5f, slope_offset = 0.2f;
+	// pl_tone_map_spline "Contrast", 0.00 .. 1.50, default 0.50
+	float spline_contrast = 0.50f;
+};
+
+// fix_constants() + the params_infer clamp, from pl_tone_map_params_infer().
+// The clamp is not cosmetic: without it a dark scene (20-nit peak) builds a
+// curve whose entire input range sits below the display's own white, so the
+// spline's pivot lands outside the data and the result is a near-linear ramp.
+static void InferParams(Params& p) {
+	const float eps = 1e-6f;
+	p.knee_adaptation = clampf(p.knee_adaptation, 0.0f, 1.0f);
+	p.knee_minimum    = clampf(p.knee_minimum, eps, 0.5f - eps);
+	p.knee_maximum    = clampf(p.knee_maximum, 0.5f + eps, 1.0f - eps);
+	p.knee_default    = clampf(p.knee_default, p.knee_minimum, p.knee_maximum);
+	p.slope_tuning    = clampf(p.slope_tuning, 0.0f, 10.0f);
+	p.slope_offset    = clampf(p.slope_offset, 0.0f, 1.0f);
+	p.spline_contrast = clampf(p.spline_contrast, 0.0f, 1.5f);
+
+	// Constrain the input peak to be no less than min(output_max, 100 nits).
+	// input_scaling == output_scaling here, so libplacebo's rescale of output_max
+	// between them is the identity and only the 100-nit floor does any work.
+	const float sdr = fminf(p.output_max, LinearNitsToPq(100.0f));
+	p.input_max = fmaxf(p.input_max, sdr);
+}
+
+// libplacebo st2094_pick_knee(): the pivot is chosen from SOURCE SCENE
+// BRIGHTNESS, which is exactly features[1] from the ML extractor.
+static void St2094PickKnee(float* out_src, float* out_dst, const Params& p) {
+	const float src_min = p.input_min;
+	const float src_max = p.input_max;
+	const float src_avg = p.input_avg;
+	const float dst_min = p.output_min;
+	const float dst_max = p.output_max;
+
+	const float src_knee_min = mixf(src_min, src_max, p.knee_minimum);
+	const float src_knee_max = mixf(src_min, src_max, p.knee_maximum);
+	const float dst_knee_min = mixf(dst_min, dst_max, p.knee_minimum);
+	const float dst_knee_max = mixf(dst_min, dst_max, p.knee_maximum);
+
+	// PL_DEF: fall back to the default knee when there is no average.
+	float src_knee = src_avg > 0.0f ? src_avg : mixf(src_min, src_max, p.knee_default);
+	src_knee = clampf(src_knee, src_knee_min, src_knee_max);
+
+	const float target = (src_knee - src_min) / fmaxf(src_max - src_min, 1e-6f);
+	const float adapted = mixf(dst_min, dst_max, target);
+
+	const float tuning = 1.0f - smoothstepf(p.knee_maximum, p.knee_default, target) *
+	                             smoothstepf(p.knee_minimum, p.knee_default, target);
+	const float adaptation = mixf(p.knee_adaptation, 1.0f, tuning);
+	float dst_knee = mixf(src_knee, adapted, adaptation);
+	dst_knee = clampf(dst_knee, dst_knee_min, dst_knee_max);
+
+	*out_src = src_knee;
+	*out_dst = dst_knee;
+}
+
+// libplacebo spline(): the function's `map`, operating IN PLACE on a table of PQ
+// values. Single-pivot polynomial — quadratic below the pivot, cubic above,
+// solved so the slope matches through the knee. Do not "simplify" the PQ away:
+// it is the domain libplacebo solves in, and the curve shape depends on it.
+static void SplineMap(float* lut, int n, const Params& p) {
+	float src_pivot = 0.0f, dst_pivot = 0.0f;
+	St2094PickKnee(&src_pivot, &dst_pivot, p);
+
+	// Solve for the linear knee (Pa = 0)
+	float slope = (dst_pivot - p.output_min) / fmaxf(src_pivot - p.input_min, 1e-6f);
+
+	// Tune the slope at the knee point slightly: raise it to a user-provided
+	// gamma exponent, multiplied by an extra tuning coefficient designed to make
+	// the slope closer to 1.0 when the difference in peaks is low, and closer to
+	// linear when the difference between peaks is high.
+	const float ratio_raw = p.input_max / fmaxf(p.output_max, 1e-6f) - 1.0f;
+	const float ratio = clampf(p.slope_tuning * ratio_raw, p.slope_offset, 1.0f + p.slope_offset);
+	slope = powf(fmaxf(slope, 1e-6f), (1.0f - p.spline_contrast) * ratio);
+
+	// Normalise everything to the pivot to make the math easier
+	const float in_min  = p.input_min - src_pivot;
+	const float in_max  = p.input_max - src_pivot;
+	const float out_min = p.output_min - dst_pivot;
+	const float out_max = p.output_max - dst_pivot;
+
+	// Solve P of order 2 for: P(in_min) = out_min, P'(0) = slope, P(0) = 0
+	const float Pa = (out_min - slope * in_min) / fmaxf(in_min * in_min, 1e-9f);
+	const float Pb = slope;
+
+	// Solve Q of order 3 for: Q(in_max) = out_max, Q''(in_max) = 0, Q(0) = 0, Q'(0) = slope
+	const float t = 2.0f * in_max * in_max;
+	const float Qa = (slope * in_max - out_max) / fmaxf(in_max * t, 1e-9f);
+	const float Qb = -3.0f * (slope * in_max - out_max) / fmaxf(t, 1e-9f);
+	const float Qc = slope;
+
+	for (int i = 0; i < n; ++i) {
+		float x = lut[i] - src_pivot;
+		x = x > 0.0f ? ((Qa * x + Qb) * x + Qc) * x : (Pa * x + Pb) * x;
+		lut[i] = x + dst_pivot;
+	}
+}
+
+// pl_tone_map_generate() for the spline. The index axis is uniform in PQ over
+// [input_min, input_max] and each entry is the output in PQ — exactly what
+// libplacebo builds when input_scaling/output_scaling are PL_HDR_PQ, which is
+// how both its colour-mapping shader and its ML extractor call it.
+//
+// `out` is filled with the output in DISPLAY-RELATIVE linear light: 0.0 is the
+// display's measured black, 1.0 its measured white. That is the domain the
+// shader's plain `pow(v, 1/2.2)` encodes, and it has to be this rather than
+// absolute light for a panel that has a black offset.
+//
+// A projector's response is L = Lb + (Lw - Lb)*v^gamma — the offset is IN the
+// panel, which is what "black output offset 100%" in a calibration report means.
+// Handing the shader absolute light (nits/Lw) makes the encode add that offset a
+// second time: source black came out at code 15 instead of code 0, i.e. exactly
+// 2*Lb, which is visible as blacks sitting at grey. Normalising by the display's
+// own RANGE instead of its white is what removes the double count.
+//
+// The PQ decode back to linear happens here, once per entry, rather than per
+// pixel per channel.
+static void SplineLut(float* out, int n, Params p) {
+	InferParams(p);
+
+	for (int i = 0; i < n; ++i) {
+		out[i] = mixf(p.input_min, p.input_max, (float)i / (float)(n - 1));
+	}
+
+	SplineMap(out, n, p);
+
+	// Sanitize outputs, adapt back out of the function's scaling, and convert to
+	// display-relative. The subtraction uses the SAME clamp bounds the sanitize
+	// does, so entry 0 lands on exactly 0.0 and the last entry on exactly 1.0 —
+	// the two codes that must be right for black and white to land where the
+	// calibration measured them.
+	const float outMinNits = PqToLinearNits(p.output_min);
+	const float outMaxNits = PqToLinearNits(p.output_max);
+	const float range = fmaxf(outMaxNits - outMinNits, 1e-6f);
+	for (int i = 0; i < n; ++i) {
+		out[i] = (PqToLinearNits(clampf(out[i], p.output_min, p.output_max)) - outMinNits) / range;
+	}
+}
+
+} // namespace exptm
+
+void CDX11VideoProcessor::UpdateCorrectionShader()
+{
+	m_pCorrectionConstants.Release();
+	if (!m_D3D11VP.IsReady()) {
+		// Nothing to correct through: the Tex VP path builds its converter instead
+		// (see UpdateConvertColorShader), and the correction pass would be skipped.
+		m_pPSCorrection.Release();
+		m_strCorrection = nullptr;
+		return;
+	}
+
+	UINT resId = 0;
+	const bool bTransFunc22 = m_srcExFmt.VideoTransferFunction == DXVA2_VideoTransFunc_22
+							|| m_srcExFmt.VideoTransferFunction == DXVA2_VideoTransFunc_709
+							|| m_srcExFmt.VideoTransferFunction == DXVA2_VideoTransFunc_240M;
+
+	if (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084 && !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) && m_bConvertToSdr) {
+		resId = m_D3D11VP.IsPqSupported() ? IDF_PS_11_CONVERT_PQ_TO_SDR : IDF_PS_11_FIXCONVERT_PQ_TO_SDR;
+		m_strCorrection = L"PQ to SDR";
+	}
+	else if (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG) {
+		if (m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) {
+			resId = IDF_PS_11_CONVERT_HLG_TO_PQ;
+			m_strCorrection = L"HLG to PQ";
+		}
+		else if (m_bConvertToSdr) {
+			resId = IDF_PS_11_FIXCONVERT_HLG_TO_SDR;
+			m_strCorrection = L"HLG to SDR";
+		}
+		else if (m_srcExFmt.VideoPrimaries == MFVideoPrimaries_BT2020) {
+			// HLG compatible with SDR
+			resId = IDF_PS_11_FIX_BT2020;
+			m_strCorrection = L"Fix BT.2020";
+		}
+	}
+	else if ((bTransFunc22 || !m_bHdrPassthroughSupport) && m_srcExFmt.VideoPrimaries == MFVideoPrimaries_BT2020) {
+		resId = IDF_PS_11_FIX_BT2020;
+		m_strCorrection = L"Fix BT.2020";
+	}
+
+	// A change of selection must drop the old shader, or turning Convert to SDR off
+	// would leave the PQ->SDR converter bound and the control would appear dead.
+	m_pPSCorrection.Release();
+	if (resId) {
+		EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSCorrection, resId));
+		DLogIf(m_pPSCorrection, L"CDX11VideoProcessor::UpdateCorrectionShader() m_pPSCorrection('{}') created", m_strCorrection);
+		SetShaderLuminanceParams();
+	} else {
+		m_strCorrection = nullptr;
+	}
+}
+
 void CDX11VideoProcessor::SetShaderLuminanceParams()
 {
-	FLOAT cbuffer[4] = { 10000.0f / m_iSDRDisplayNits, 0, 0, 0 };
+	// [0] LuminanceScale — PQ decode scale, 10000/sdrNits, so 1.0 == sdrNits nits
+	// [1] displayMinNits — the display's measured black. Was an unused zero; the
+	//     PQ->SDR converter now builds its curve over [floor, 1] and puts the
+	//     floor back on the output, so the shadow end lands in the range the
+	//     panel can actually show instead of inside a band it renders as one black.
+	// [2] outputGamut — 0 converts BT.2020->BT.709, 1 keeps BT.2020 so a wider-than-
+	//     Rec.709 display can show the source's real colour. Read only by the
+	//     PQ/HLG->SDR converters; the other correction shaders ignore the slot.
+	// [3] toneLutEnable — 0 = the shipped tone mapping, 1 = sample the experimental
+	//     1D curve. Read only by the PQ/HLG->SDR converters.
+	// [4] toneLutPqMin — the curve's index axis, in PQ code values
+	// [5] toneLutPqMax
+	// [6] toneLutSize — entries in m_pToneLut. The shader samples texel CENTRES,
+	//     so it needs N to map [0,1] onto them; passing it keeps the two sides
+	//     from drifting if the texture size is ever changed.
+	// [7] unused
+	//
+	// Slots 3..6 are new. The other correction shaders declare only three floats,
+	// so their reads are unaffected by the larger buffer.
+	//
+	// [8] toneCurveSelection — the "Tone curve" choice (iHdrLocalToneMappingType,
+	//     1..6). This is the value the panel has always set; the converter used to
+	//     ignore it and call ToneMappingHable unconditionally, so the row changed
+	//     nothing on an SDR display. 0 and 3 both mean the legacy Hable.
+	// [9..12] HDR10 static metadata for the curves that derive a knee from it.
+	//     Same fallbacks SetHDR10ShaderParams applies, so the HDR-output path and
+	//     the SDR path see the same numbers for the same content. All zero on the
+	//     DeckLink capture path — the card's ST.2086 frame metadata is unsupported
+	//     on HDMI — so in practice the fallback peak (1000 nits) is what is used.
+	// [13..15] unused
+	FLOAT cbuffer[16] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
+	                     (float)m_iOutputGamut,
+	                     ToneLutActive() ? 1.0f : 0.0f,
+	                     m_ToneLutKey.pqMin, m_ToneLutKey.pqMax,
+	                     (float)kToneLutSize, 0,
+	                     (float)discard<int>(m_iHdrLocalToneMappingType, 3, 0, 6),
+	                     0, 0, 0, 0, 0, 0, 0 };
+
+	// The metadata, guarded exactly as SetHDR10ShaderParams guards it.
+	{
+		// The content peak comes from real metadata when there is any, and from the
+		// user's Title peak otherwise. On the DeckLink capture path there never is:
+		// the card's ST.2086 frame metadata is unsupported on HDMI and the values
+		// arrive as media SIDE data, which a captured frame does not carry — so
+		// m_lastHdr10 stays zeroed and the control is what the curves actually get.
+		const float titlePeak = std::clamp(m_fHdrTitlePeakNits, 100.0f, 4000.0f);
+		float mMin = (float)m_lastHdr10.hdr10.MinMasteringLuminance;
+		float mMax = (float)m_lastHdr10.hdr10.MaxMasteringLuminance;
+		float cll  = (float)m_lastHdr10.hdr10.MaxContentLightLevel;
+		float fall = (float)m_lastHdr10.hdr10.MaxFrameAverageLightLevel;
+		if (mMin <= 0.0f)  mMin = 0.0f;
+		if (mMax <= 10.0f) mMax = titlePeak;
+		if (cll <= 10.0f)  cll = mMax;
+		if (fall <= 1.0f)  fall = cll;
+		cbuffer[9]  = cll;
+		cbuffer[10] = fall;
+		cbuffer[11] = mMax;
+		cbuffer[12] = mMin;
+
+		// cbuffer[13]: the IIR-smoothed per-scene source peak the Hable branch
+		// normalises by. Negative until the extractor has a reading, in which case
+		// the shader falls back to maxCLL.
+		//
+		// Deliberately NOT folded into cbuffer[9] (maxCLL): that is what BT.2390
+		// and ST.2094-10 derive their knee from, and this change needs to be
+		// attributable to Hable alone. Promoting it is a separate decision.
+		cbuffer[13] = m_HableScenePeakNits;
+
+		// cbuffer[14]: the Hable knee. 0 = pure Hable (behaviour identical to
+		// before the knee existed), >0 = identity below that point.
+		cbuffer[14] = std::clamp(m_fHdrHableKnee, 0.0f, 0.90f);
+	}
 
 	if (m_pCorrectionConstants) {
 		m_pDeviceContext->UpdateSubresource(m_pCorrectionConstants, 0, nullptr, &cbuffer, 0, 0);
@@ -1091,6 +1448,297 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		D3D11_SUBRESOURCE_DATA InitData = { &cbuffer, 0, 0 };
 		EXECUTE_ASSERT(S_OK == m_pDevice->CreateBuffer(&BufferDesc, &InitData, &m_pCorrectionConstants));
 	}
+}
+
+// Display calibration LUT. Text format per the .cube spec (Adobe/Resolve/Argyll):
+//   LUT_3D_SIZE N            N^3 entries, red varying fastest
+//   DOMAIN_MIN / DOMAIN_MAX  (assumed 0..1 — the only range DisplayCAL emits)
+//   then N^3 "r g b" float rows
+// A 1D shaper (LUT_1D_SIZE) is ignored in v1; DisplayCAL's 3D-only exports have none.
+HRESULT CDX11VideoProcessor::LoadCubeLut(const char* utf8Path)
+{
+	// Unload first: a failed load must never leave a half-applied LUT on screen.
+	m_bCubeLutEnabled = false;
+	m_pCubeLutSRV.Release();
+	m_pCubeLut.Release();
+	m_iCubeLutSize = 0;
+
+	if (!utf8Path || !utf8Path[0]) {
+		DLog(L"CDX11VideoProcessor::LoadCubeLut() : cleared (no path)");
+		// S_OK: the requested end state — no LUT — is exactly what we now have.
+		// S_FALSE here would be indistinguishable from a bad file to the caller.
+		return S_OK;
+	}
+	if (!m_pDevice) {
+		return E_FAIL;
+	}
+
+	wchar_t wpath[MAX_PATH] = {};
+	MultiByteToWideChar(CP_UTF8, 0, utf8Path, -1, wpath, MAX_PATH);
+
+	FILE* f = nullptr;
+	if (_wfopen_s(&f, wpath, L"rb") != 0 || !f) {
+		DLog(L"CDX11VideoProcessor::LoadCubeLut() : cannot open the file");
+		return E_FAIL;
+	}
+
+	int  size = 0;
+	std::vector<float> lut;
+	char buf[512];
+	while (fgets(buf, sizeof(buf), f)) {
+		std::string s(buf);
+		while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) s.pop_back();
+		size_t b = s.find_first_not_of(" \t");
+		if (b == std::string::npos) continue;
+		s.erase(0, b);
+		if (s[0] == '#') continue;
+
+		if (s.rfind("LUT_3D_SIZE", 0) == 0) { size = atoi(s.c_str() + 12); continue; }
+		if (s.rfind("LUT_1D_SIZE", 0) == 0 || s.rfind("DOMAIN_", 0) == 0
+			|| s.rfind("TITLE", 0) == 0) {
+			continue;
+		}
+		float r = 0, g = 0, bl = 0;
+		if (sscanf_s(s.c_str(), "%f %f %f", &r, &g, &bl) == 3) {
+			lut.push_back(r); lut.push_back(g); lut.push_back(bl);
+		}
+	}
+	fclose(f);
+
+	const size_t want = (size_t)size * size * size;
+	if (size < 2 || size > 128 || lut.size() != want * 3) {
+		DLog(L"CDX11VideoProcessor::LoadCubeLut() : bad LUT (size={}, floats={})", size, lut.size());
+		return E_FAIL;
+	}
+
+	// R32G32B32A32 avoids a float->half pass; 65^3 is 4.4 MB, uploaded once.
+	std::vector<float> rgba(want * 4);
+	for (size_t i = 0; i < want; ++i) {
+		rgba[i * 4 + 0] = lut[i * 3 + 0];
+		rgba[i * 4 + 1] = lut[i * 3 + 1];
+		rgba[i * 4 + 2] = lut[i * 3 + 2];
+		rgba[i * 4 + 3] = 1.0f;
+	}
+
+	D3D11_TEXTURE3D_DESC desc = {};
+	desc.Width      = (UINT)size;
+	desc.Height     = (UINT)size;
+	desc.Depth      = (UINT)size;
+	desc.MipLevels  = 1;
+	desc.Format     = DXGI_FORMAT_R32G32B32A32_FLOAT;
+	desc.Usage      = D3D11_USAGE_IMMUTABLE;
+	desc.BindFlags  = D3D11_BIND_SHADER_RESOURCE;
+
+	D3D11_SUBRESOURCE_DATA init = {};
+	init.pSysMem          = rgba.data();
+	init.SysMemPitch      = (UINT)size * 4 * sizeof(float);
+	init.SysMemSlicePitch = (UINT)size * (UINT)size * 4 * sizeof(float);
+
+	HRESULT hr = m_pDevice->CreateTexture3D(&desc, &init, &m_pCubeLut);
+	if (FAILED(hr)) {
+		DLog(L"CDX11VideoProcessor::LoadCubeLut() : CreateTexture3D failed {:#x}", hr);
+		return hr;
+	}
+	hr = m_pDevice->CreateShaderResourceView(m_pCubeLut, nullptr, &m_pCubeLutSRV);
+	if (FAILED(hr)) {
+		m_pCubeLut.Release();
+		return hr;
+	}
+
+	if (!m_pCubeLutSampler) {
+		D3D11_SAMPLER_DESC sd = {};
+		sd.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;   // hardware trilinear over the cube
+		sd.AddressU       = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.AddressV       = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.AddressW       = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+		sd.MaxLOD         = D3D11_FLOAT32_MAX;
+		hr = m_pDevice->CreateSamplerState(&sd, &m_pCubeLutSampler);
+		if (FAILED(hr)) {
+			m_pCubeLutSRV.Release();
+			m_pCubeLut.Release();
+			return hr;
+		}
+	}
+
+	m_iCubeLutSize    = size;
+	m_bCubeLutEnabled = true;
+	DLog(L"CDX11VideoProcessor::LoadCubeLut() : loaded {}^3 LUT", size);
+	return S_OK;
+}
+
+// The experimental tone curve. libplacebo builds its tone LUT on the CPU once
+// per parameter change and lets the shader sample it — complex curves become
+// practical, and each curve carries a tunable parameter instead of being one
+// fixed shape. The scene statistics that drive it (features[0] = maxscl,
+// features[1] = average, both in PQ) are the ones the Zion grade already
+// extracts every frame, so this adds no readback of its own.
+//
+// The two IIR-smoothed inputs are the curve's dynamic part: the spline picks its
+// pivot from the scene average, so an unsmoothed average makes the curve flicker
+// on noise. The smoothing anchor is the same scene-jump test the gamma filter
+// uses (a change in maxscl beyond 0.15 PQ is a cut, not a drift) — one policy
+// for "has the scene changed", not two that can disagree.
+void CDX11VideoProcessor::UpdateToneLut()
+{
+	if (m_iExperimentalToneMapper == 0 || !m_pDevice || !m_bMLFeaturesReady) {
+		return;
+	}
+
+	const float featMax = m_MLFeatures[0];
+	const float featAvg = m_MLFeatures[1];
+
+	const bool sceneJumped = m_MLToneMaxSmooth < 0.0f ||
+	                         fabsf(featMax - m_MLToneMaxSmooth) > 0.15f;
+	if (sceneJumped) {
+		m_MLToneMaxSmooth = featMax;
+		m_MLToneAvgSmooth = featAvg;
+	} else {
+		m_MLToneMaxSmooth = 0.10f * featMax + 0.90f * m_MLToneMaxSmooth;
+		m_MLToneAvgSmooth = 0.10f * featAvg + 0.90f * m_MLToneAvgSmooth;
+	}
+
+	// The display's measured range. This IS the curve's output range — that is the
+	// whole point of feeding the mapper display black and white.
+	//
+	// `iSDRDisplayNits` is the white in NITS. Do not compute 10000/sdrNits here:
+	// that is LuminanceScale, the PQ decode scale the shader uses, and it is a
+	// different quantity. Conflating them is what made this curve render 28% dark
+	// at an 85-nit target (the table came out normalised to 117.6 instead of 85),
+	// and it is invisible except by reading the output range back.
+	const float displayNits = fmaxf((float)m_iSDRDisplayNits, 1.0f);
+
+	ToneLutKey key;
+	key.pqMin     = 0.0f;   // source nominal black: PQ code 0. DeckLink HDR10 carries
+	                        // no usable min-luminance, so this is the honest default.
+	// input_max is the SIGNAL's nominal peak, not the current frame's measured peak.
+	//
+	// This is the one place where following the measured statistics would be
+	// wrong, and it is worth being explicit about why. libplacebo takes input_max
+	// from the source colour space's nominal luma — the declared peak (MaxCLL, or
+	// the mastering display peak) — and takes only input_avg from dynamic
+	// per-scene metadata. Feeding the MEASURED peak in instead stretches every
+	// scene to fill the display: a 40-nit night scene and a 1000-nit daylight
+	// scene would come out the same brightness, which is auto-gain, not tone
+	// mapping. It would also fight the Zion grade and the calibration LUT, both of
+	// which assume the signal's own levels are preserved.
+	//
+	// 1000 nits is libplacebo's own fallback for HDR10 with no usable metadata
+	// (see pl_color_space_nominal_luma and the SetHDR10ShaderParams guard below,
+	// which substitutes 1000 for anything <= 10). The Title peak control replaces
+	// it when the user knows better — and on this capture path they may be the only
+	// source of the value, since the card cannot supply MaxCLL.
+	key.pqMax     = exptm::LinearNitsToPq(std::clamp(m_fHdrTitlePeakNits, 100.0f, 4000.0f));
+	key.pqAvg     = m_MLToneAvgSmooth;   // measured: this is the pivot's input
+	key.contrast  = m_fToneLutContrast;
+	key.dispNits  = displayNits;
+	key.blackNits = m_fHdrDisplayMinNits;
+
+	// Rebuild only when something the curve is built from actually moved.
+	//
+	// The configuration fields are compared EXACTLY: a change to those is a user
+	// action and must take effect on the next frame, not when the scene drifts.
+	//
+	// The rate limit has to be on TIME rather than on the size of the change: the
+	// IIR steps ~2/1000 PQ per frame, so any deadband small enough to be invisible
+	// is also small enough to be cleared every frame — measured at 24 rebuilds/s
+	// with a 2/1000 deadband, i.e. no throttling at all. One rebuild every 6th
+	// frame, plus an immediate one on a cut or a config change, keeps the curve
+	// responsive for a quarter of the cost.
+	//
+	// Only pqAvg can move at runtime; pqMax is a configuration value now (the Title
+	// peak), so it is compared with the configuration fields rather than deadbanded.
+	const bool statsMoved = fabsf(key.pqAvg - m_ToneLutKey.pqAvg) > 2e-3f;
+	const bool configChanged = key.pqMin != m_ToneLutKey.pqMin ||
+	                           key.pqMax != m_ToneLutKey.pqMax ||
+	                           key.contrast != m_ToneLutKey.contrast ||
+	                           key.dispNits != m_ToneLutKey.dispNits ||
+	                           key.blackNits != m_ToneLutKey.blackNits;
+	m_nToneLutFrame++;
+	const bool rateOk = sceneJumped || (m_nToneLutFrame % 6 == 0);
+	if (m_bToneLutReady) {
+		if (!statsMoved && !configChanged) return;  // nothing to do
+		if (!configChanged && !rateOk) return;      // moved, but rate-limited
+	}
+
+	exptm::Params p;
+	p.input_min  = exptm::LinearNitsToPq(key.pqMin);
+	p.input_max  = key.pqMax;
+	p.input_avg  = key.pqAvg;
+	p.output_min = exptm::LinearNitsToPq(key.blackNits);
+	p.output_max = exptm::LinearNitsToPq(key.dispNits);
+	p.spline_contrast = key.contrast;
+
+	exptm::InferParams(p);
+	// InferParams can lift input_max, so publish the INFERRED axis — the shader
+	// indexes with these, and an axis that disagrees with the table mis-maps the
+	// whole curve while still looking like a plausible picture.
+	key.pqMax = p.input_max;
+
+	std::vector<float> table(kToneLutSize);
+	// Display-relative (0 = the display's black, 1 = its white), which is what the
+	// shader's plain pow(v, 1/2.2) encodes — see SplineLut().
+	exptm::SplineLut(table.data(), kToneLutSize, p);
+
+	if (!m_pToneLut) {
+		// R32_FLOAT, 1D as a 1024x1 2D texture: D3D11 has no 1D textures, and a
+		// 2D one with height 1 is what every other 1D LUT here does too.
+		D3D11_TEXTURE2D_DESC desc = {};
+		desc.Width      = (UINT)kToneLutSize;
+		desc.Height     = 1;
+		desc.MipLevels  = 1;
+		desc.ArraySize  = 1;
+		desc.Format     = DXGI_FORMAT_R32_FLOAT;
+		desc.SampleDesc = { 1, 0 };
+		desc.Usage      = D3D11_USAGE_DEFAULT;   // updated per scene
+		desc.BindFlags  = D3D11_BIND_SHADER_RESOURCE;
+
+		D3D11_SUBRESOURCE_DATA init = {};
+		init.pSysMem     = table.data();
+		init.SysMemPitch = (UINT)kToneLutSize * sizeof(float);
+
+		HRESULT hr = m_pDevice->CreateTexture2D(&desc, &init, &m_pToneLut);
+		if (FAILED(hr)) {
+			DLog(L"CDX11VideoProcessor::UpdateToneLut() : CreateTexture2D failed {:#x}", hr);
+			m_bToneLutReady = false;
+			return;
+		}
+		hr = m_pDevice->CreateShaderResourceView(m_pToneLut, nullptr, &m_pToneLutSRV);
+		if (FAILED(hr)) {
+			m_pToneLut.Release();
+			m_bToneLutReady = false;
+			return;
+		}
+		if (!m_pToneLutSampler) {
+			D3D11_SAMPLER_DESC sd = {};
+			sd.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;   // linear between entries
+			sd.AddressU       = D3D11_TEXTURE_ADDRESS_CLAMP;       // above the peak -> display white
+			sd.AddressV       = D3D11_TEXTURE_ADDRESS_CLAMP;
+			sd.AddressW       = D3D11_TEXTURE_ADDRESS_CLAMP;
+			sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+			sd.MaxLOD         = D3D11_FLOAT32_MAX;
+			if (FAILED(m_pDevice->CreateSamplerState(&sd, &m_pToneLutSampler))) {
+				m_pToneLutSRV.Release();
+				m_pToneLut.Release();
+				m_bToneLutReady = false;
+				return;
+			}
+		}
+	} else {
+		m_pDeviceContext->UpdateSubresource(m_pToneLut, 0, nullptr, table.data(),
+		                                           (UINT)kToneLutSize * sizeof(float), 0);
+	}
+
+	m_bToneLutReady = true;
+	m_ToneLutKey = key;
+	m_nToneLutBuilds++;
+	// The curve's axis lives in the correction cbuffer, which is only re-uploaded
+	// by SetShaderLuminanceParams — push it so a scene change takes effect on this
+	// frame rather than at the next unrelated settings change.
+	SetShaderLuminanceParams();
+
+	DLog(L"CDX11VideoProcessor::UpdateToneLut() : mapper {} rebuilt, PQ {:.4f}..{:.4f} avg {:.4f} contrast {:.2f}",
+	     m_iExperimentalToneMapper, key.pqMin, key.pqMax, key.pqAvg, key.contrast);
 }
 
 void CDX11VideoProcessor::SetHDR10ShaderParams(float masteringMinLuminanceNits, float masteringMaxLuminanceNits,
@@ -1107,7 +1755,8 @@ void CDX11VideoProcessor::SetHDR10ShaderParams(float masteringMinLuminanceNits, 
 	const HDRParamsConstantBuffer_t cbuffer = {
 		masteringMinLuminanceNits, masteringMaxLuminanceNits,
 		maxCLL, maxFALL,
-		displayMaxNits, static_cast<UINT>(toneMappingType)
+		displayMaxNits, static_cast<UINT>(toneMappingType),
+		m_fHdrDisplayMinNits
 	};
 
 	if (!m_pPSHDR10ToneMapping) {
@@ -1268,6 +1917,7 @@ void CDX11VideoProcessor::SetMLParams()
 	float shadow  = 0.0f;
 	float rolloff = 0.0f;
 	float l1max   = 0.5f;
+	float gammaTopUp = 0.0f;   // user offset, passed to the shader SEPARATELY (see below)
 
 	// Micro-contrast texture gate: IIR-filter the raw texture energy, snapping
 	// on the same scene-jump anchor as the gamma filter (features[0] = maxscl).
@@ -1302,6 +1952,31 @@ void CDX11VideoProcessor::SetMLParams()
 			}
 			m_MLPrevL1Max = l1now;
 			gamma = m_MLIIRGamma;
+
+			// Gamma top-up (model-override, mirrors the highlight shoulder below):
+			// a signed offset the user ADDS to the model's prediction IN AUTO. The
+			// model keeps shaping the per-scene gamma; this moves it up or down
+			// without freezing the scene adaptation.
+			//
+			// Additive on the EXPONENT, not multiplicative: a multiplier cannot lift
+			// a scene the model judged neutral — predicted 1.0 is a fixed point —
+			// which is precisely the case a top-up exists to cover.
+			//
+			// Clamped wider than the model's own 0.5-1.5 because an offset can leave
+			// it, but bounded: the shader's gamma block guards BOTH ends itself
+			// (fade over the shadows, hi_g over the highlights), so this stays a
+			// midtone move and cannot reintroduce the highlight push the curve gain
+			// had at 1.6.
+			//
+			// Signed, and added to the exponent — see fMLGammaTopUp in IVideoRenderer.h
+			// for why it is additive rather than a multiplier.
+			//
+			// NOT folded into `gamma`. It is passed to the shader SEPARATELY as
+			// MLGammaTopUp so the gamma pass can hold it back inside skin using the
+			// trained skin LUT. Folded in, it would be inseparable from the model's
+			// own judgement and there would be nothing to gate.
+			gammaTopUp = fminf(0.50f, fmaxf(-0.50f, m_fMLGammaTopUp));
+			m_MLGammaTopUpApplied = gammaTopUp;
 		}
 		float highlightPred = 0.0f;
 		if (m_bMLHighlightModelLoaded && m_MLHighlightModel.Predict(m_MLFeatures, ML_FEATURE_DIM, highlightPred)) {
@@ -1537,6 +2212,14 @@ void CDX11VideoProcessor::SetMLParams()
 		: guard - 1.0f; // effectively disabled before features are ready
 	params.MLSkyLuma = m_SkyLuma;
 
+	// Gamma top-up (see fMLGammaTopUp): carried SEPARATELY from MLGamma so the
+	// gamma pass can gate it by the trained skin LUT. Stays 0 when the model did
+	// not predict, which is also the "no top-up" default.
+	params.MLGammaTopUp = gammaTopUp;
+	params._padGT0 = 0.0f;
+	params._padGT1 = 0.0f;
+	params._padGT2 = 0.0f;
+
 	// Person skin protection (stage 4): LUT-only-inside-people gate. Strength 0
 	// -> shaders branch to the plain legacy LUT/MC path (bit-identical).
 	params.MLSkinPersonStrength = (m_bMLFeaturesReady && m_bPersonEnabled)
@@ -1600,11 +2283,27 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 		return;
 	}
 
-	// The convert output holds true source-referred PQ only when the swap chain
-	// is actually in the PQ color space; on any SDR output path (incl. an
-	// HDR-capable display running convert-to-SDR) it is gamma-2.2 encoded and
-	// is remapped into PQ units by BuildMLFeatures.
-	const MLLumaDomain domain = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+	// WHICH COLOUR SPACE IS THE SAMPLED TEXTURE IN?
+	//
+	// Not the swap chain's. m_TexConvertOutput is written by the D3D11 video
+	// processor, and for a 2084 source the VP emits PQ
+	// (DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, D3D11VP.cpp:609-615): the tone
+	// mapping happens later, inside the correction shader. On an SDR display the
+	// swap chain stays G22, so keying the domain off the swap chain selected
+	// SDRGamma22 and applied SdrGammaToPQ to values that were ALREADY PQ — a
+	// double remap that corrupted every feature on exactly the path the tone
+	// curve and the Zion grade run on.
+	//
+	// Key it off the correction actually selected instead: the same predicate
+	// that picks IDF_PS_11_CONVERT_PQ_TO_SDR in UpdateCorrectionShader(). The
+	// swap-chain test is kept as well, for the HDR-passthrough path where it is
+	// the correct signal.
+	const bool bPqToSdr =
+		(m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084) &&
+		!(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) &&
+		m_bConvertToSdr;
+	const MLLumaDomain domain =
+		(m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || bPqToSdr)
 		? MLLumaDomain::PQ : MLLumaDomain::SDRGamma22;
 	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain, &m_MLBarDetected, &m_MLRawTexture);
 	m_pDeviceContext->Unmap(m_MLStaging, 0);
@@ -1911,6 +2610,15 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		L"hunt={:.3f}{}   chroma={:.2f}/{:.2f} knee={:.2f} skin={:.2f}{}\n"
 		L"mask: sky={:.3f} person={:.3f}  pDbg={} pStr={:.3f} cad={}/{}\n"
 		L"bars: top={} bot={}{}\n"
+		L"toneMap: mapper={} active={} builds={} axis={:.4f}..{:.4f} avg={:.4f} contrast={:.2f} out={:.4f}..{:.4f} outNits={:.3f}..{:.1f}\n"
+		// WHICH converter is live, and the flags that decide it. `m_strCorrection`
+		// is the name chosen in InitMediaType ("PQ to SDR", "Fix BT.2020", ...), so
+		// this line answers "did the control change the pipeline" directly instead
+		// of by inference. The four flags next to it are the ones that could make
+		// Convert to SDR inert on their own, so a reader can tell WHICH reason
+		// applies: no HDR display support, passthrough armed, DV suppressing the
+		// re-init, or the VP not ready.
+		L"pipeline: correction={} convertSdr={} passthrough={} passthroughSupport={} localToneMap={} dovi={} vpReady={} hdrRaw={} tf={} prim={} texVP={} cfmt={} rtxHdr={} toneCurve={} titlePeak={:.0f}\n"
 		L"rendererIn: fmt={} {}x{}  ics={}",
 		mode, domain, (m_bMLActive ? L"yes" : L"no"),
 		m_lastMLParams.MLGamma, m_lastMLParams.MLShadowToe, m_lastMLParams.MLHighlightRolloff,
@@ -1930,6 +2638,35 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		(int)std::lround(m_fMLBarTop * m_windowRect.Height()),
 		(int)std::lround((1.0f - m_fMLBarBot) * m_windowRect.Height()),
 		(m_bMLBarsHighlight ? L" (hl)" : L""),
+		m_iExperimentalToneMapper, (ToneLutActive() ? L"yes" : L"no"),
+		(unsigned long long)m_nToneLutBuilds,
+		m_ToneLutKey.pqMin, m_ToneLutKey.pqMax, m_ToneLutKey.pqAvg, m_fToneLutContrast,
+		// The curve's OUTPUT range, in PQ and in nits. During calibration this is
+		// the number that matters: it is the measured display range the mapper was
+		// given, and seeing it here is what separates "I typed 85 and 0.17" from
+		// "the curve is built over 85 and 0.17".
+		exptm::LinearNitsToPq(m_ToneLutKey.blackNits), exptm::LinearNitsToPq(m_ToneLutKey.dispNits),
+		m_ToneLutKey.blackNits, m_ToneLutKey.dispNits,
+		(m_strCorrection ? m_strCorrection : L"-"),
+		(m_bConvertToSdr ? 1 : 0), (m_bHdrPassthrough ? 1 : 0),
+		(m_bHdrPassthroughSupport ? 1 : 0), (m_bHdrLocalToneMapping ? 1 : 0),
+		(m_Dovi.bValid ? 1 : 0), (m_D3D11VP.IsReady() ? 1 : 0),
+		(m_bHDRPassthroughRaw ? 1 : 0),
+		// The source format the selection above actually saw, plus which converter
+		// path is live. `m_strCorrection` being "-" is only meaningful alongside
+		// these: it can be "-" because the transfer function is not PQ/HLG at all,
+		// or because the D3D11 VP is unavailable and the Tex VP path is building its
+		// converter instead (texVP), and those need opposite fixes.
+		(int)m_srcExFmt.VideoTransferFunction, (int)m_srcExFmt.VideoPrimaries,
+		(m_PSConvColorData.bEnable ? 1 : 0), (int)m_srcParams.cformat,
+		(m_bVPUseRTXVideoHDR ? 1 : 0),
+		// The curve the PQ->SDR converter is actually applying. 0/3 = the legacy
+		// ToneMappingHable; 1/2/4/5/6 = the standard curves. This is the field that
+		// answers "does the Tone curve row do anything" without reading the shader.
+		m_iHdrLocalToneMappingType,
+		// The content peak the curves are normalised by. Distinct from the display
+		// peak: this is the top of the range being mapped FROM.
+		m_fHdrTitlePeakNits,
 		inFmt, (int)m_srcRectWidth, (int)m_srcRectHeight, icsName);
 }
 
@@ -1941,6 +2678,7 @@ void CDX11VideoProcessor::GetRenderStats(::RenderStats_t& stats)
 	stats.dropped       = m_pFilter ? m_pFilter->m_DrawStats.m_dropped : 0;
 	stats.skipped       = m_RenderStats.dropped2;
 	stats.failed        = m_RenderStats.failed;
+	stats.presentLatencyMs = m_presentLatencyMs;
 	if (m_pFilter) stats.drawFps = m_pFilter->m_DrawStats.GetAverageFps();
 }
 
@@ -3105,6 +3843,10 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 
 	BufferDesc = { sizeof(FLOAT) * 4, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
 	EXECUTE_ASSERT(S_OK == m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pHalfOUtoInterlaceConstantBuffer));
+
+	// 8 floats: [0..1] dither coord scale, [2] cube LUT enabled, [3] cube LUT size,
+	// [4] dither active. Grew from 4 when the display LUT moved into this pass.
+	BufferDesc = { sizeof(FLOAT) * 8, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
 	EXECUTE_ASSERT(S_OK == m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pFinalPassConstantBuffer));
 
 	BufferDesc = { sizeof(PS_EXTSHADER_CONSTANTS), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
@@ -3487,191 +4229,6 @@ bool CDX11VideoProcessor::ToggleHDR(const DisplayConfig_t& displayConfig, const 
 	return ret == ERROR_SUCCESS;
 }
 
-// Ideal cadence refreshes are integer multiples of the source rate: 2x = 48 Hz
-// for 23.976/24p (also 72, 96, 120, 144 ...). Iterated lowest-first so the
-// minimal multiple the display supports wins. 1x (the native source rate, e.g.
-// a projector's 23.976 Hz cinema mode) is only ever RECOGNIZED in place — it
-// is deliberately not a switch target, so the desktop never drops to ~24 Hz.
-static constexpr int kCadenceMultiples[] = { 2, 3, 4, 5, 6, 7 };
-
-void CDX11VideoProcessor::HandleRefreshRateForCadence()
-{
-	if (!m_iRefreshSwitch24p || m_bRefreshSwitchInProgress) {
-		return;
-	}
-
-	CAutoLock cRendererLock(&m_HDRToggleLock);
-
-	if (m_rtAvgTimePerFrame <= 0) { // no input rate known yet — make sure we are back at the original refresh
-		RestoreRefreshRateOverrideLocked();
-		return;
-	}
-
-	const double inputFps = 10000000.0 / (double)m_rtAvgTimePerFrame;
-	const bool bIs24p = inputFps >= 23.0 && inputFps <= 24.5;
-
-	MONITORINFOEXW mi = { sizeof(mi) };
-	GetMonitorInfoW(MonitorFromWindow(m_hWnd, MONITOR_DEFAULTTOPRIMARY), reinterpret_cast<LPMONITORINFO>(&mi));
-	DisplayConfig_t displayConfig = {};
-	if (!GetDisplayConfig(mi.szDevice, displayConfig)) {
-		RestoreRefreshRateOverrideLocked();
-		return;
-	}
-
-	const double displayHertz = displayConfig.refreshRate.Denominator
-		? (double)displayConfig.refreshRate.Numerator / (double)displayConfig.refreshRate.Denominator : 0.0;
-
-	auto IsIdealCadenceRefresh = [inputFps](const double hz) {
-		if (hz <= 0.0) return false;
-		// 1x = the display already runs at the source rate (1:1 — e.g. the
-		// projector's 23.976 Hz cinema mode) or any clean multiple 2x..7x.
-		for (int mult = 1; mult <= 7; mult++) {
-			const double ideal = inputFps * mult;
-			if (std::abs(hz - ideal) / ideal <= 0.02) { // within ±2 %
-				return true;
-			}
-		}
-		return false;
-	};
-
-	if (bIs24p && IsIdealCadenceRefresh(displayHertz)) {
-		return; // display already at 1:1 or a clean multiple of the source rate
-	}
-	if (!bIs24p && !m_bRefreshOverrideActive) {
-		return; // nothing to do
-	}
-
-	DLog(L"HandleRefreshRateForCadence() : inputFps={:.2f} ({}) display {:.3f}Hz -> {}",
-		inputFps, bIs24p ? L"24p" : L"other", displayHertz, bIs24p ? L"cadence multiple" : L"restore original");
-
-	m_bHdrDisplaySwitching = true; // gate Reset(true) re-entrancy like ToggleHDR does
-	m_bRefreshSwitchInProgress = true;
-	bool bSwitched = false;
-	if (bIs24p) {
-		bSwitched = SetDisplayRefreshForCadenceLocked(displayConfig, inputFps);
-	}
-	if (!bSwitched) {
-		// Not 24p, or no clean multiple of the source rate is supported on this
-		// display — fall back to whatever the display prefers (its configured
-		// refresh). Also restores any override owed from an earlier switch.
-		RestoreRefreshRateOverrideLocked();
-	}
-	m_bRefreshSwitchInProgress = false;
-	m_bHdrDisplaySwitching = false;
-}
-
-bool CDX11VideoProcessor::SetDisplayRefreshForCadenceLocked(const DisplayConfig_t& displayConfig, const double inputFps)
-{
-	DEVMODEW current = {};
-	current.dmSize = sizeof(current);
-	if (!EnumDisplaySettingsW(displayConfig.displayName, ENUM_CURRENT_SETTINGS, &current)) {
-		DLog(L"SetDisplayRefreshForCadenceLocked() : EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS) failed");
-		return false;
-	}
-
-	if (!m_bRefreshOverrideActive) {
-		// Remember the pre-switch mode once — it is the restore target.
-		m_refreshSavedMode = current;
-		m_refreshSavedDisplayName = displayConfig.displayName;
-	}
-
-	// Find the lowest multiple of the source rate the display actually offers
-	// (48/72/96/120... for 24p; panels often list 47.952 or 48.000 Hz).
-	DEVMODEW mode = {};
-	DEVMODEW target = {};
-	for (const int mult : kCadenceMultiples) {
-		const double ideal = inputFps * mult;
-		float bestRel = 1e9f;
-		for (UINT i = 0; EnumDisplaySettingsExW(displayConfig.displayName, i, &mode, 0); i++) {
-			if (mode.dmPelsWidth != current.dmPelsWidth || mode.dmPelsHeight != current.dmPelsHeight
-					|| mode.dmBitsPerPel != current.dmBitsPerPel || mode.dmDisplayFrequency == 0) {
-				continue;
-			}
-			const double hz = (double)mode.dmDisplayFrequency;
-			const double rel = std::abs(hz - ideal) / ideal;
-			if (rel > 0.02) {
-				continue;
-			}
-			if (rel < bestRel) {
-				bestRel = (float)rel;
-				target = mode;
-			}
-		}
-		if (target.dmPelsWidth) {
-			break; // lowest multiple that matches wins
-		}
-	}
-
-	if (!target.dmPelsWidth) {
-		DLog(L"SetDisplayRefreshForCadenceLocked() : no {:.3f}Hz x2..x7 mode on '{}' — falling back to the display's configured refresh",
-			 inputFps, displayConfig.displayName);
-		return false;
-	}
-
-	LONG ret = ChangeDisplaySettingsExW(displayConfig.displayName, &target, nullptr, CDS_FULLSCREEN, nullptr);
-	if (ret != DISP_CHANGE_SUCCESSFUL) {
-		DLog(L"SetDisplayRefreshForCadenceLocked() : ChangeDisplaySettingsExW(cadence) failed with {}",
-			 HR2Str(HRESULT_FROM_WIN32(ret)));
-		return false;
-	}
-
-	m_bRefreshOverrideActive = true;
-	m_bDisplayModeChangeAfterRefreshSwitch = true; // absorb the WM_DISPLAYCHANGE we just caused
-	FillDisplayParams();
-	DLog(L"SetDisplayRefreshForCadenceLocked() : switched '{}' to {}x{}@{}Hz", displayConfig.displayName,
-		 target.dmPelsWidth, target.dmPelsHeight, target.dmDisplayFrequency);
-
-	return true;
-}
-
-void CDX11VideoProcessor::RestoreRefreshRateOverrideLocked()
-{
-	if (!m_bRefreshOverrideActive || m_refreshSavedDisplayName.empty()) {
-		return;
-	}
-
-	DEVMODEW current = {};
-	current.dmSize = sizeof(current);
-	if (EnumDisplaySettingsW(m_refreshSavedDisplayName.c_str(), ENUM_CURRENT_SETTINGS, &current)
-			&& current.dmPelsWidth == m_refreshSavedMode.dmPelsWidth
-			&& current.dmPelsHeight == m_refreshSavedMode.dmPelsHeight
-			&& current.dmDisplayFrequency == m_refreshSavedMode.dmDisplayFrequency) {
-		// Display is already back at the original mode (external change did it).
-		m_bRefreshOverrideActive = false;
-		m_refreshSavedDisplayName.clear();
-		m_refreshSavedMode = {};
-		return;
-	}
-
-	LONG ret = ChangeDisplaySettingsExW(m_refreshSavedDisplayName.c_str(), &m_refreshSavedMode, nullptr, CDS_FULLSCREEN, nullptr);
-	if (ret != DISP_CHANGE_SUCCESSFUL) {
-		DLog(L"RestoreRefreshRateOverrideLocked() : ChangeDisplaySettingsExW restore failed with {}",
-			 HR2Str(HRESULT_FROM_WIN32(ret)));
-		return;
-	}
-
-	m_bDisplayModeChangeAfterRefreshSwitch = true; // absorb the WM_DISPLAYCHANGE we just caused
-	FillDisplayParams();
-	DLog(L"RestoreRefreshRateOverrideLocked() : restored '{}' to {}x{}@{}Hz", m_refreshSavedDisplayName,
-		 m_refreshSavedMode.dmPelsWidth, m_refreshSavedMode.dmPelsHeight, m_refreshSavedMode.dmDisplayFrequency);
-
-	m_bRefreshOverrideActive = false;
-	m_refreshSavedDisplayName.clear();
-	m_refreshSavedMode = {};
-}
-
-void CDX11VideoProcessor::RestoreRefreshRateOverride()
-{
-	if (!m_bRefreshOverrideActive) {
-		return;
-	}
-
-	CAutoLock cRendererLock(&m_HDRToggleLock);
-	m_bHdrDisplaySwitching = true;
-	RestoreRefreshRateOverrideLocked();
-	m_bHdrDisplaySwitching = false;
-}
-
 void CDX11VideoProcessor::ApplyInputColorSpaceOverride()
 {
 	// Always-on trace (ml_debug.csv, opened at construction in release) so the
@@ -3905,52 +4462,13 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 
 	m_srcVideoTransferFunction = m_srcExFmt.VideoTransferFunction;
 
-	// 24p cadence: the input rate is now known (m_rtAvgTimePerFrame above), so
-	// the display refresh can be re-evaluated (DeckLink 23.976p -> 48 Hz, and
-	// back to the original when the source leaves 24p).
-	HandleRefreshRateForCadence();
-
 	HRESULT hr = E_NOT_VALID_STATE;
 
 	// D3D11 Video Processor
 	if (FmtParams.VP11Format != DXGI_FORMAT_UNKNOWN) {
 		hr = InitializeD3D11VP(FmtParams, origW, origH, pmt);
 		if (SUCCEEDED(hr)) {
-			UINT resId = 0;
-			m_pCorrectionConstants.Release();
-			bool bTransFunc22 = m_srcExFmt.VideoTransferFunction == DXVA2_VideoTransFunc_22
-								|| m_srcExFmt.VideoTransferFunction == DXVA2_VideoTransFunc_709
-								|| m_srcExFmt.VideoTransferFunction == DXVA2_VideoTransFunc_240M;
-
-			if (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084 && !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) && m_bConvertToSdr) {
-				resId = m_D3D11VP.IsPqSupported() ? IDF_PS_11_CONVERT_PQ_TO_SDR : IDF_PS_11_FIXCONVERT_PQ_TO_SDR;
-				m_strCorrection = L"PQ to SDR";
-			}
-			else if (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG) {
-				if (m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) {
-					resId = IDF_PS_11_CONVERT_HLG_TO_PQ;
-					m_strCorrection = L"HLG to PQ";
-				}
-				else if (m_bConvertToSdr) {
-					resId = IDF_PS_11_FIXCONVERT_HLG_TO_SDR;
-					m_strCorrection = L"HLG to SDR";
-				}
-				else if (m_srcExFmt.VideoPrimaries == MFVideoPrimaries_BT2020) {
-					// HLG compatible with SDR
-					resId = IDF_PS_11_FIX_BT2020;
-					m_strCorrection = L"Fix BT.2020";
-				}
-			}
-			else if ((bTransFunc22 || !m_bHdrPassthroughSupport) && m_srcExFmt.VideoPrimaries == MFVideoPrimaries_BT2020) {
-				resId = IDF_PS_11_FIX_BT2020;
-				m_strCorrection = L"Fix BT.2020";
-			}
-
-			if (resId) {
-				EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSCorrection, resId));
-				DLogIf(m_pPSCorrection, L"CDX11VideoProcessor::InitMediaType() m_pPSCorrection('{}') created", m_strCorrection);
-				SetShaderLuminanceParams();
-			}
+			UpdateCorrectionShader();
 		}
 		else {
 			ReleaseVP();
@@ -4187,7 +4705,9 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 		return hr;
 	}
 
-	if (m_bMLActive) {
+	// The experimental tone mapper is driven by the same per-frame statistics, so it
+	// keeps them fresh on its own — see the extraction gate in Process().
+	if (MLStatsNeeded()) {
 		m_bMLFeaturesStale = true; // re-analyze on the next render
 	}
 
@@ -4196,6 +4716,21 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 	m_pFilter->m_DrawStats.Add(GetPreciseTick());
 	if (m_pFilter->m_filterState == State_Running) {
 		m_pFilter->StreamTime(rtClock);
+	}
+
+	// HTPC present-latency gauge: (wall clock since first present) - (stream
+	// time since first present). Valid while decklink stream time advances 1:1
+	// with real capture time.
+	{
+		const long long wall100 = (long long)((uint64_t)GetPreciseTick() * 10000000ULL / GetPreciseTicksPerSecondI());
+		if (m_rtFirstPresent < 0) {
+			m_rtFirstPresent = rtStart;
+			m_wallFirstPresent100ns = wall100;
+			m_presentLatencyMs = 0.0;
+		} else {
+			const long long lag100 = (wall100 - m_wallFirstPresent100ns) - (rtStart - m_rtFirstPresent);
+			m_presentLatencyMs = lag100 > 0 ? (double)lag100 / 10000.0 : 0.0;
+		}
 	}
 
 	m_RenderStats.syncoffset = rtClock - rtStart;
@@ -4660,13 +5195,76 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 	// bypassed, which silently stalled AUTO mode for a whole session.
 	// Feature extraction runs while ML is armed — active OR auto-pending — so the
 // AUTO path warms from the preloaded pipeline instead of waiting on activation.
-	if (m_pPSMLGamma && m_pPSMLDownsample && (m_bMLActive || (m_bML && m_iMLMode == ML_Auto))) {
+	//
+	// The experimental tone mapper feeds on the same statistics, so it arms the
+	// extractor on its own: a user who selects it with the Zion grade off must
+	// still get a curve, and the alternative — quietly reusing whatever stale
+	// statistics were left over — reads to the user as "the control does nothing".
+	// MLStatsNeeded() is the one predicate for "these statistics are wanted"; the
+	// staleness flag and the convert-seen latch below use it too, so the three
+	// cannot drift apart again.
+	if (m_pPSMLGamma && m_pPSMLDownsample && MLStatsNeeded()) {
 		m_MLDebugStale = m_bMLFeaturesStale ? 1 : 0;
 		m_MLDebugConvertSeen = m_bMLConvertSeen ? 1 : 0;
 		m_MLDebugTexConv = m_TexConvertOutput.pTexture ? 1 : 0;
 		if (m_bMLFeaturesStale && m_bMLConvertSeen && m_TexConvertOutput.pTexture) {
 			ExtractMLFeatures();
 			m_bMLFeaturesStale = false;
+			UpdateToneLut();
+
+			// --- Per-scene peak for the Hable curve --------------------------
+			// m_MLFeatures[0] is the per-scene peak of the signal the tone curve is
+			// about to consume, in PQ. It is measured on the PRE-tone-map texture,
+			// and correctly domained since the extractor stopped keying its luma
+			// domain off the SWAP CHAIN (which is SDR on this path) instead of the
+			// correction actually selected.
+			//
+			// Smoothing and gating are not optional here: an instantaneous
+			// per-frame peak re-normalises the curve on every shot, so the picture
+			// breathes. The IIR is the drift, the cut test is the snap. Thresholds
+			// reuse this renderer's existing maxscl scene-cut policy so there is
+			// one definition of "the scene changed" rather than two that disagree.
+			const float peakPq = m_MLFeatures[0];
+			const float peakNits = exptm::PqToLinearNits(peakPq);
+
+			// Plausibility gate. PQ 1.0 decodes to 10000 nits, and that is exactly
+			// what the extractor reports when it saturates — observed live on a
+			// blank frame as raw_pq=1.0000 / raw_nits=10000.0. Taken as a scene peak
+			// it snaps the smoothed value to 10000, and the divisor
+			// hable(10000/sdrNits) drives the picture to BLACK. A read outside a
+			// sane band is a failed read, so reject it rather than trust it — the
+			// smoothed value simply holds until a real reading arrives.
+			const bool bPlausible = (peakNits > 10.0f) && (peakNits < 4000.0f);
+			if (bPlausible) {
+				const float d = peakPq - m_HablePrevPeakPq;
+				const bool bCut = (m_HableScenePeakNits < 0.0f)
+					|| (m_HablePrevPeakPq < 0.0f)
+					|| d > SCENE_CUT_THRESH || d < -SCENE_CUT_THRESH;
+				m_HablePrevPeakPq = peakPq;
+				if (bCut) {
+					m_HableScenePeakNits = peakNits;            // snap across a cut
+				} else {
+					// ~12-frame time constant: fast enough to follow a fade, slow
+					// enough that a cut-free shot cannot pump.
+					m_HableScenePeakNits += (peakNits - m_HableScenePeakNits) * 0.08f;
+				}
+				const float chg = m_HableScenePeakNits - m_HableScenePeakApplied;
+				if (m_HableScenePeakApplied < 0.0f || chg > 1.0f || chg < -1.0f) {
+					m_HableScenePeakApplied = m_HableScenePeakNits;
+					SetShaderLuminanceParams();   // per-frame push; the cbuffer is
+					                              // otherwise only sent on settings changes
+					// Logged on PUSH, not every frame: this fires exactly when the
+					// value the Hable branch normalises by actually moves, which is
+					// the thing to check when asking "is the per-scene peak live?".
+					if (m_bMLDebug && m_pMLDebugFile) {
+						fwprintf(m_pMLDebugFile,
+							L"HABLE_PEAK frame=%llu raw_pq=%.4f raw_nits=%.1f smooth_nits=%.1f cut=%d\n",
+							(unsigned long long)m_MLDebugFrame, (double)peakPq,
+							(double)peakNits, (double)m_HableScenePeakNits, bCut ? 1 : 0);
+						fflush(m_pMLDebugFile);
+					}
+				}
+			}
 		}
 	}
 
@@ -4970,7 +5568,10 @@ void CDX11VideoProcessor::UpdatePostScaleTexures()
 		(m_SwapChainFmt == DXGI_FORMAT_B8G8R8A8_UNORM && m_InternalTexFmt != DXGI_FORMAT_B8G8R8A8_UNORM
 		|| m_SwapChainFmt == DXGI_FORMAT_R10G10B10A2_UNORM && m_InternalTexFmt == DXGI_FORMAT_R16G16B16A16_FLOAT);
 
-	m_bFinalPass = (m_bUseDither && needDither && m_TexDither.pTexture);
+	m_bDitherActive = (m_bUseDither && needDither && m_TexDither.pTexture);
+	// A loaded calibration LUT forces the final pass even with dithering off —
+	// it is the last display-referred stage and nothing else can host it.
+	m_bFinalPass = m_bDitherActive || m_bCubeLutEnabled;
 	if (m_bFinalPass) {
 		m_pPSFinalPass.Release();
 		m_bFinalPass = SUCCEEDED(CreatePShaderFromResource(
@@ -5274,7 +5875,13 @@ HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRen
 		return hr;
 	}
 
-	const FLOAT constants[4] = { (float)Tex.desc.Width / dither_size, (float)Tex.desc.Height / dither_size, 0, 0 };
+	const FLOAT constants[8] = {
+		(float)Tex.desc.Width / dither_size, (float)Tex.desc.Height / dither_size,
+		m_bCubeLutEnabled ? 1.0f : 0.0f, (float)m_iCubeLutSize,
+		m_bDitherActive ? 1.0f : 0.0f,
+		(float)m_iCubeLutMode,
+		0, 0
+	};
 	D3D11_MAPPED_SUBRESOURCE mr;
 	hr = m_pDeviceContext->Map(m_pFinalPassConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr);
 	if (FAILED(hr)) {
@@ -5297,10 +5904,21 @@ HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRen
 	m_pDeviceContext->PSSetShaderResources(1, 1, &m_TexDither.pShaderResource.p);
 	m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerDither.p);
 
+	// Display calibration LUT on t2/s2. Bound only when loaded; the shader guards
+	// on the enable flag, so an unbound slot is never sampled.
+	const bool bLutBound = m_bCubeLutEnabled && m_pCubeLutSRV && m_pCubeLutSampler;
+	if (bLutBound) {
+		m_pDeviceContext->PSSetShaderResources(2, 1, &m_pCubeLutSRV.p);
+		m_pDeviceContext->PSSetSamplers(2, 1, &m_pCubeLutSampler.p);
+	}
+
 	TextureBlt11(m_pDeviceContext, pRenderTargetView, VP, m_pVSimpleInputLayout, m_pVS_Simple, m_pPSFinalPass, Tex.pShaderResource, m_pSamplerPoint, m_pFinalPassConstantBuffer, m_pVertexBuffer);
 
 	ID3D11ShaderResourceView* views[1] = {};
 	m_pDeviceContext->PSSetShaderResources(1, 1, views);
+	if (bLutBound) {
+		m_pDeviceContext->PSSetShaderResources(2, 1, views);
+	}
 
 	return hr;
 }
@@ -5430,9 +6048,25 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			// Raw HDR/DV passthrough also bypasses the correction step (the
 			// 10000/sdrNits scale) so the SDR display gets the UNconverted signal.
 			StepSetting();
+
+			// Experimental tone curve on t1/s1. TextureCopyRect only binds t0/s0 and
+			// b0, so anything bound here survives into the draw — the same trick the
+			// final pass uses for its dither and cube LUT. Unbound when inactive: the
+			// shader branches on toneLutEnable, so a disabled mapper never samples it.
+			const bool bToneLut = !m_bHDRPassthroughRaw && ToneLutActive();
+			if (bToneLut) {
+				m_pDeviceContext->PSSetShaderResources(1, 1, &m_pToneLutSRV.p);
+				m_pDeviceContext->PSSetSamplers(1, 1, &m_pToneLutSampler.p);
+			}
+
 			hr = TextureCopyRect(*pInputTexture, pRT, rect, rect,
 				m_bHDRPassthroughRaw ? m_pPS_Simple.p : m_pPSCorrection.p,
 				m_bHDRPassthroughRaw ? nullptr : m_pCorrectionConstants, 0, false);
+
+			if (bToneLut) {
+				ID3D11ShaderResourceView* none[1] = {};
+				m_pDeviceContext->PSSetShaderResources(1, 1, none);
+			}
 		}
 
 		if (m_pPSHDR10ToneMapping) {
@@ -5551,9 +6185,18 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				m_pDeviceContext->PSSetShaderResources(4, 1, &m_SkinGateSRV.p);
 				m_pDeviceContext->PSSetSamplers(4, 1, &m_pSamplerGate.p);
 			}
+			// Trained P(skin) LUT on t1/s1 for the gamma pass's skin-gated top-up —
+			// the SAME LUT the chroma pass uses, sampled with the same derivation so
+			// both passes agree on what counts as skin. t1 is free in this pass:
+			// t0=tex, t2=sky/person mask, t3=source, t4=gate.
+			if (m_SkinLUTSRV && m_pSamplerSkin) {
+				m_pDeviceContext->PSSetShaderResources(1, 1, &m_SkinLUTSRV.p);
+				m_pDeviceContext->PSSetSamplers(1, 1, &m_pSamplerSkin.p);
+			}
 			hrs[1] = TextureCopyRect(*pInputTexture, pRT, rect, rect, psGamma, m_bMLDebugCopy ? nullptr : m_pMLParams, 0, false);
 			{
-				ID3D11ShaderResourceView* nul = nullptr;   // unbind t3 (source) + t4 (gate); t2 stays for MC
+				ID3D11ShaderResourceView* nul = nullptr;   // unbind t1 (skin LUT), t3 (source), t4 (gate); t2 stays for MC
+				m_pDeviceContext->PSSetShaderResources(1, 1, &nul);
 				m_pDeviceContext->PSSetShaderResources(3, 1, &nul);
 				m_pDeviceContext->PSSetShaderResources(4, 1, &nul);
 			}
@@ -5728,7 +6371,10 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 		hr = ResizeShaderPass(*pInputTexture, pRenderTarget, rSrc, dstRect, rotation);
 	}
 
-	if (m_bMLActive && m_TexConvertOutput.pTexture) {
+	// Latch "a convert output exists" for whoever wants the statistics. Gated on the
+	// same predicate as the extraction itself — gating it on the Zion grade alone
+	// was what left the experimental mapper permanently unbuilt.
+	if (MLStatsNeeded() && m_TexConvertOutput.pTexture) {
 		m_bMLConvertSeen = true;
 	}
 
@@ -5773,19 +6419,7 @@ HRESULT CDX11VideoProcessor::SetWindowRect(const CRect& windowRect)
 HRESULT CDX11VideoProcessor::Reset(bool bDisplayModeChange)
 {
 	DLog(L"CDX11VideoProcessor::Reset({})", bDisplayModeChange);
-
-	// 24p cadence, step 1 — absorb the display-mode change our own switch just
-	// caused, BEFORE anything could restore the refresh or tear down while the
-	// 24p content is still playing.
-	if (bDisplayModeChange && m_bDisplayModeChangeAfterRefreshSwitch) {
-		m_bDisplayModeChangeAfterRefreshSwitch = false;
-		return S_OK;
-	}
-
-	// 24p cadence, step 2 — any other pipeline / display reset is a chance to
-	// hand the display refresh back to the user's original mode (before taking
-	// the lock; RestoreRefreshRateOverride takes it itself, no deadlock).
-	RestoreRefreshRateOverride();
+	m_rtFirstPresent = -1;   // re-anchor the present-latency gauge on the next frame
 
 	CAutoLock cRendererLock(&m_HDRToggleLock);
 
@@ -6240,9 +6874,20 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 
 	if (config.bHdrLocalToneMapping != m_bHdrLocalToneMapping ||
 			config.iHdrLocalToneMappingType != m_iHdrLocalToneMappingType) {
+		const bool bCurveChanged = config.iHdrLocalToneMappingType != m_iHdrLocalToneMappingType;
 		m_bHdrLocalToneMapping = config.bHdrLocalToneMapping;
 		m_iHdrLocalToneMappingType = config.iHdrLocalToneMappingType;
 		changeHDR = true;
+		// The PQ->SDR converter's constant buffer carries the curve selection now,
+		// so a change has to re-push it. Without this the "Tone curve" row would
+		// still do nothing live on an SDR display — the same class of bug as the
+		// selection being read only by a shader that never gets built.
+		//
+		// changeHDR alone is not enough: it drives the HDR-output machinery, which
+		// is dormant here.
+		if (bCurveChanged) {
+			changeLuminanceParams = true;
+		}
 	}
 
 	if (config.bHDRPassthroughRaw != m_bHDRPassthroughRaw) {
@@ -6255,6 +6900,68 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		//changeHDR = true;
 	}
 
+	if (config.iOutputGamut != m_iOutputGamut) {
+		m_iOutputGamut = config.iOutputGamut;
+		// Read from the correction shader's constant buffer, so it needs the SAME
+		// update mechanism as iSDRDisplayNits just below — changeLuminanceParams
+		// -> SetShaderLuminanceParams(). NOT changeConvertShader: that flag
+		// rebuilds the YCbCr->RGB shader and left the gamut value never reaching
+		// the GPU, which made the control appear to do nothing.
+		if (SourceIsHDR()) {
+			changeLuminanceParams = true;
+		}
+	}
+
+	if (config.fHdrDisplayMinNits != m_fHdrDisplayMinNits) {
+		m_fHdrDisplayMinNits = config.fHdrDisplayMinNits;
+		// Shader-constant only: SetHDR10ShaderParams memcmps its cbuffer, so the
+		// next call picks the new value up without a media-type or swap-chain
+		// rebuild. Same treatment as iHdrDisplayMaxNits above.
+		//
+		// The experimental curve reads it too, and as its OUTPUT BLACK — force a
+		// rebuild, or the new black waits for the next scene change to appear.
+		if (m_iExperimentalToneMapper != 0) {
+			m_bToneLutReady = false;
+		}
+		// The standard curves read it in the converter's cbuffer, so re-push.
+		changeLuminanceParams = true;
+	}
+
+	if (config.fHdrTitlePeakNits != m_fHdrTitlePeakNits) {
+		m_fHdrTitlePeakNits = config.fHdrTitlePeakNits;
+		// Read by the converter's cbuffer (the standard curves' normalisation) AND
+		// by the experimental spline's index axis, so both need to see it.
+		changeLuminanceParams = true;
+		m_bToneLutReady = false;
+	}
+
+	if (config.fHdrHableKnee != m_fHdrHableKnee) {
+		m_fHdrHableKnee = config.fHdrHableKnee;
+		// Shader-constant only: the Hable branch reads it from the converter's
+		// cbuffer, so a re-push is enough. No curve rebuild — it is a per-pixel
+		// blend weight, not a table.
+		changeLuminanceParams = true;
+	}
+
+	if (config.iExperimentalToneMapper != m_iExperimentalToneMapper) {
+		m_iExperimentalToneMapper = config.iExperimentalToneMapper;
+		// Also covers switching back to Off: ToneLutActive() goes false, the next
+		// SetShaderLuminanceParams writes toneLutEnable = 0, and the converter
+		// takes the shipped branch again. Drop the built table so re-enabling
+		// rebuilds from the current scene rather than reusing a stale one.
+		m_bToneLutReady = false;
+		if (m_iExperimentalToneMapper == 0) {
+			m_MLToneMaxSmooth = -1.0f;
+		}
+		// Reads the correction shader's constant buffer — same flag as iOutputGamut.
+		changeLuminanceParams = true;
+	}
+
+	if (config.fToneLutContrast != m_fToneLutContrast) {
+		m_fToneLutContrast = config.fToneLutContrast;
+		m_bToneLutReady = false;   // the curve is built from it
+	}
+
 	if (config.iHdrToggleDisplay != m_iHdrToggleDisplay) {
 		if (config.iHdrToggleDisplay == HDRTD_Disabled || m_iHdrToggleDisplay == HDRTD_Disabled) {
 			changeHDR = true;
@@ -6262,24 +6969,26 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_iHdrToggleDisplay = config.iHdrToggleDisplay;
 	}
 
-	if (config.iRefreshSwitch24p != m_iRefreshSwitch24p) {
-		m_iRefreshSwitch24p = config.iRefreshSwitch24p;
-		if (!config.iRefreshSwitch24p) {
-			RestoreRefreshRateOverride();     // turning it off: display back to original
-		} else {
-			HandleRefreshRateForCadence();    // turning it on: evaluate the current input
-		}
-	}
-
 	if (config.bConvertToSdr != m_bConvertToSdr) {
 		m_bConvertToSdr = config.bConvertToSdr;
 		if (SourceIsHDR()) {
-			if (m_D3D11VP.IsReady()) {
-				changeNumTextures = true;
-				changeVP = true; // temporary solution
-			} else {
-				changeConvertShader = true;
-			}
+			// Re-select the converter shader DIRECTLY. This used to ask for a full
+			// VP re-init (changeVP) and that request is silently dropped in several
+			// situations — Configure() clears changeVP for Dolby Vision sources, and
+			// a re-init that lands before the media type has settled does nothing.
+			// Whenever it was dropped, the control simply had no effect, which is
+			// why Convert to SDR behaved intermittently: the setting was stored
+			// correctly every time, but only took on the runs where a rebuild
+			// happened to follow it.
+			//
+			// bConvertToSdr is not a shader constant, it decides WHICH shader exists,
+			// so it cannot be pushed as one — but it can be re-selected in place,
+			// which is all a re-init was achieving.
+			UpdateCorrectionShader();
+			// The correction pass is one step of the post-scale ring, so the ring's
+			// step count can change with it (see the m_pPSCorrection block in the
+			// render path). Mirrors what UpdateMLActive() does for the ML steps.
+			UpdatePostScaleTexures();
 		}
 	}
 
@@ -6298,10 +7007,15 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		if (SourceIsHDR()) {
 			changeLuminanceParams = true;
 		}
+		// SDR white is the experimental curve's OUTPUT WHITE, so the table itself
+		// is stale, not just the constant that scales it.
+		if (m_iExperimentalToneMapper != 0) {
+			m_bToneLutReady = false;
+		}
 	}
 
 	if (config.bMLEnabled != m_bML || config.iMLMode != m_iMLMode ||
-			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow || config.fMLShadowDehaze != m_fMLShadowDehaze || config.fMLHighlightRolloffCtrl != m_fMLHighlightRolloffCtrl ||
+			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow || config.fMLShadowDehaze != m_fMLShadowDehaze || config.fMLHighlightRolloffCtrl != m_fMLHighlightRolloffCtrl || config.fMLGammaTopUp != m_fMLGammaTopUp ||
 			config.fMLHighlight != m_fMLHighlight ||
 			config.bMLGammaEnabled != m_bMLGammaEnabled ||
 			config.bMLShadowEnabled != m_bMLShadowEnabled ||
@@ -6334,6 +7048,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_fMLShadow    = config.fMLShadow;
 		m_fMLShadowDehaze = config.fMLShadowDehaze;
 		m_fMLHighlightRolloffCtrl = config.fMLHighlightRolloffCtrl;
+		m_fMLGammaTopUp = config.fMLGammaTopUp;
 		m_fMLHighlight = config.fMLHighlight;
 		m_bMLToneCurveEnabled = config.bMLToneCurveEnabled;
 		m_bMLGammaEnabled   = config.bMLGammaEnabled;
