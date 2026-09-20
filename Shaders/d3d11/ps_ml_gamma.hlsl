@@ -234,10 +234,31 @@ float4 main(PS_INPUT input) : SV_Target
 			I_norm = saturate(I_norm + corr * u * MLSkinPersonStrength * 0.32f);
 		}
 	}
-	ictcp.x = I_norm * I_peak;
+	// The curve's move on I, turned into a per-pixel GAIN on the whole colour.
+	//
+	// This used to be `ictcp.x = I_norm * I_peak;` with Ct/Cp handed back
+	// untouched — which is NOT hue-preserving, it is saturation-changing: I moves,
+	// the PQ-encoded chroma stays, so the colour slides whenever the curve moves.
+	//
+	// And the curve DOES move inside a single shot. The Auto gamma is IIR smoothed
+	// (DX11VideoProcessor.cpp: 0.10/0.90, snapping only when the scene peak shifts
+	// more than 0.15 PQ), so as a camera settles the gamma ramps over ~0.4 s. That
+	// ramp was reaching the screen as colour: an indoor orange diffuse light fading
+	// to pale yellow then white, green going pale, inside one scene.
+	//
+	// Scaling the whole colour instead makes a curve move a LUMINANCE move. A
+	// linear scale of R, G and B leaves chromaticity exactly where it was, so the
+	// grade may ramp as much as it likes and hue and relative saturation hold. The
+	// header claim above — "preserves Ct/Cp, no skin tone or hue shift" — is only
+	// true once the colour is carried along like this.
+	const float I_new   = I_norm * I_peak;
+	const float nitsOld = ST2084ToLinear(float4(I,     0.0, 0.0, 0.0), 10000.0).x;
+	const float nitsNew = ST2084ToLinear(float4(I_new, 0.0, 0.0, 0.0), 10000.0).x;
+	const float g       = nitsNew / max(nitsOld, 1e-6);
 
-	// Inverse: ICtCp → linear nits → output encoding
-	float3 rgb_out = ictcp_to_linear(ictcp);
+	// Inverse: ICtCp → linear nits, scaled by the curve's gain, → output encoding.
+	// `ictcp` still holds the ORIGINAL I here (only the local I_norm was curved).
+	float3 rgb_out = ictcp_to_linear(ictcp) * g;
 
 	if (IsPQ > 0.5) {
 		color.rgb = LinearToST2084(float4(rgb_out, 0.0), 10000.0).rgb;

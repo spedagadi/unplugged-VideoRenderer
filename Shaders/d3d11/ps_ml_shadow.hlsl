@@ -209,10 +209,25 @@ float4 main(PS_INPUT input) : SV_Target
 	float I_out = I_norm * lift;
 	I_out = min(I_out, I_norm * (1.0 + MCRatioCap * MCStrength));
 
-	ictcp.x = I_out * I_peak;
+	// Carry the COLOUR with the lift — same treatment as ps_ml_gamma.
+	//
+	// This pass used to scale ictcp.x and hand Ct/Cp back untouched: `lift` moved
+	// and the PQ-encoded chroma did not, so saturation followed local contrast.
+	// That is far more visible here than in the gamma pass, because `lift` is a
+	// PER-PIXEL, PER-FRAME quantity — logr is the pixel's deviation from a blurred
+	// surround, so it changes everywhere the moment the camera moves. A saturated
+	// diffuse light then washes toward white as its local contrast changes, which
+	// is the indoor orange going pale.
+	//
+	// Scaling the whole colour instead makes the clarity lift a LUMINANCE move: a
+	// linear scale of R, G and B leaves chromaticity exactly where it was.
+	const float nitsOld = ST2084ToLinear(float4(I_norm * I_peak, 0.0, 0.0, 0.0), 10000.0).x;
+	const float nitsNew = ST2084ToLinear(float4(I_out  * I_peak, 0.0, 0.0, 0.0), 10000.0).x;
+	const float gLift  = nitsNew / max(nitsOld, 1e-6);
 
-	// Inverse: ICtCp → linear nits → output encoding
-	float3 rgb_out = ictcp_to_linear(ictcp);
+	// Inverse: ICtCp → linear nits, scaled by the lift, → output encoding.
+	// `ictcp` still holds the ORIGINAL I (only the local I_norm / I_out were lifted).
+	float3 rgb_out = ictcp_to_linear(ictcp) * gLift;
 	if (IsPQ > 0.5) {
 		color.rgb = LinearToST2084(float4(rgb_out, 0.0), 10000.0).rgb;
 	} else {

@@ -208,6 +208,88 @@ anchor is allowed to follow the content.
 
 ---
 
+### 11. Scene adaptation — the anchor chain, and the three traps in it (2026-09-20)
+
+The anchor (what Hable normalises by) is now, in order:
+
+1. **p99.5** of the content-row histogram — see 11b.
+2. **IIR low-pass**, libplacebo's, period 20, on BOTH average and peak.
+3. **Cut detection**: thresholds 1.0/3.0 dB, `bias` = cell-active fraction,
+   **`delta = bias * max(|Δavg|, |Δpeak|)`** — see 11c.
+4. Both values mixed toward the measurement by `smoothstep(thresh_low, thresh_high, delta)`.
+
+Each of the three defects below produced a distinct symptom, and they were
+reported in this order — worth reading as a sequence, because each one masked the
+next:
+
+**11a — `bias` was a PIXEL fraction.** libplacebo uses a *workgroup*-active
+fraction, which stays near 1.0 because a workgroup counts as active if ANY of its
+pixels is. A pixel fraction on a sparse dark frame is small, which scaled `delta`
+below `thresh_low` and pinned `mix` at **0.000 on every line ever captured** — the
+snap never fired and the IIR alone set the peak. Symptom: **brightness that
+trailed the picture** (the "catch-up"). Fixed by reporting a 16x16 cell-active
+fraction from `BuildMLFeatures`.
+
+**11b — the statistic was p99.995.** On the 256x144 readback (36864 px) that
+discards the top **~2 pixels** — a speck. Right for grain, useless against a
+**light source**: a lamp survives intact and sets the anchor for the whole scene.
+Symptom: **the picture dims when a specular enters**, and — because the anchor's
+ramp is smooth — it settles over about a second. Now **p99.5** (top 184 px), so
+the scene's LEVEL sets the anchor and its speculars do not; those clip to white,
+which is what a specular should look like. Constant:
+`kAnchorPeakPercentile` in `ml_features.cpp`.
+
+**11c — libplacebo's cut detection uses the AVERAGE only.** That is the one place
+this port deliberately departs from libplacebo, and the reason is this content:
+**two scenes either side of a cut can have almost identical average brightness and
+very different peaks** (one has light sources, the other does not). `delta` stays
+under `thresh_low`, the hysteresis never fires, and the IIR **glides** the anchor
+from the old scene's value to the new one's over ~0.8 s. The glide is visible
+whichever way it runs — **bright settling dim**, then after 11b **dim brightening**
+— and both were reported before the cause was found. A slow anything-after-a-cut
+IS the hysteresis not firing; go to `delta` first.
+
+Adding the peak was only safe *after* 11b: the peak statistic is now stable within
+a shot (a max spanning 0.003 PQ across 4198 frames), so it cannot fire spuriously.
+
+**Cost of 11c, stated:** a large bright addition *within* a shot — a wide subtitle
+over the picture — now snaps rather than glides. Subtitles in the letterbox bars
+are already excluded by the content-row measurement.
+
+### 12. THE CHROMA TRAP — scale I and chroma in the SAME domain
+
+**If you tone-map I and hand the chroma back unscaled, the colour moves whenever
+the curve moves. Saturation becomes a function of the gain.** This appeared in
+**three separate places**, and each looked like a different bug:
+
+| place | the form it took |
+|---|---|
+| tone map | I scaled in **linear**, Ct/Cp scaled in **PQ** — different domains, so they do not compose to a uniform scale |
+| `ps_ml_gamma` | `ictcp.x = I_norm * I_peak`, Ct/Cp untouched |
+| `ps_ml_shadow` (microcontrast) | same, and worst — `lift` is a **per-pixel, per-frame** field, so saturation tracked local contrast |
+
+**The correct treatment, used in all three now:** reconstruct the colour in
+**linear**, apply the **per-pixel gain** to the whole RGB, re-derive the ICtCp. A
+linear scale of R, G and B cannot move chromaticity, so the curve may move as much
+as it likes and the colour holds.
+
+**And the diagnostic trap that cost the most time here:** *"turning the ML grade
+off fixes it" does NOT mean the grade causes it.*
+
+```cpp
+if (m_pPSMLGamma && m_pPSMLDownsample && MLStatsNeeded()) { ... ExtractMLFeatures() ... }
+```
+
+`MLStatsNeeded()` is true **because the grade is on**. Turning the grade off stops
+the feature extractor, so **the anchor freezes** — no anchor movement, no drift.
+It removes the *driver*, not the *cause*. The actual drift was in the tone map.
+
+Corollary, and the reason chroma and microcontrast were both correctly ruled out:
+those two toggles DO gate their passes (`bMLChromaEnabled`, `bMLContrastEnabled`),
+so testing them proves something. The grade toggle does not.
+
+---
+
 ## Measured facts (do not re-derive)
 
 | | |

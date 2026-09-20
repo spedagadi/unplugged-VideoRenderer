@@ -302,11 +302,30 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 				anchorCount++;
 			}
 		}
-		// No content band detected (full-frame content, or a letterbox the bar scan
-		// did not resolve): fall back to the whole frame rather than reporting zero.
+		// PERCENTILE — 99.5, not 99.995. The name `outPeakP995` is historical.
+		//
+		// p99.995 on this 256x144 readback (36864 px) discards the top ~2 pixels:
+		// a speck. That was chosen to stop the anchor shimmering on grain, and it
+		// does — but a LIGHT SOURCE or specular highlight is far bigger than two
+		// pixels, so it survived intact and set the anchor for the whole scene.
+		//
+		// That is what produced the slow dim after a cut. Two scenes either side of
+		// a cut can have similar AVERAGE brightness and very different PEAKS, so
+		// libplacebo's hysteresis (which measures the average) sees no cut, and the
+		// IIR then ramps the anchor up to the specular's level — the picture goes
+		// bright on the cut and settles dimmer over about a second.
+		//
+		// p99.5 discards the top 184 pixels of 36864 — enough to take a light
+		// source out of the statistic without touching the body of the picture, so
+		// the scene's LEVEL sets the anchor and its speculars do not. Those
+		// speculars then sit above the anchor and clip to white, which is what a
+		// specular is supposed to look like.
+		//
+		// One constant, deliberately: if it needs to move, it moves here.
+		constexpr float kAnchorPeakPercentile = 0.995f;
 		*outPeakP995 = (anchorCount > 0)
-			? HistogramPercentile(anchorHist, anchorCount, 0.99995f)
-			: HistogramPercentile(histogram, total, 0.99995f);
+			? HistogramPercentile(anchorHist, anchorCount, kAnchorPeakPercentile)
+			: HistogramPercentile(histogram, total, kAnchorPeakPercentile);
 	}
 
 	if (bars) {

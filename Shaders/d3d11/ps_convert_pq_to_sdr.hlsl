@@ -154,12 +154,14 @@ float3 ToneMapSelectedCurve(float3 nits, float sdrNits)
     // It is also the same root cause as the blotches: the reconstruction leaves the
     // gamut, and ictcp_to_linear_gamut() then removes saturation per pixel.
     //
-    // min(1, ...) as before — drop saturation with the level, never add it.
-    const float chromaScale = min(1.0, I_out / max(I_in, 1e-6));
-    ictcp.yz *= chromaScale;
+    // Per-pixel gain on the WHOLE colour, applied in linear — not on the chroma
+    // in the PQ domain. See the long note in the Hable branch: scaling I in
+    // linear while scaling Ct/Cp in PQ makes saturation depend on the gain, and
+    // the gain depends on the anchor, so a moving anchor drained the colour.
+    const float gGain = I_out / max(I_in, 1e-6);
+    const float3 ictcpNew = linear_to_ictcp(ictcp_to_linear(ictcp) * gGain);
 
-    ictcp.x = LinearToST2084(float4(I_out, 0.0, 0.0, 0.0), 10000.0).x;
-    float3 mapped = ictcp_to_linear_gamut(ictcp, sdrNits);
+    float3 mapped = ictcp_to_linear_gamut(ictcpNew, sdrNits);
     // Nits -> display-relative. The same arithmetic as the legacy floor step, which
     // is what makes the two branches land in one domain.
     return saturate((mapped - displayMinNits) / max(sdrNits - displayMinNits, 1e-3));
@@ -352,16 +354,28 @@ float4 main(PS_INPUT input) : SV_Target
             // is (near enough) the original colour scaled down — already inside the
             // gamut, so the search becomes a no-op instead of a heavy correction.
             //
-            // min(1, ...) deliberately: DROP saturation when the level drops, never
-            // ADD it when the curve lifts. A shadow lift should not also raise
-            // saturation, and letting it would put the search straight back to work.
+            // The curve as a per-pixel GAIN on the whole colour, applied in LINEAR.
+            //
+            // This replaces `ictcp.yz *= chromaScale` with I re-encoded: that pair
+            // scaled I in the LINEAR domain and the chroma in the PQ-ENCODED one,
+            // and the two do not compose to a uniform scale. So the effective
+            // saturation depended on the gain — which means it depended on the
+            // ANCHOR. Since the anchor now ramps smoothly (libplacebo's IIR), that
+            // showed up as colour draining out of the picture over about a second:
+            // a saturated diffuse light going pale, orange to white.
+            //
+            // Scaling the original colour in linear and re-deriving the ICtCp is
+            // exact: a linear scale of R, G and B cannot move chromaticity, so the
+            // anchor may move as much as it likes and the colour holds. This is the
+            // same treatment as ps_ml_gamma and ps_ml_shadow.
             const float I_newNits = I_rel * max(sdrNits, 1e-3);
-            const float chromaScale = min(1.0, I_newNits / max(I_origNits, 1e-6));
-            ictcp.yz *= chromaScale;
+            const float gGain = I_newNits / max(I_origNits, 1e-6);
 
-            ictcp.x = LinearToST2084(float4(I_newNits, 0.0, 0.0, 0.0), 10000.0).x;
+            // ictcp still holds the ORIGINAL I here (the curve result lives in
+            // I_rel / I_newNits), so ictcp_to_linear returns the original colour.
+            const float3 ictcpNew = linear_to_ictcp(ictcp_to_linear(ictcp) * gGain);
 
-            color.rgb = ictcp_to_linear_gamut(ictcp, sdrNits) / max(sdrNits, 1e-3);
+            color.rgb = ictcp_to_linear_gamut(ictcpNew, sdrNits) / max(sdrNits, 1e-3);
         }
 
         // Output gamut. 0 = the standard SDR target: map BT.2020 content onto

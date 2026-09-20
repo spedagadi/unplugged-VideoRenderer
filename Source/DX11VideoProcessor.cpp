@@ -5399,40 +5399,33 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					if (fabsf(maxPq - m_PeakMaxPq) < eps) maxPq = m_PeakMaxPq;
 				}
 
-				// 3. Average: IIR low-pass. See the anchor note below for the max.
+				// 3. IIR low-pass over BOTH values, one coefficient — libplacebo's
+				// own shape (smoothing_period 20, ~0.8 s at 24 fps).
 				//
-				// libplacebo filters BOTH the average and the max with this coefficient
-				// (smoothing_period 20, ~0.8 s at 24 fps) and then snaps both when a
-				// scene change fires. We did that too, and then lengthened the max's
-				// period to ~8 s to stop a pause overlay from dimming the face — and
-				// THAT was worse. The brightness then trailed the picture in both
-				// directions: after any bright moment the anchor relaxed over several
-				// seconds, so the scene visibly "caught up" in brightness long after
-				// the change. Reported, and correctly: a brightness that converges
-				// slowly reads as a fault, not as damping.
+				// This is the SHIMMER fix. The anchor is a per-frame maximum, and a
+				// maximum moves a little every frame — grain, motion, a flickering
+				// lamp — which the whole picture then follows, because the anchor sets
+				// the divisor. The filter damps exactly that variation.
 				//
-				// So the max is no longer filtered at all — the anchor IS the current
-				// frame. One frame of lag, from the readback being a frame behind, and
-				// nothing else. A cut, a fade, an overlay appearing or leaving: the
-				// picture follows on the next frame in every case.
+				// The 0.8 s is only tolerable BECAUSE of step 4 below. On a real cut
+				// the hysteresis drives mix to 1 and both values JUMP in a single
+				// frame, so a stale normalisation is never carried across a scene
+				// change. With no working hysteresis this coefficient is precisely what
+				// makes the brightness trail the picture — which is what happened, and
+				// what the bias fix in step 4 removes.
 				//
-				// Stated plainly, because it is a real consequence: an overlay that
-				// enters the frame now moves the picture IMMEDIATELY rather than over
-				// seconds. That is the same event, just not smeared. It cannot be
-				// filtered away without reintroducing the trail — an overlay is a large
-				// bright region and is statistically identical to content, so the only
-				// real fix is to EXCLUDE it from the measurement (a screen-region rule
-				// for subtitles and player graphics), not to smooth it.
-				//
-				// The average keeps its filter, and the hysteresis below still runs to
-				// maintain it. Neither gates the anchor any more.
+				// An earlier attempt lengthened the max's period to ~8 s to stop a
+				// pause overlay dimming the face. Wrong tool: it made the anchor lag in
+				// BOTH directions, so the scene visibly caught up in brightness seconds
+				// after every change. An overlay is a bright region statistically
+				// identical to content, so the answer to it is to EXCLUDE it from the
+				// measurement, not to filter longer.
 				const float coeff = 1.0f - expf(-1.0f / kSmoothPeriod);
 				m_PeakAvgPq += coeff * (avgPq - m_PeakAvgPq);
 
-				// The ANCHOR is the current frame's measurement. No filter, no
-				// hysteresis, no snap. See the note below for why libplacebo's
-				// smoothing was removed from it as well.
-				m_PeakMaxPq = maxPq;
+				// The anchor takes the SAME filter as the average now — this is the
+				// shimmer fix, and the shipped libplacebo behaviour.
+				m_PeakMaxPq += coeff * (maxPq - m_PeakMaxPq);
 
 				// 4. Scene-change hysteresis. bias = the non-black CELL fraction, so a
 				// letterboxed or mostly-black frame cannot register a change on its own.
@@ -5441,13 +5434,29 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// never fired and the IIR ramp alone set the peak, so a cut to a bright
 				// scene kept the previous scene's normalisation for ~3 seconds and the
 				// highlights clipped against it. See BuildMLFeatures.
-				const float delta = m_MLActiveFrac * fabsf(avgPq - m_PeakAvgPq);
+				// libplacebo measures the deviation from the AVERAGE alone, and that misses
+				// precisely the cuts that matter here. Two scenes either side of a cut can
+				// have almost identical average brightness and very different PEAKS (one
+				// has light sources, the other does not), so delta stays under thresh_low,
+				// the hysteresis never fires, and the IIR glides the anchor from the old
+				// scene's value to the new one's over ~0.8 s. The glide is visible in
+				// whichever direction it runs — bright settling dim, or dim brightening —
+				// and both of those were reported, in that order.
+				//
+				// Including the peak catches it: a peak jump IS a scene change. This was
+				// safe to add only after the anchor's statistic became p99.5 measured over
+				// the content rows, which is stable within a shot (a max spanning 0.003 PQ
+				// across 4198 frames), so it cannot fire spuriously on ordinary frames.
+				const float delta = m_MLActiveFrac *
+					fmaxf(fabsf(avgPq - m_PeakAvgPq), fabsf(maxPq - m_PeakMaxPq));
 				const float mixc  = exptm::smoothstepf(kThreshLow * kLog10Pq,
 				                                       kThreshHigh * kLog10Pq, delta);
 				m_PeakAvgPq = exptm::mixf(m_PeakAvgPq, avgPq, mixc);
-				// m_PeakMaxPq deliberately NOT mixed: it is set from the frame above.
-				// The hysteresis still runs because it maintains m_PeakAvgPq, which is
-				// part of the ported state; it no longer gates the anchor.
+				// Both values snap together, exactly as libplacebo does. This line is
+				// what makes a scene change arrive in ONE frame instead of creeping in
+				// over the IIR — the "no catch-up" requirement, satisfied by the snap
+				// rather than by removing the filter.
+				m_PeakMaxPq = exptm::mixf(m_PeakMaxPq, maxPq, mixc);
 
 				m_HableScenePeakNits = exptm::PqToLinearNits(m_PeakMaxPq);
 				const float chg = m_HableScenePeakNits - m_HableScenePeakApplied;
