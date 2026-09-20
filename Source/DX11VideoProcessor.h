@@ -429,6 +429,17 @@ private:
 	// signal — then IIR-smoothed so the curve does not re-normalise every shot,
 	// and snapped on a scene cut so it does not ramp across one. Negative means
 	// "no reading yet"; the shader falls back to the static maxCLL until then.
+	// The p99.995 peak from the last extraction, in PQ. This rather than
+	// m_MLFeatures[0] is what the Hable per-scene normalisation uses: features[0]
+	// is a MAX and a max is set by one bright speck, which makes the whole picture
+	// shimmer. See BuildMLFeatures.
+	float m_MLPeakPq995 = -1.0f;
+	float m_MLActiveFrac = 1.0f;   // non-black CELL fraction (libplacebo's bias term); was a pixel fraction, which pinned the scene-change hysteresis at 0
+	// libplacebo's peak-detect state (sh_color_map_obj.peak): the IIR- and
+	// hysteresis-filtered average and peak, in PQ. These persist across frames —
+	// the filter IS the state, and clearing them restarts the detection.
+	float m_PeakAvgPq = 0.0f;
+	float m_PeakMaxPq = 0.0f;
 	float m_HableScenePeakNits = -1.0f;
 	float m_HablePrevPeakPq = -1.0f;        // previous raw PQ peak, for the cut test
 	float m_HableScenePeakApplied = -1.0f;  // value last pushed to the cbuffer
@@ -639,8 +650,36 @@ private:
 	// True when the experimental mapper is selected AND has parameters ready, i.e.
 	// the converter must take the LUT branch. Single source of truth for the
 	// C++-side enable, so the cbuffer flag and the shader branch cannot disagree.
+	// The correction this frame selects: PQ -> SDR. ONE predicate, because it now
+	// decides the extractor's luma domain, the ML passes' input domain, and which
+	// shader SetShaderLuminanceParams feeds.
+	bool IsPqToSdrSelected() const;
+
+	// Which luma domain each consumer's texture is actually in. TWO predicates,
+	// deliberately — they read DIFFERENT textures, and one flag cannot be right
+	// for both.
+	//
+	//   MLFeatureDomainIsPq(): ExtractMLFeatures reads m_TexConvertOutput, the
+	//     PRE-correction texture, so its domain depends only on the SOURCE. Keying
+	//     it off m_bConvertToSdr was a bug: with Convert to SDR off the texture is
+	//     still PQ but the flag said otherwise, and the extractor applied
+	//     SdrGammaToPQ on top of values that were already PQ. Measured on a static
+	//     frame it reported feat0 = 0.3161 where SdrGammaToPQ(0.3855) = 0.31575 —
+	//     the double remap, to 0.1%. The Auto model then predicted gamma 1.4816
+	//     against 1.4446 for the identical frame, so the grade ran wrong numbers.
+	//
+	//   MLInputIsPq(): the ML passes read pInputTexture, the POST-correction
+	//     texture, so PQ survives only when the correction did not convert to SDR.
+	bool MLFeatureDomainIsPq() const;
+	bool MLInputIsPq() const;
+
 	bool ToneLutActive() const {
-		return m_iExperimentalToneMapper != 0 && m_bToneLutReady && m_pToneLutSRV != nullptr;
+		// The REFERENCE curve outranks the experimental mapper in the shader, so
+		// the LUT must not be built (or uploaded, or flagged in the cbuffer) while
+		// it is selected — otherwise the shader and this predicate disagree about
+		// which branch is live, and the "toneMap: active=" readout lies.
+		return m_iHdrLocalToneMappingType != TONE_CURVE_REFERENCE
+			&& m_iExperimentalToneMapper != 0 && m_bToneLutReady && m_pToneLutSRV != nullptr;
 	}
 
 	// True when the per-frame scene statistics are needed — by the Zion grade, by

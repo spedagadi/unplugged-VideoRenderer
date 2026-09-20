@@ -65,15 +65,9 @@ float4 main(PS_INPUT input) : SV_Target
         color.rgb = ToneMapExperimental(color.rgb);
     }
     else {
-        // Display floor, on the same terms as the PQ converters so the control means
-        // one thing across sources: absolute light in, display-relative out, and the
-        // floor is NOT added back (the panel's black offset supplies it).
-        // floor == 0 is the old behaviour.
-        float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
-        float floorN  = saturate(displayMinNits / max(sdrNits, 1e-3));
-        float scale   = max(1.0 - floorN, 1e-3);
-
-        color.rgb = max(color.rgb - floorN, 0.0) / scale;
+        // Display floor REMOVED — same terms as the PQ converters, so the behaviour is
+        // one thing across sources. See ps_convert_pq_to_sdr.hlsl for the account:
+        // subtracting the panel's black from scene light clipped the shadows.
         color.rgb = ToneMappingHable(color.rgb);
     }
 

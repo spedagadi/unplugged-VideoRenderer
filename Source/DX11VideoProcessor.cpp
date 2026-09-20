@@ -1309,6 +1309,33 @@ static void SplineLut(float* out, int n, Params p) {
 
 } // namespace exptm
 
+bool CDX11VideoProcessor::IsPqToSdrSelected() const
+{
+	return (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084)
+		&& !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping))
+		&& m_bConvertToSdr;
+}
+
+bool CDX11VideoProcessor::MLFeatureDomainIsPq() const
+{
+	// The extractor reads the PRE-correction texture (m_TexConvertOutput), so the
+	// domain follows the SOURCE. m_bConvertToSdr has no business here, and having
+	// it here is what produced the double remap documented in the header.
+	return (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+		|| (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084);
+}
+
+bool CDX11VideoProcessor::MLInputIsPq() const
+{
+	// The ML passes read the POST-correction texture (pInputTexture), so PQ
+	// survives only if the correction left it alone. On the DeckLink path with
+	// Convert to SDR OFF that correction is "Fix BT.2020", which passes PQ
+	// through while the swap chain stays SDR — so the old swap-chain test said
+	// "gamma 2.2" and ps_ml_gamma decoded PQ with pow(x, 2.2).
+	return (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+		|| ((m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084) && !IsPqToSdrSelected());
+}
+
 void CDX11VideoProcessor::UpdateCorrectionShader()
 {
 	m_pCorrectionConstants.Release();
@@ -1392,14 +1419,19 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 	//     the SDR path see the same numbers for the same content. All zero on the
 	//     DeckLink capture path — the card's ST.2086 frame metadata is unsupported
 	//     on HDMI — so in practice the fallback peak (1000 nits) is what is used.
-	// [13..15] unused
-	FLOAT cbuffer[16] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
+	// [13] per-scene Hable peak   [14] Hable knee   [15] spare
+	// [16..18] mobius coefficients for the curve that takes over above the knee
+	// [19] padding — cbuffers must stay 16-byte aligned
+	FLOAT cbuffer[20] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
 	                     (float)m_iOutputGamut,
 	                     ToneLutActive() ? 1.0f : 0.0f,
 	                     m_ToneLutKey.pqMin, m_ToneLutKey.pqMax,
 	                     (float)kToneLutSize, 0,
-	                     (float)discard<int>(m_iHdrLocalToneMappingType, 3, 0, 6),
-	                     0, 0, 0, 0, 0, 0, 0 };
+	                     // 7 = the upstream REFERENCE curve. The clamp's upper bound
+	                     // must cover it or discard() quietly rewrites it to 3
+	                     // (Hable), i.e. the row would do nothing.
+	                     (float)discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_REFERENCE),
+	                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 	// The metadata, guarded exactly as SetHDR10ShaderParams guards it.
 	{
@@ -1431,9 +1463,44 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// attributable to Hable alone. Promoting it is a separate decision.
 		cbuffer[13] = m_HableScenePeakNits;
 
-		// cbuffer[14]: the Hable knee. 0 = pure Hable (behaviour identical to
-		// before the knee existed), >0 = identity below that point.
-		cbuffer[14] = std::clamp(m_fHdrHableKnee, 0.0f, 0.90f);
+		// cbuffer[14]: the Hable knee, in display-relative light (1.0 = the
+		// display's white). cbuffer[16..18]: the mobius coefficients for the curve
+		// that takes over ABOVE it.
+		//
+		// With the knee OFF (0) Hable applies unchanged — exactly the behaviour it
+		// has always had, and the reason the curve is worth keeping: it protects
+		// highlights. With the knee ON, the curve above it is a SOLVED rational:
+		//
+		//   M(x) = s*(x + a)/(x + b),  with M(j) = j, M(peak) = 1, M'(j) = 1
+		//
+		// so the joint at the knee is smooth BY CONSTRUCTION rather than by a blend
+		// band. That matters because a blend band shows its mismatch, and it would
+		// show it most when the knee MOVES — which is the whole point of a knee.
+		//
+		// Hable itself cannot be joined this way. It is concave everywhere, so
+		// identity (slope 1) meets it only at the origin and no positive knee can be
+		// both value- and slope-continuous. A rational with a free (a, b) can, which
+		// is why libplacebo solves mobius this way and why its spline family is
+		// joinable while Hable is not. (Solve from libplacebo tone_mapping.c.)
+		//
+		// Three divides, run when the knee or the measured peak moves — never per
+		// pixel.
+		const float kJ = std::clamp(m_fHdrHableKnee, 0.0f, 0.90f);
+		cbuffer[14] = kJ;
+		cbuffer[16] = cbuffer[17] = cbuffer[18] = 0.0f;
+		if (kJ > 0.001f) {
+			const float sdr = (float)std::max((int)m_iSDRDisplayNits, 1);
+			const float pk  = (m_HableScenePeakNits > 10.0f)
+				? (m_HableScenePeakNits / sdr) : (titlePeak / sdr);
+			if (pk > kJ + 0.01f && pk > 1.0f + 1e-3f) {
+				const float a = -kJ * kJ * (pk - 1.0f) / (kJ * kJ - 2.0f * kJ + pk);
+				const float b = (kJ * kJ - 2.0f * kJ * pk + pk) / std::max(pk - 1.0f, 1e-6f);
+				const float s = (b * b + 2.0f * b * kJ + kJ * kJ) / (b - a);
+				cbuffer[16] = a;
+				cbuffer[17] = b;
+				cbuffer[18] = s;
+			}
+		}
 	}
 
 	if (m_pCorrectionConstants) {
@@ -2135,7 +2202,11 @@ void CDX11VideoProcessor::SetMLParams()
 		hunt,                                             // hunt compensation
 		l1max,
 		0.25f,                                            // highlight desaturation
-		(m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ? 1.0f : 0.0f,
+		// The domain of the texture the ML passes actually read — NOT the swap
+		// chain's. On an SDR display the swap chain is G22 whether or not the
+		// correction ran, so the old test told ps_ml_gamma to decode PQ with
+		// pow(x, 2.2) whenever Convert to SDR was off. See MLInputIsPq().
+		MLInputIsPq() ? 1.0f : 0.0f,
 		0.0f,
 		// Phase 1b — chroma vector tuning (per-row enables)
 		(bChromaActive && m_bMLChromaNeutralEnabled) ? discard<float>(m_fMLChromaNeutral, 1.08f, 1.0f, 1.3f) : 1.0f,
@@ -2294,18 +2365,20 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	// double remap that corrupted every feature on exactly the path the tone
 	// curve and the Zion grade run on.
 	//
-	// Key it off the correction actually selected instead: the same predicate
-	// that picks IDF_PS_11_CONVERT_PQ_TO_SDR in UpdateCorrectionShader(). The
-	// swap-chain test is kept as well, for the HDR-passthrough path where it is
+	// Key it off the correction actually selected instead: MLFeatureDomainIsPq().
+	// The swap-chain test is kept as well, for the HDR-passthrough path where it is
 	// the correct signal.
-	const bool bPqToSdr =
-		(m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084) &&
-		!(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) &&
-		m_bConvertToSdr;
+	//
+	// The predicate itself was still wrong, and this frame is where it showed: it
+	// ANDed in m_bConvertToSdr, so turning Convert to SDR OFF flipped the domain to
+	// SDRGamma22 for a texture that is still PQ, and the identical double remap
+	// came back on that path only. Caught from the log — feat0 read 0.3161 on the
+	// no-conversion path against 0.3855 on the tone-mapped one for a static frame,
+	// and SdrGammaToPQ(0.3855) = 0.31575. The extractor's texture is written by the
+	// VP, so only the SOURCE decides its domain; the correction is downstream of it.
 	const MLLumaDomain domain =
-		(m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || bPqToSdr)
-		? MLLumaDomain::PQ : MLLumaDomain::SDRGamma22;
-	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain, &m_MLBarDetected, &m_MLRawTexture);
+		MLFeatureDomainIsPq() ? MLLumaDomain::PQ : MLLumaDomain::SDRGamma22;
+	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain, &m_MLBarDetected, &m_MLRawTexture, &m_MLPeakPq995, &m_MLActiveFrac);
 	m_pDeviceContext->Unmap(m_MLStaging, 0);
 
 	if (m_bMLDebug && m_pMLDebugFile) {
@@ -2329,7 +2402,7 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 			D3D11_MAPPED_SUBRESOURCE mr2 = {};
 			if (SUCCEEDED(m_pDeviceContext->Map(m_pFaceDownParams, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr2))) {
 				struct { float IsPQ; float pad[3]; } fd = {
-					(m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ? 1.0f : 0.0f
+					MLInputIsPq() ? 1.0f : 0.0f
 				};
 				memcpy(mr2.pData, &fd, sizeof(fd));
 				m_pDeviceContext->Unmap(m_pFaceDownParams, 0);
@@ -3366,7 +3439,19 @@ void CDX11VideoProcessor::InitMLDebug()
 			L"frame,time_100ns,active,mode,gamma,shadow,highlight,"
 			L"ispq,swapcs,swfmt,steps,tmactive,winW,winH,srcW,srcH,vidL,vidT,vidR,vidB,"
 			L"mlmin,mlmax,mlavg,clipfrac,edgefrac,logCOPY,"
-			L"featReady,stale,convSeen,texConv,feat0,feat1,pred,dehaze,rolloffCtl\n");
+			L"featReady,stale,convSeen,texConv,feat0,feat1,pred,dehaze,rolloffCtl,"
+			// Appended 2026-09-20. The swap chain cannot identify the pipeline —
+			// it is G22P709 in BOTH "tone mapped" and "not tone mapped" on an SDR
+			// display — so a capture with the two could not be told apart, and the
+			// comparison that mattered was unreadable. `correction` names the
+			// converter actually selected and `mlIsPQ` is the domain the Zion grade
+			// was TOLD its input is; those two must agree.
+			L"convertSdr,correction,sdrNits,mlIsPQ,"
+			// Which CURVE the converter is applying, and whether the experimental
+			// mapper is armed. Added with the four above for the same reason: without
+			// them a capture cannot be attributed to a setting, and "the row did
+			// nothing" cannot be told apart from "the row was never read".
+			L"toneCurve,expTm,toneLutActive\n");
 		fwprintf(m_pMLDebugFile, L"# debug on (ML enabled=%d, copy=%d)\n", (m_bML ? 1 : 0), (m_bMLDebugCopy ? 1 : 0));
 		fflush(m_pMLDebugFile);
 	}
@@ -3394,7 +3479,8 @@ void CDX11VideoProcessor::LogMLFrame()
 
 	fwprintf(m_pMLDebugFile,
 		L"%llu,%lld,%d,%d,%.4f,%.4f,%.4f,%d,%s,%d,%u,%d,%d,%d,%u,%u,%d,%d,%d,%d,"
-		L"%u,%u,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+		L"%u,%u,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,"
+		L"%d,%s,%d,%d,%d,%d,%d\n",
 		m_MLDebugFrame,
 		(long long)m_rtStart,
 		(m_bMLActive ? 1 : 0),
@@ -3412,7 +3498,16 @@ void CDX11VideoProcessor::LogMLFrame()
 		(double)m_MLDebugLastAvg, (double)m_MLDebugLastClipF, (double)m_MLDebugLastEdgeF,
 		(m_bMLDebugCopy ? 1 : 0),
 		m_MLDebugFeatReady, m_MLDebugStale, m_MLDebugConvertSeen, m_MLDebugTexConv,
-		(double)m_MLDebugFeat0, (double)m_MLDebugFeat1, (double)m_MLDebugPred, (double)m_MLShadowDehazeApplied, (double)m_MLRolloffCtrlApplied);
+		(double)m_MLDebugFeat0, (double)m_MLDebugFeat1, (double)m_MLDebugPred, (double)m_MLShadowDehazeApplied, (double)m_MLRolloffCtrlApplied,
+		// Four specifiers, four arguments — keep them in step. A specifier added
+		// without its argument corrupts the file this log exists to be read from.
+		(int)m_bConvertToSdr,
+		(m_strCorrection ? m_strCorrection : L"-"),
+		m_iSDRDisplayNits,
+		(m_lastMLParams.IsPQ > 0.5f ? 1 : 0),
+		m_iHdrLocalToneMappingType,
+		m_iExperimentalToneMapper,
+		(ToneLutActive() ? 1 : 0));
 	fflush(m_pMLDebugFile);
 }
 
@@ -5214,53 +5309,160 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 
 			// --- Per-scene peak for the Hable curve --------------------------
 			// m_MLFeatures[0] is the per-scene peak of the signal the tone curve is
-			// about to consume, in PQ. It is measured on the PRE-tone-map texture,
-			// and correctly domained since the extractor stopped keying its luma
-			// domain off the SWAP CHAIN (which is SDR on this path) instead of the
-			// correction actually selected.
+			// about to consume, in PQ. Measured on the PRE-tone-map texture, and
+			// correctly domained since the extractor stopped keying its luma domain
+			// off the SWAP CHAIN (which is SDR on this path) instead of the source
+			// actually selected.
 			//
-			// Smoothing and gating are not optional here: an instantaneous
-			// per-frame peak re-normalises the curve on every shot, so the picture
-			// breathes. The IIR is the drift, the cut test is the snap. Thresholds
-			// reuse this renderer's existing maxscl scene-cut policy so there is
-			// one definition of "the scene changed" rather than two that disagree.
-			const float peakPq = m_MLFeatures[0];
-			const float peakNits = exptm::PqToLinearNits(peakPq);
+			// *** THE COMMENT THAT USED TO SIT HERE WAS WRONG, AND IS GONE. ***
+			// It said the smoothing had been "TAKEN INSTANTANEOUSLY, deliberately",
+			// and that the earlier ~12-frame IIR had been removed because "a
+			// brightness change that trails the picture reads as a fault". The code
+			// immediately below it has done the opposite ever since the libplacebo
+			// peak detection was ported: it filters, and the same stale paragraph was
+			// left standing over it. Anyone reading top-down would have concluded the
+			// lag was fixed.
+			//
+			// It is not fixed. Measured 2026-09-20 on a static scene, filt_pq ramped
+			// 0.3202 -> 0.3785 across frames 172-252 — about 80 frames, over three
+			// seconds — with mix = 0.000 on every line. The hysteresis never fires,
+			// so nothing snaps and the IIR always wins.
+			//
+			// The cause was the bias term, and it was a real departure from
+			// libplacebo. libplacebo scales the deviation by a WORKGROUP-active
+			// fraction (frame_wg_active / frame_wg_count, colorspace.c:1231), which
+			// stays near 1.0 on any normally-exposed frame because a workgroup counts
+			// as active if ANY of its pixels is. m_MLActiveFrac was a PIXEL fraction,
+			// a small number on a sparse dark frame, so it scaled delta below
+			// thresh_low (0.01) and mix pinned to 0.
+			//
+			// FIXED 2026-09-20: BuildMLFeatures now reports a 16x16 CELL-active
+			// fraction, the workgroup analogue. The consequence of the old behaviour
+			// was not only lag — it was CLIPPING. peakSdrUnits = max(peak/sdrNits, 1)
+			// means a stale LOW peak keeps the divisor at hable(1.0), i.e. "85 nits is
+			// white"; cut to a bright scene and everything above 85 nits overflows and
+			// is flattened by the closing saturate(). The normalisation stayed anchored
+			// to the previous dark scene for ~3 seconds, which is what a hard-edged
+			// blotch in the highlights of a bright shot actually is.
+			//
+			// Historical note, still true and still the reason to be careful here:
+			// within a scene maxscl is a MAX, so it is set by the brightest object
+			// and is very
+			// the response time was the whole cost.
+			// --- libplacebo peak detection, ported ---------------------------------
+			// This is the code the mpv stack ran (shaders/colorspace.c,
+			// sh_color_map_obj.peak) with its own constants: percentile 99.995, an
+			// IIR of smoothing_period 20, scene hysteresis at 1.0/3.0.
+			//
+			// The ORDER is libplacebo's and it matters:
+			//   1. measure avg_pq and max_pq (both PQ)
+			//   2. ignore deviations below rounding error
+			//   3. IIR low-pass                          <- the filter
+			//   4. hysteresis: mix toward the measurement by how far it moved,
+			//      smoothstepped between the two thresholds
+			//
+			// Step 4 is why this cannot lag. The IIR only wins for deviations BELOW
+			// the low threshold (1 dB); above the high threshold (3 dB) the mix
+			// coefficient reaches 1 and the value JUMPS in a single frame. The filter
+			// is left doing what it is for — sub-1 dB drift, which is where noise
+			// lives — and a real scene change goes straight through.
+			//
+			// An earlier version here used ONE hard threshold at 0.12 PQ, roughly 4x
+			// libplacebo's high threshold. Ordinary scene changes fell into the
+			// filter's bucket and ramped, and that was read as the filter being slow.
+			// The filter was innocent; the threshold was the fault.
+			constexpr float kPqMax        = 16383.0f;  // libplacebo PQ_MAX = (1<<14)-1
+			constexpr float kSmoothPeriod = 20.0f;     // PL_PEAK_DETECT_HQ_DEFAULTS / --hdr-peak-decay-rate
+						constexpr float kThreshLow    = 1.0f;      // PL_PEAK_DETECT_HQ_DEFAULTS
+			constexpr float kThreshHigh   = 3.0f;
+			constexpr float kLog10Pq      = 1e-2f;     // libplacebo's own "experimentally determined" constant
 
-			// Plausibility gate. PQ 1.0 decodes to 10000 nits, and that is exactly
-			// what the extractor reports when it saturates — observed live on a
-			// blank frame as raw_pq=1.0000 / raw_nits=10000.0. Taken as a scene peak
-			// it snaps the smoothed value to 10000, and the divisor
-			// hable(10000/sdrNits) drives the picture to BLACK. A read outside a
-			// sane band is a failed read, so reject it rather than trust it — the
-			// smoothed value simply holds until a real reading arrives.
-			const bool bPlausible = (peakNits > 10.0f) && (peakNits < 4000.0f);
-			if (bPlausible) {
-				const float d = peakPq - m_HablePrevPeakPq;
-				const bool bCut = (m_HableScenePeakNits < 0.0f)
-					|| (m_HablePrevPeakPq < 0.0f)
-					|| d > SCENE_CUT_THRESH || d < -SCENE_CUT_THRESH;
-				m_HablePrevPeakPq = peakPq;
-				if (bCut) {
-					m_HableScenePeakNits = peakNits;            // snap across a cut
+			float avgPq = m_MLFeatures[1];
+			float maxPq = (m_MLPeakPq995 > 0.0f) ? m_MLPeakPq995 : m_MLFeatures[0];
+
+			// Plausibility gate — NOT libplacebo's, and the one place this departs
+			// from it. PQ 1.0 decodes to 10000 nits and is what the extractor
+			// reports when it saturates (observed live: raw_pq=1.0000 /
+			// raw_nits=10000.0). Fed to the filter it would poison the state for
+			// many frames, so a read outside a sane band is treated as a failed read
+			// and skipped outright — the filter simply holds.
+			const float maxNits = exptm::PqToLinearNits(maxPq);
+			if (maxNits > 10.0f && maxNits < 4000.0f) {
+				if (m_PeakAvgPq == 0.0f) {
+					// No state yet — take the first reading outright
+					// (libplacebo: "if (!obj->peak.avg_pq)").
+					m_PeakAvgPq = avgPq;
+					m_PeakMaxPq = maxPq;
 				} else {
-					// ~12-frame time constant: fast enough to follow a fade, slow
-					// enough that a cut-free shot cannot pump.
-					m_HableScenePeakNits += (peakNits - m_HableScenePeakNits) * 0.08f;
+					const float eps = 1.0f / kPqMax;
+					if (fabsf(avgPq - m_PeakAvgPq) < eps) avgPq = m_PeakAvgPq;
+					if (fabsf(maxPq - m_PeakMaxPq) < eps) maxPq = m_PeakMaxPq;
 				}
+
+				// 3. Average: IIR low-pass. See the anchor note below for the max.
+				//
+				// libplacebo filters BOTH the average and the max with this coefficient
+				// (smoothing_period 20, ~0.8 s at 24 fps) and then snaps both when a
+				// scene change fires. We did that too, and then lengthened the max's
+				// period to ~8 s to stop a pause overlay from dimming the face — and
+				// THAT was worse. The brightness then trailed the picture in both
+				// directions: after any bright moment the anchor relaxed over several
+				// seconds, so the scene visibly "caught up" in brightness long after
+				// the change. Reported, and correctly: a brightness that converges
+				// slowly reads as a fault, not as damping.
+				//
+				// So the max is no longer filtered at all — the anchor IS the current
+				// frame. One frame of lag, from the readback being a frame behind, and
+				// nothing else. A cut, a fade, an overlay appearing or leaving: the
+				// picture follows on the next frame in every case.
+				//
+				// Stated plainly, because it is a real consequence: an overlay that
+				// enters the frame now moves the picture IMMEDIATELY rather than over
+				// seconds. That is the same event, just not smeared. It cannot be
+				// filtered away without reintroducing the trail — an overlay is a large
+				// bright region and is statistically identical to content, so the only
+				// real fix is to EXCLUDE it from the measurement (a screen-region rule
+				// for subtitles and player graphics), not to smooth it.
+				//
+				// The average keeps its filter, and the hysteresis below still runs to
+				// maintain it. Neither gates the anchor any more.
+				const float coeff = 1.0f - expf(-1.0f / kSmoothPeriod);
+				m_PeakAvgPq += coeff * (avgPq - m_PeakAvgPq);
+
+				// The ANCHOR is the current frame's measurement. No filter, no
+				// hysteresis, no snap. See the note below for why libplacebo's
+				// smoothing was removed from it as well.
+				m_PeakMaxPq = maxPq;
+
+				// 4. Scene-change hysteresis. bias = the non-black CELL fraction, so a
+				// letterboxed or mostly-black frame cannot register a change on its own.
+				// Fixed 2026-09-20: this used to be a PIXEL fraction, which on a sparse
+				// frame scaled delta below thresh_low and pinned mix at 0 — the snap
+				// never fired and the IIR ramp alone set the peak, so a cut to a bright
+				// scene kept the previous scene's normalisation for ~3 seconds and the
+				// highlights clipped against it. See BuildMLFeatures.
+				const float delta = m_MLActiveFrac * fabsf(avgPq - m_PeakAvgPq);
+				const float mixc  = exptm::smoothstepf(kThreshLow * kLog10Pq,
+				                                       kThreshHigh * kLog10Pq, delta);
+				m_PeakAvgPq = exptm::mixf(m_PeakAvgPq, avgPq, mixc);
+				// m_PeakMaxPq deliberately NOT mixed: it is set from the frame above.
+				// The hysteresis still runs because it maintains m_PeakAvgPq, which is
+				// part of the ported state; it no longer gates the anchor.
+
+				m_HableScenePeakNits = exptm::PqToLinearNits(m_PeakMaxPq);
 				const float chg = m_HableScenePeakNits - m_HableScenePeakApplied;
 				if (m_HableScenePeakApplied < 0.0f || chg > 1.0f || chg < -1.0f) {
 					m_HableScenePeakApplied = m_HableScenePeakNits;
 					SetShaderLuminanceParams();   // per-frame push; the cbuffer is
 					                              // otherwise only sent on settings changes
-					// Logged on PUSH, not every frame: this fires exactly when the
-					// value the Hable branch normalises by actually moves, which is
-					// the thing to check when asking "is the per-scene peak live?".
+					// Logged on PUSH so the filter can be watched: filt_pq is what the
+					// curve normalises by, raw is the frame's own measurement, and mix
+					// is the hysteresis coefficient — 0 = filtered, 1 = jumped.
 					if (m_bMLDebug && m_pMLDebugFile) {
 						fwprintf(m_pMLDebugFile,
-							L"HABLE_PEAK frame=%llu raw_pq=%.4f raw_nits=%.1f smooth_nits=%.1f cut=%d\n",
-							(unsigned long long)m_MLDebugFrame, (double)peakPq,
-							(double)peakNits, (double)m_HableScenePeakNits, bCut ? 1 : 0);
+							L"HABLE_PEAK frame=%llu raw_pq=%.4f avg_pq=%.4f filt_pq=%.4f applied_nits=%.1f mix=%.3f\n",
+							(unsigned long long)m_MLDebugFrame, (double)maxPq, (double)avgPq,
+							(double)m_PeakMaxPq, (double)m_HableScenePeakNits, (double)mixc);
 						fflush(m_pMLDebugFile);
 					}
 				}
@@ -6892,7 +7094,20 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 
 	if (config.bHDRPassthroughRaw != m_bHDRPassthroughRaw) {
 		m_bHDRPassthroughRaw = config.bHDRPassthroughRaw;
-		changeHDR = true;
+		// NO changeHDR — deliberately, and this is the crash fix.
+		//
+		// The raw toggle only changes WHICH shader the render loop binds: per frame
+		// it picks m_pPS_Simple over the correction / HDR10-tone-map shader, and
+		// copies the ML steps (see the bind sites in Render()). All of that is read
+		// every frame, so the toggle takes effect on the next one.
+		//
+		// changeHDR did not do that. It took the HDR-output path, and because the
+		// source is HDR10 that meant ReleaseSwapChain() + m_pFilter->Init(true) +
+		// InitMediaType() — tearing the swap chain and media type out from under a
+		// live render thread. Observed as a hard fault on toggling the row:
+		//   Unplugged.exe, faulting module MpcVideoRenderer64.ax v0.10.8.2637,
+		//   exception 0xc0000005 at offset 0x93ccf.
+		// Nothing about "show me the raw signal" needs a media-type re-init.
 	}
 
 	if (config.iHdrDisplayMaxNits != m_iHdrDisplayMaxNits) {

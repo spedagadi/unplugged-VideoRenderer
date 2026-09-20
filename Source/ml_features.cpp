@@ -75,7 +75,8 @@ constexpr float kCropLimit = 0.01f;
 } // namespace
 
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[ML_FEATURE_DIM],
-                     MLLumaDomain domain, MLBarBounds* bars, float* outTextureEnergy)
+                     MLLumaDomain domain, MLBarBounds* bars, float* outTextureEnergy,
+                     float* outPeakP995, float* outActiveFrac)
 {
 	const int w = ML_DOWNSAMPLE_W;
 	const int h = ML_DOWNSAMPLE_H;
@@ -91,14 +92,34 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 
 	// 1) decode the readback into the feature domain (PQ, or SDR gamma -> PQ)
 	int64_t sum = 0, max_bin = 0, bright = 0;
+	int64_t active = 0;   // pixels at/above the crop level — bar detection only
 	int contentTop = h, contentBottom = -1;
+
+	// libplacebo's scene-change bias is a WORKGROUP-active fraction, not a pixel
+	// fraction: a workgroup counts as active if ANY of its pixels is above the
+	// cutoff, so on any normally-exposed frame the fraction stays near 1.0 and the
+	// scene-change delta keeps its full magnitude. A pixel fraction does the
+	// opposite — on a sparse dark frame it is a small number, which scales delta
+	// below thresh_low and pins the hysteresis mix at 0, so a real scene change
+	// never snaps and the IIR alone decides. That is the lag.
+	//
+	// Cells stand in for workgroups: 16x16 over the 256x144 readback gives 144 of
+	// them, the same order as a real dispatch grid.
+	constexpr int kCell = 16;
+	constexpr int kCellsX = (ML_DOWNSAMPLE_W + kCell - 1) / kCell;
+	constexpr int kCellsY = (ML_DOWNSAMPLE_H + kCell - 1) / kCell;
+	bool cellActive[kCellsX * kCellsY] = {};
+
 	for (int y = 0; y < h; y++) {
 		const uint16_t* row = luma16 + (size_t)y * rowPitch;
+		const int cellRow = (y / kCell) * kCellsX;
 		for (int x = 0; x < w; x++) {
 			const float y16 = (float)(row[x] * scale);
 			const float fv = (domain == MLLumaDomain::SDRGamma22) ? SdrGammaToPQ(y16) : y16;
 			tv[(size_t)y * w + x] = fv;
 			if (y16 >= kCropLimit) {
+				active++;
+				cellActive[cellRow + (x / kCell)] = true;
 				if (contentTop > y) contentTop = y;
 				contentBottom = y;
 			}
@@ -156,6 +177,21 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 		features[3 + i] = HistogramPercentile(histogram, total, targets[i]);
 	}
 
+	// outPeakP995 is computed AFTER the bar detection below — it must be measured
+	// over the content rows only. See the note there.
+
+	// Cell-active fraction, for libplacebo's scene-change bias. Full-frame content
+	// gives ~1.0; a letterboxed or mostly-black frame gives less, and its delta is
+	// scaled down by that so it cannot register as a scene change on its own —
+	// which is the intent, and a PIXEL fraction overshot it. See the note above.
+	if (outActiveFrac) {
+		int cellsOn = 0;
+		for (int i = 0; i < kCellsX * kCellsY; i++) {
+			if (cellActive[i]) cellsOn++;
+		}
+		*outActiveFrac = (float)cellsOn / (float)(kCellsX * kCellsY);
+	}
+
 	// [9..76] zone means + maxes (3x3 then 5x5), column-major zone indexing
 	auto extract_zones = [&](int grid, int meanBase, int maxBase) {
 		for (int r = 0; r < grid; r++) {
@@ -200,6 +236,78 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 	}
 	features[85] = (float)top_bars / h;
 	features[86] = (float)bottom_bars / h;
+
+	// The noise-robust scene peak that drives the Hable ANCHOR — measured over the
+	// CONTENT rows only, so player graphics in the letterbox bars cannot move it.
+	//
+	// libplacebo's own peak detection uses 99.995 (PL_PEAK_DETECT_HQ_DEFAULTS),
+	// high enough that on a 256x144 readback it discards the top ~2 pixels — a
+	// speck, not a highlight. That is right for a decoded video file. It is not
+	// enough for a CAPTURE: a subtitle line is thousands of pixels and survives the
+	// percentile intact.
+	//
+	// A subtitle is white, and in a dark scene it is the brightest thing in frame.
+	// So it set the anchor, the anchor set the divisor, and the divisor scales the
+	// ENTIRE picture — the film visibly dimmed whenever subtitles appeared, and
+	// recovered when they left. Observed on a scope film whose content band is
+	// rows 18..125 of 144, i.e. the subtitle sits in the bottom BAR, inside the
+	// region that was being measured.
+	//
+	// Restricting to the content band removes it with no user setting, and unlike
+	// lowering the percentile it cannot clip the picture: the anchor is still the
+	// peak, just the peak of the PICTURE rather than of the frame.
+	//
+	// Deliberately NOT applied to features[]. That array is the model contract —
+	// its mean and max are trained values, and excluding the bars there would shift
+	// every prediction on every scope film. This is a separate statistic for one
+	// consumer.
+	if (outPeakP995) {
+		thread_local uint32_t anchorHist[65536];
+		ZeroMemory(anchorHist, sizeof(anchorHist));
+		// Bottom band of the PICTURE excluded as well, because subtitles are not
+		// always in the letterbox bars. Dune puts them over the active frame, and
+		// there the bar crop above removes nothing at all.
+		//
+		// This is the one exclusion that is a heuristic rather than a fact: subs are
+		// placed in a predictable band (roughly the bottom eighth to sixth of the
+		// picture, per the title-safe convention), but a genuinely bright object down
+		// there is then invisible to the anchor. The cost of that is confined to the
+		// bottom band — the rest of the frame is still normalised by a peak that
+		// ignores a region the size of a subtitle line, which is the trade that buys
+		// back both the dimming AND the colour loss below.
+		//
+		// The colour is the second symptom of the same cause, and worth stating
+		// because it surprises: a subtitle raises the anchor, the anchor raises the
+		// divisor, the curve lowers I, and the chroma rescale that keeps the
+		// reconstruction inside the gamut scales chroma down WITH it. Brightness and
+		// saturation move together because one quantity drives both. Fix the anchor
+		// and the colour comes back on its own.
+		// ZERO, i.e. OFF. A percentage chosen here would be a guess dressed as a
+		// constant: where a player draws subtitles depends on the player, the
+		// content's aspect, the disc's own positioning and the user's setting, and
+		// none of that is knowable from the frame. It is a property of the SETUP.
+		//
+		// Left in place, at zero, so the mechanism is here if it becomes a setting
+		// the operator sets deliberately for their own player.
+		constexpr float kSubtitleBand = 0.0f;            // bottom fraction of the picture
+		const int y0 = top_bars;
+		const int contentEnd = h - bottom_bars;          // exclusive
+		const int contentRows = contentEnd - y0;
+		const int y1 = std::max(y0 + 1, contentEnd - (int)(contentRows * kSubtitleBand));
+		int anchorCount = 0;
+		for (int y = y0; y < y1; y++) {
+			const float* row = &tv[(size_t)y * w];
+			for (int x = 0; x < w; x++) {
+				anchorHist[(int)(fminf(row[x], 1.0f) * 65535.0f)]++;
+				anchorCount++;
+			}
+		}
+		// No content band detected (full-frame content, or a letterbox the bar scan
+		// did not resolve): fall back to the whole frame rather than reporting zero.
+		*outPeakP995 = (anchorCount > 0)
+			? HistogramPercentile(anchorHist, anchorCount, 0.99995f)
+			: HistogramPercentile(histogram, total, 0.99995f);
+	}
 
 	if (bars) {
 		bars->contentTop = contentTop;

@@ -66,17 +66,12 @@ float4 main(PS_INPUT input) : SV_Target
         }
     }
     else {
-        // Display floor — see ps_convert_pq_to_sdr.hlsl for the full explanation.
-        // Converts absolute light to display-relative so the plain pow(v, 1/2.2)
-        // encodes it correctly, and deliberately does NOT add the floor back: the
-        // panel's own black offset supplies it, and re-adding it doubles the black.
-        // floor == 0 makes this a no-op.
-        float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
-        float floorN  = saturate(displayMinNits / max(sdrNits, 1e-3));
-        float scale   = max(1.0 - floorN, 1e-3);
-
-        color.rgb = max(color.rgb - floorN, 0.0) / scale;
-
+        // Display floor REMOVED — see ps_convert_pq_to_sdr.hlsl for the full account.
+        // Subtracting the panel's black from SCENE light clipped every pixel below
+        // 0.170 nits to zero, which on dark HDR content is most of the frame.
+        // Removed here too, not only in the VP converter: this is the fallback for
+        // a machine without D3D11 VP PQ support, and leaving it would reintroduce
+        // exactly the crush this was fixed for, on a different machine.
         color.rgb = ToneMappingHable(color.rgb);
 
         // Output gamut — see ps_convert_pq_to_sdr.hlsl. 1 keeps BT.2020.

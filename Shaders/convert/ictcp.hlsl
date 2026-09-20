@@ -79,8 +79,21 @@ float3 ictcp_to_linear_gamut(float3 ictcp, float maxNits)
 	// Bisect on the chroma scale. s = 0 is the achromatic value of the same I,
 	// which is in gamut by construction: the curve bounds I, and zero chroma
 	// reconstructs that same bounded level on all three channels.
+	//
+	// ITERATION COUNT IS LOAD-BEARING, and 5 was wrong. The loop leaves sLo on a
+	// multiple of 1/2^N, so N = 5 quantises the chroma scale to steps of 1/32 —
+	// 3.1%, which is tens of codes of saturation at 10-bit. Because sLo is a STEP
+	// function of the input, every pixel whose reconstruction exceeds the ceiling
+	// gets its saturation snapped to that grid, and smooth shading in the affected
+	// region breaks into flat patches. A lit face is exactly where the clamp
+	// engages, so the artefact lands on skin.
+	//
+	// 12 iterations puts the grid at 1/4096 — below one output code, so the step is
+	// not representable and the correction is effectively continuous. The cost is
+	// bounded and only paid by out-of-gamut pixels: the in-gamut case above returns
+	// after a single reconstruction and never enters this loop.
 	float sLo = 0.0, sHi = 1.0;
-	for (int i = 0; i < 5; ++i) {
+	for (int i = 0; i < 12; ++i) {
 		const float s = 0.5 * (sLo + sHi);
 		const float3 c = ictcp_to_linear(float3(ictcp.x, ictcp.y * s, ictcp.z * s));
 		if (min(min(c.r, c.g), c.b) >= 0.0 && max(max(c.r, c.g), c.b) <= maxNits)

@@ -46,7 +46,16 @@ cbuffer PS_PARAMETERS : register(b0)
     // the Hable curve is replaced by IDENTITY. 0 = pure Hable, i.e. exactly the
     // behaviour before the knee existed. See IVideoRenderer.h for the rationale.
     float hableKnee;
-    float unused1;                 // keeps the cbuffer at 16 floats
+    float unused1;
+    // Mobius coefficients for the curve that takes over ABOVE the knee:
+    //   M(x) = hableKneS * (x + hableKneA) / (x + hableKneB)
+    // solved CPU-side for M(j) = j, M(peak) = 1, M'(j) = 1, so the joint at the
+    // knee is smooth BY CONSTRUCTION. All zero when the knee is off, in which
+    // case Hable applies unchanged and this whole branch is skipped.
+    float hableKneA;
+    float hableKneB;
+    float hableKneS;
+    float _padK;                   // keeps the cbuffer 16-byte aligned
 };
 
 #include "../convert/conv_matrix.hlsl"
@@ -134,7 +143,21 @@ float3 ToneMapSelectedCurve(float3 nits, float sdrNits)
                                        sdrNits, displayMinNits).x;
     }
 
-    // Re-encode I, hand back the ORIGINAL chroma, and return to RGB.
+    // Chroma follows the curve down — the same fix as the Hable branch, and it was
+    // missing here. This function serves BT-2390, ACES, Reinhard, Mobius and
+    // ST.2094-10, all of which here hand back the ORIGINAL absolute Ct/Cp after
+    // lowering I. That is over-saturation by construction, and it is why these
+    // curves read as DEEPER than Hable: I drops, the chroma does not, so the colour
+    // gets relatively more saturated. It is not a property of BT-2390 — it is the
+    // pairing, and the harder the curve compresses, the stronger the effect.
+    //
+    // It is also the same root cause as the blotches: the reconstruction leaves the
+    // gamut, and ictcp_to_linear_gamut() then removes saturation per pixel.
+    //
+    // min(1, ...) as before — drop saturation with the level, never add it.
+    const float chromaScale = min(1.0, I_out / max(I_in, 1e-6));
+    ictcp.yz *= chromaScale;
+
     ictcp.x = LinearToST2084(float4(I_out, 0.0, 0.0, 0.0), 10000.0).x;
     float3 mapped = ictcp_to_linear_gamut(ictcp, sdrNits);
     // Nits -> display-relative. The same arithmetic as the legacy floor step, which
@@ -150,7 +173,38 @@ float4 main(PS_INPUT input) : SV_Target
     color = saturate(color);
     color = ST2084ToLinear(color, LuminanceScale);
 
-    if (toneLutEnable > 0.5) {
+    // ---------------------------------------------------------------------
+    // 7 = REFERENCE. The upstream VideoRenderer-master converter, verbatim:
+    //
+    //     color = ST2084ToLinear(color, LuminanceScale);
+    //     color.rgb = ToneMappingHable(color.rgb);
+    //     color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+    //     color = pow(color, 1.0 / 2.2);
+    //
+    // Kept so a regression can be isolated by switching a row instead of
+    // rebuilding an old tree. It deliberately reads NONE of:
+    //   - the display floor (upstream had no displayMinNits in this shader),
+    //   - ICtCp and the chroma bisection (per-channel RGB, as upstream),
+    //   - the measured per-scene peak, or maxCLL (fixed 4.8, as upstream),
+    //   - the knee, and any mobius coefficients.
+    // So it answers "is the change in the curve, or in the machinery around it".
+    //
+    // outputGamut IS still honoured — upstream applied the 2020->709 matrix
+    // unconditionally, and outputGamut 0 selects that same matrix, so at the
+    // default the two are identical; at gamut 1 the caller has explicitly asked
+    // to keep BT.2020 and the reference must not silently override that.
+    //
+    // Must stay FIRST: it has to outrank the experimental tone LUT, which is a
+    // different axis and would otherwise replace the curve entirely.
+    // ---------------------------------------------------------------------
+    if (toneCurveSelection > 6.5) {
+        color.rgb = ToneMappingHable(color.rgb);
+
+        if (outputGamut < 0.5) {
+            color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+        }
+    }
+    else if (toneLutEnable > 0.5) {
         // The experimental table is ALREADY display-relative (0 = the panel's
         // measured black, 1 = its white), because the CPU built it that way. So it
         // feeds the encoder directly and the floor conversion below must not be
@@ -162,21 +216,45 @@ float4 main(PS_INPUT input) : SV_Target
         }
     }
     else {
-        // Display floor. The panel's response is L = Lb + (Lw - Lb)*v^gamma — the
-        // offset lives IN the panel, which is what "black output offset 100%" in a
-        // calibration report means. So this step converts absolute light into
-        // DISPLAY-RELATIVE light (0 = the panel's measured black, 1 = its white),
-        // which is exactly what the plain pow(v, 1/2.2) below encodes.
-        //
-        // Do NOT add the floor back afterwards. Doing so feeds the encoder an
-        // absolute value where a relative one is wanted, the panel applies its own
-        // offset on top, and source black lands at code 15 instead of code 0 —
-        // exactly 2*Lb, which reads on screen as blacks sitting at grey.
-        //
-        // floor == 0 makes this a no-op, reproducing the pre-floor behaviour.
         float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
-        float floorN  = saturate(displayMinNits / max(sdrNits, 1e-3));
-        float scale   = max(1.0 - floorN, 1e-3);
+
+        // THE DISPLAY FLOOR IS GONE FROM THIS BRANCH — deliberately, from
+        // measurement, 2026-09-20.
+        //
+        // It used to subtract the panel's measured black from the HABLE input:
+        //
+        //     float floorN = saturate(displayMinNits / sdrNits);   // 0.170 / 85
+        //     float3 disp  = max(color.rgb - floorN, 0.0) / (1.0 - floorN);
+        //
+        // The reasoning was sound — the panel's L = Lb + (Lw - Lb)*v^gamma has its
+        // offset built in, so encoding (L - Lb)/(Lw - Lb) makes it reproduce L
+        // exactly. Above the panel's black that is what it did.
+        //
+        // What it cost was never priced in. `color.rgb` is SCENE light, and the
+        // content's black is 0, not Lb — so the subtraction removed 0.170 nits of
+        // scene light from every pixel and then clipped: max(..., 0). On dark HDR
+        // content the frame's own mean luminance sits BELOW the panel's black, so
+        // MOST OF THE PICTURE was being clipped to absolute zero. In panel code the
+        // cut lands at (0.170/85)^(1/2.2) = 0.06, and everything under it died.
+        //
+        // Measured on a static scene, Hable with the floor vs without:
+        //   mean output code   0.0105  ->  0.0162   (+54%)
+        //   peak output code   0.7777  ->  0.5816
+        // The floor was buying 34% more peak by deleting the shadows — and the peak
+        // is already above the content's own level either way.
+        //
+        // Upstream (VideoRenderer-master) had no floor here at all, which is the
+        // third reason this is the right default: reference and shipping agree.
+        //
+        // The convention now is the ordinary tone-mapping one: content 0 -> panel
+        // black, content sdrNits -> panel white, so the panel's range is filled
+        // rather than trimmed. displayMinNits is still used by the experimental
+        // LUT's output range and by ToneMapSelectedCurve, where the value really is
+        // display-absolute — it just no longer has any business being subtracted
+        // from scene light.
+        //
+        // Keep the panel's black truthful in the settings. Do not "fix" a lifted
+        // black by typing 0 there again: this branch no longer reads it.
 
         // A selection of 0 or 3 means Hable — the legacy display-referred curve,
         // kept because it is the one that protects highlights (a curve with an
@@ -199,10 +277,13 @@ float4 main(PS_INPUT input) : SV_Target
             // display-relative value is scaled up by sdrNits on the way in and back
             // down on the way out. The curve still sees the same 0..1 domain it
             // always has.
-            float3 disp = max(color.rgb - floorN, 0.0) / scale;   // nits / sdrNits (1.0 = white)
+            float3 disp = color.rgb;   // nits / sdrNits (1.0 = white) — no floor, see above
 
             float3 ictcp = linear_to_ictcp(disp * sdrNits);
             float I_rel = ST2084ToLinear(float4(ictcp.x, 0.0, 0.0, 0.0), 10000.0).x / max(sdrNits, 1e-3);
+            // The ORIGINAL intensity in nits, kept for the chroma rescale at the
+            // reconstruction below. I_rel is reassigned by the curve.
+            const float I_origNits = I_rel * max(sdrNits, 1e-3);
 
             // Normalise by the CONTENT PEAK, not Hable's fixed 4.8 — see
             // ToneMappingHablePeak().
@@ -235,23 +316,50 @@ float4 main(PS_INPUT input) : SV_Target
             const float3 hv = float3(I_rel * kHableGain, I_rel * kHableGain, I_rel * kHableGain);
             const float  hMapped = ToneMappingHablePeak(hv, peakSdrUnits).x;
 
-            // Hable knee. Below it the value passes through UNTOUCHED; above it
-            // Hable applies unchanged. Hable has no knee of its own — it is a
-            // global rational curve and compresses everywhere, which is what makes
-            // it highlight-safe and also why the whole picture sits low: the
-            // shadows and lower mids pay compression only the top of the range
-            // needs. A smoothstep band, not a corner, because a hard knee is where
-            // banding shows.
+            // Hable knee. Below it: identity, untouched. Above it: a SOLVED mobius
+            // curve, not Hable — chosen because its join can be smooth by
+            // construction, which Hable's shape does not permit (Hable is concave
+            // everywhere, so identity meets it only at the origin and no positive
+            // knee can be both value- and slope-continuous).
             //
-            // knee = 0 keeps the curve EXACTLY as it was (w = 1 everywhere), so the
-            // A/B anchor survives.
-            float w = 1.0;
-            if (hableKnee > 0.001) {
-                w = smoothstep(hableKnee, min(hableKnee + 0.15, 1.0), I_rel);
+            // Hable still owns the highlights whenever the knee is OFF: hableKneS
+            // stays 0 then and this collapses to the Hable value exactly, so
+            // knee = 0 remains the A/B anchor.
+            float hFinal = hMapped;
+            if (hableKneS > 0.0) {
+                const float3 m = hableKneS * (hv + hableKneA) / (hv + hableKneB);
+                hFinal = lerp(hv.x, m.x, step(hableKnee, hv.x));
             }
-            I_rel = lerp(I_rel, hMapped, w);
+            I_rel = hFinal;
 
-            ictcp.x = LinearToST2084(float4(I_rel * max(sdrNits, 1e-3), 0.0, 0.0, 0.0), 10000.0).x;
+            // --- Chroma follows the tone curve down --------------------------------
+            // This was the blotches.
+            //
+            // Ct/Cp are ABSOLUTE chroma. Handing the ORIGINAL ones back after the
+            // curve has lowered I makes the colour over-saturated with respect to its
+            // new level — so the reconstruction leaves the display gamut and
+            // ictcp_to_linear_gamut() has to pull it back with a per-pixel search,
+            // on every bright saturated pixel. That search is a saturation REMOVAL,
+            // and where it engages across a smooth gradient it leaves visible
+            // structure: patches on a face, hard-edged and skin-shaped.
+            //
+            // It got worse the lower sdrNits went, because the tone map then lowers I
+            // by a larger factor while the chroma stays where the source put it. That
+            // is exactly what the operator found: raise sdrNits and the patches
+            // disappear, because the reduction shrinks and the search stops firing.
+            //
+            // Scaling the chroma by the same factor I moved means the reconstruction
+            // is (near enough) the original colour scaled down — already inside the
+            // gamut, so the search becomes a no-op instead of a heavy correction.
+            //
+            // min(1, ...) deliberately: DROP saturation when the level drops, never
+            // ADD it when the curve lifts. A shadow lift should not also raise
+            // saturation, and letting it would put the search straight back to work.
+            const float I_newNits = I_rel * max(sdrNits, 1e-3);
+            const float chromaScale = min(1.0, I_newNits / max(I_origNits, 1e-6));
+            ictcp.yz *= chromaScale;
+
+            ictcp.x = LinearToST2084(float4(I_newNits, 0.0, 0.0, 0.0), 10000.0).x;
 
             color.rgb = ictcp_to_linear_gamut(ictcp, sdrNits) / max(sdrNits, 1e-3);
         }

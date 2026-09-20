@@ -45,8 +45,36 @@ struct MLBarBounds {
 // Slots: [0] maxscl, [1] avg, [2] fraction bright, [3..8] p25..p99,
 // [9..26] 3x3 zone means+maxes, [27..76] 5x5 zone means+maxes,
 // [77..84] spline knots, [85]/[86] top/bottom bar norm, [87] compression.
+// `outPeakP995`, when given, receives the 99.995th percentile peak in the
+// feature domain — the noise-robust scene peak libplacebo's peak detection is
+// built on (PL_PEAK_DETECT_HQ_DEFAULTS, percentile 99.995). On a 256x144
+// readback that discards the top TWO pixels, so it is not a low percentile that
+// loses small highlights: it drops the stray speck and keeps the real peak.
+//
+// The distinction matters because features[0] is a MAX, and a max is set by a
+// single bright pixel — sensor noise, grain, ringing. That makes it the least
+// stable statistic available, and a caller that normalises a curve by it will
+// shimmer. A percentile is a statistic.
+//
+// Emitted SEPARATELY rather than as a feature slot on purpose: features[] is the
+// exact contract the Zion XGBoost models were trained on, so adding to it would
+// shift every prediction.
+//
+// `outActiveFrac`, when given, receives the fraction of 16x16 CELLS containing
+// at least one pixel at or above the crop (non-black) level — an analogue of
+// libplacebo's frame_wg_active / frame_wg_count, which scales its scene-change
+// delta so a mostly-black or letterboxed frame cannot trigger a change on its
+// own. A cell counts if ANY of its pixels is active, exactly as a workgroup does.
+//
+// It was a pixel fraction, and that was a bug with a visible cost: on a sparse
+// dark frame a pixel fraction is small, which scaled the delta below libplacebo's
+// own thresh_low (0.01) and pinned its hysteresis mix at 0 — so no scene change
+// ever snapped and the IIR ramp alone set the peak. Measured: filt_pq ramping
+// 0.3202 -> 0.3785 over ~80 frames with mix = 0.000 on every line.
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch,
                      float features[ML_FEATURE_DIM],
                      MLLumaDomain domain = MLLumaDomain::PQ,
                      MLBarBounds* bars = nullptr,
-                     float* outTextureEnergy = nullptr);
+                     float* outTextureEnergy = nullptr,
+                     float* outPeakP995 = nullptr,
+                     float* outActiveFrac = nullptr);

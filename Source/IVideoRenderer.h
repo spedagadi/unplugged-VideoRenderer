@@ -86,6 +86,24 @@ enum :int {
 	HDRTD_OnOff
 };
 
+// iHdrLocalToneMappingType. 1..6 are the shipped curves.
+//
+// 7 is the REFERENCE: the upstream VideoRenderer-master converter, kept verbatim
+// so a change can be isolated by switching to it rather than by rebuilding an old
+// tree. It is per-channel RGB Hable normalised by the fixed 4.8, and it reads NONE
+// of the DeckLink title metadata, the measured scene peak, the knee, or ICtCp —
+// which is exactly the set of things it exists to rule in or out. The Zion grade
+// still runs; set the rows that belong to it (Gamma top-up) to 0 for a clean A/B.
+enum :int {
+	TONE_CURVE_ACES      = 1,
+	TONE_CURVE_REINHARD  = 2,
+	TONE_CURVE_HABLE     = 3,
+	TONE_CURVE_MOBIUS    = 4,
+	TONE_CURVE_BT2390    = 5,
+	TONE_CURVE_ST2094_10 = 6,
+	TONE_CURVE_REFERENCE = 7,
+};
+
 #define SDR_NITS_DEF 50
 #define SDR_NITS_MIN  25
 #define SDR_NITS_MAX 400
@@ -150,7 +168,7 @@ struct Settings_t {
 	bool bConvertToSdr;
 	int  iSDRDisplayNits;
 	bool bHdrLocalToneMapping;
-	int  iHdrLocalToneMappingType; // 1=ACES 2=Reinhard 3=Hable 4=Mobius 5=BT.2390 6=...
+	int  iHdrLocalToneMappingType; // TONE_CURVE_* above; 7 = upstream reference
 	int iHdrDisplayMaxNits;
 	// Display BLACK level in nits — measured, e.g. 0.16 for a projector at bb1.0.
 	// The tone mapper builds its destination range as [min, max]; without this it
