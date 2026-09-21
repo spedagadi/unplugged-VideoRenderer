@@ -87,6 +87,7 @@ class __declspec(uuid("71F080AA-8661-4093-B15E-4F6903E77D0A"))
 	, public CExFilterConfigImpl
 	, public ID3DFullscreenControl
 	, public ISubRenderConsumer2
+	, public IMpcvrLogSink
 {
 private:
 	friend class CVideoRendererInputPin;
@@ -287,6 +288,21 @@ public:
 
 	STDMETHODIMP_(void) GetMLStats(std::wstring& str);
 	STDMETHODIMP_(void) GetRenderStats(::RenderStats_t& stats);
+
+	// IMpcvrLogSink — the OPTIONAL high-level channel. Null sink = no logging at
+	// all, which is how every host that is not our ingester runs.
+	STDMETHODIMP SetLogSink(void* ctx, MpcvrLogFn fn) override;
+
+public:
+	// High-level state/action logging, callable from the video processors via
+	// m_pFilter. No-op when no sink is installed, so call sites need no guard of
+	// their own. NOT the ML/frame debug log (ml_debug.csv) — see IMpcvrLogSink.
+	void LogLine(const char* fmt, ...);
+private:
+	void*     m_logCtx = nullptr;
+	MpcvrLogFn m_logFn = nullptr;
+
+public:
 
 	// ISubRender (DX9)
 	STDMETHODIMP SetCallback(ISubRenderCallback* cb) override;

@@ -6,35 +6,64 @@
 
 #pragma once
 
-#ifdef _DEBUG
+// ─ DLog — made REAL in every build (previously `__noop` in Release) ─────────
+//
+// The renderer crashed at a fixed address across a whole investigation while its
+// only trace, DLog, compiled to nothing in Release — so the module that faulted
+// had no voice, and every diagnosis was built from the survivors' logs. Since
+// 2026-09-21 DLog is always on, routed through mpcvr::TraceLog:
+//
+//   * timestamped (ms) into mpcvr_trace.log beside the .ax, independently;
+//   * forwarded RAW to a host that installed IMpcvrLogSink, so the same lines
+//     interleave with the engine's monitor/decider lines in the one s3engine.log
+//     on the same clock;
+//   * and to OutputDebugString.
+//
+// This is the DEBUG/state/format trace — it is NOT the image-quality log
+// (ml_debug.csv), which is untouched and deliberately separate.
+
+#include "MpcvrLog.h"
+
+namespace mpcvr_detail {
+    inline std::string Utf8(const std::wstring& w)
+    {
+        if (w.empty()) return {};
+        const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+        std::string s((size_t)n, '\0');
+        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
+        return s;
+    }
+}
 
 inline void DLog(std::wstring_view str)
 {
-	DbgLogInfo(LOG_TRACE, 3, str.data());
+#ifdef _DEBUG
+    DbgLogInfo(LOG_TRACE, 3, str.data());
+#endif
+    mpcvr::TraceLog(mpcvr_detail::Utf8(std::wstring(str)).c_str());
 }
 
 inline void DLog(std::string_view str)
 {
-	DbgLogInfo(LOG_TRACE, 3, str.data());
+#ifdef _DEBUG
+    DbgLogInfo(LOG_TRACE, 3, str.data());
+#endif
+    mpcvr::TraceLog(std::string(str).c_str());
 }
 
 template <typename... Args>
 inline void DLog(std::wformat_string<Args...> fmt, Args&&... args)
 {
-	DbgLogInfo(LOG_TRACE, 3, std::format(fmt, std::forward<Args>(args)...).c_str());
+    mpcvr::TraceLog(mpcvr_detail::Utf8(std::format(fmt, std::forward<Args>(args)...)).c_str());
 }
 
 template <typename... Args>
 inline void DLog(std::format_string<Args...> fmt, Args&&... args)
 {
-	DbgLogInfo(LOG_TRACE, 3, std::format(fmt, std::forward<Args>(args)...).c_str());
+    mpcvr::TraceLog(std::format(fmt, std::forward<Args>(args)...).c_str());
 }
 
 #define DLogIf(f,...) {if (f) DLog(__VA_ARGS__);}
-#else
-#define DLog(...) __noop
-#define DLogIf(f,...) __noop
-#endif
 
 #define SAFE_RELEASE(p)      { if (p) { (p)->Release(); (p) = nullptr; } }
 #define SAFE_CLOSE_HANDLE(p) { if (p) { if ((p) != INVALID_HANDLE_VALUE) ASSERT(CloseHandle(p)); (p) = nullptr; } }

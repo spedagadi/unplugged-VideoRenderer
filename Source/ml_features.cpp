@@ -19,6 +19,7 @@
  */
 
 #include "stdafx.h"
+#include "Utils/Util.h"   // DLog — live in every build now (ml_features.cpp logs the ML clamp)
 #include "ml_features.h"
 #include "tone_spline.h"
 
@@ -298,7 +299,25 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 		for (int y = y0; y < y1; y++) {
 			const float* row = &tv[(size_t)y * w];
 			for (int x = 0; x < w; x++) {
-				anchorHist[(int)(fminf(row[x], 1.0f) * 65535.0f)]++;
+				// CRASH FIX (2026-09-21, ml_features.cpp:301). This used to be
+				//   anchorHist[(int)(fminf(row[x], 1.0f) * 65535.0f)]++;
+				// with an UNCLAMPED lower bound: a single NaN or NEGATIVE sample
+				// (what a stale readback looks like when the signal changes
+				// mid-extraction — seen on the forwarder thread after a button
+				// press) indexed the histogram out of bounds and access-violated
+				// at a fixed address in BuildMLFeatures. The clamp makes one bad
+				// sample cost a wrong bin instead of a crash; the sparse log keeps
+				// the next occurrence as evidence instead of a corpse.
+				const float l = row[x];
+				const int bin = (int)(fminf(fmaxf(l, 0.0f), 1.0f) * 65535.0f);
+				if (l < 0.0f || l > 1.0f) {
+					static LONG s_badPx = 0;
+					const LONG n = InterlockedIncrement(&s_badPx);
+					if (n == 1 || (n % 1000) == 0)
+						DLog(L"[ML] BuildMLFeatures: luma %.6f out of [0,1] at y=%d x=%d (badPx=%ld) — clamped",
+							(double)l, y, x, (long)n);
+				}
+				anchorHist[bin]++;
 				anchorCount++;
 			}
 		}

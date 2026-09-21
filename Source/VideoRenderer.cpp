@@ -197,6 +197,11 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 {
 	DLog(L"CMpcVideoRenderer::CMpcVideoRenderer()");
 
+	// Note: this runs BEFORE any host can inject a sink, so it is only audible
+	// when the host attached one on a previous instance — LogLine is a no-op with
+	// no sink, which is the normal case for every other player.
+	LogLine("renderer: constructed (instance #%d)", (int)g_nInstance);
+
 	auto nPrevInstance = g_nInstance++; // always increment g_nInstance in the constructor
 	if (nPrevInstance > 0) {
 		*phr = E_ABORT;
@@ -456,6 +461,10 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 CMpcVideoRenderer::~CMpcVideoRenderer()
 {
 	DLog(L"CMpcVideoRenderer::~CMpcVideoRenderer()");
+
+	// Deinit, on whatever thread dropped the last reference — worth knowing when
+	// a teardown is suspected, and it is the last line before the object goes.
+	LogLine("renderer: destructor entered (deinit)");
 
 	RemoveTrayIcon();
 	DestroyTrayWindow();
@@ -834,13 +843,43 @@ STDMETHODIMP CMpcVideoRenderer::NonDelegatingQueryInterface(REFIID riid, void** 
 	if (riid == __uuidof(ISubRenderOptions)) {
 		return GetInterface((ISubRenderOptions*)this, ppv);
 	}
+	IFQIRETURN(IMpcvrLogSink)
 	return __super::NonDelegatingQueryInterface(riid, ppv);
+}
+
+// IMpcvrLogSink — the OPTIONAL high-level channel.
+//
+// Never required, and its absence is the normal case: every other player (MPC-HC,
+// MPC-BE, anything else that loads this .ax) never queries for it and never calls
+// it, so the renderer opens no file and logs nothing. Only a host that owns the
+// capture chain injects a sink, and it owns the format and the clock — so these
+// lines land in ITS log, with ITS timestamp, on the same timeline as its engine.
+STDMETHODIMP CMpcVideoRenderer::SetLogSink(void* ctx, MpcvrLogFn fn)
+{
+	m_logCtx = ctx;
+	m_logFn  = fn;
+	mpcvr::SetTraceSink(ctx, fn);   // DLog forwards to the same host sink
+	if (fn) LogLine("renderer: log sink attached by the host (high-level channel; ml_debug.csv unaffected)");
+	return S_OK;
+}
+
+void CMpcVideoRenderer::LogLine(const char* fmt, ...)
+{
+	MpcvrLogFn fn = m_logFn;          // snapshot: SetLogSink may run on another thread
+	if (!fn) return;                  // no sink → nothing happens, as before this existed
+	char buf[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	fn(m_logCtx, buf);
 }
 
 // IMediaFilter
 STDMETHODIMP CMpcVideoRenderer::Run(REFERENCE_TIME rtStart)
 {
 	DLog(L"CMpcVideoRenderer::Run()");
+	LogLine("renderer: Run (transport) stateWasRunning=%d", m_State == State_Running ? 1 : 0);
 
 	if (m_State == State_Running) {
 		return NOERROR;
@@ -855,6 +894,7 @@ STDMETHODIMP CMpcVideoRenderer::Run(REFERENCE_TIME rtStart)
 STDMETHODIMP CMpcVideoRenderer::Pause()
 {
 	DLog(L"CMpcVideoRenderer::Pause()");
+	LogLine("renderer: Pause (transport)");
 
 	m_filterState = State_Paused;
 
@@ -864,6 +904,7 @@ STDMETHODIMP CMpcVideoRenderer::Pause()
 STDMETHODIMP CMpcVideoRenderer::Stop()
 {
 	DLog(L"CMpcVideoRenderer::Stop()");
+	LogLine("renderer: Stop (transport)");
 
 	m_filterState = State_Stopped;
 	m_bValidBuffer = false;
@@ -876,7 +917,9 @@ STDMETHODIMP CMpcVideoRenderer::Stop()
 	return CBaseVideoRenderer2::Stop();
 }
 
-#if _DEBUG
+// Not debug-only: DLog is real in every build now (2026-09-21), so this
+// argument helper must exist in Release too — __noop used to discard the
+// argument without ever evaluating it.
 std::wstring PropSetAndIdToString(REFGUID PropSet, ULONG Id)
 {
 #define UNPACK_VALUE(VALUE) case VALUE: str += L#VALUE; break;
@@ -908,8 +951,6 @@ std::wstring PropSetAndIdToString(REFGUID PropSet, ULONG Id)
 	return str;
 #undef UNPACK_VALUE
 }
-
-#endif
 
 // IKsPropertySet
 STDMETHODIMP CMpcVideoRenderer::Set(REFGUID PropSet, ULONG Id, LPVOID pInstanceData, ULONG InstanceLength, LPVOID pPropertyData, ULONG DataLength)

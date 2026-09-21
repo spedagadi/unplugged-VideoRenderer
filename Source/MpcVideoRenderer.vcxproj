@@ -104,6 +104,7 @@
     <ClCompile Include="SubPic\XySubPicQueueImpl.cpp" />
     <ClCompile Include="Times.cpp" />
     <ClCompile Include="Utils\CPUInfo.cpp" />
+    <ClCompile Include="Utils\MpcvrLog.cpp" />
     <ClCompile Include="Utils\StringUtil.cpp" />
     <ClCompile Include="Utils\Util.cpp" />
     <ClCompile Include="VideoProcessor.cpp" />

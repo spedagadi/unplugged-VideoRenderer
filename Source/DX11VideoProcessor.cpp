@@ -961,6 +961,8 @@ void CDX11VideoProcessor::ReleaseDevice()
 
 void CDX11VideoProcessor::ReleaseSwapChain()
 {
+	m_pFilter->LogLine("renderer: ReleaseSwapChain — tearing the swap chain down%s",
+		m_pDXGISwapChain1 ? "" : " (nothing to release)");
 	if (m_pDXGISwapChain1) {
 		m_pDXGISwapChain1->SetFullscreenState(FALSE, nullptr);
 	}
@@ -4035,6 +4037,8 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 HRESULT CDX11VideoProcessor::InitSwapChain(bool bWindowChanged)
 {
 	DLog(L"CDX11VideoProcessor::InitSwapChain() - {}", m_pFilter->m_bExclusiveScreen ? L"fullscreen" : L"window");
+	m_pFilter->LogLine("renderer: InitSwapChain ENTER %s windowChanged=%d",
+		m_pFilter->m_bExclusiveScreen ? "fullscreen" : "window", bWindowChanged ? 1 : 0);
 	CheckPointer(m_pDXGIFactory2, E_FAIL);
 
 	ReleaseSwapChain();
@@ -4404,7 +4408,14 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 	}
 	DLog(L"CDX11VideoProcessor::InitMediaType()");
 
+	// High-level: signal/format change arriving at the renderer. Paired with the
+	// DONE line at the end of this function, so a renegotiation is bracketed and
+	// a fault inside it is attributable. (The ml_debug.csv frame log is untouched
+	// — that one is for image-quality work.)
+	m_pFilter->LogLine("renderer: InitMediaType ENTER (media type change; dims reported on the DONE line)");
+
 	if (!VerifyMediaType(pmt)) {
+		m_pFilter->LogLine("renderer: InitMediaType REJECTED by VerifyMediaType");
 		return FALSE;
 	}
 
@@ -4588,6 +4599,16 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 
 		m_pFilter->m_inputMT = *pmt;
 		UpdateMLActive();
+
+		// High-level: the renderer's own account of the signal it just accepted.
+		// This is the line that says WHICH format it rebuilt for, and it is what
+		// makes a media-type change visible on the host's timeline rather than
+		// inferred from the absence of frames.
+		m_pFilter->LogLine("renderer: InitMediaType DONE %ux%u tf=%u prim=%u mtx=%u decFmt=0x%08X interlaced=%d rtAvg=%lld",
+			(unsigned)m_srcWidth, (unsigned)m_srcHeight,
+			(unsigned)m_srcVideoTransferFunction,
+			(unsigned)m_decExFmt.VideoPrimaries, (unsigned)m_decExFmt.VideoTransferMatrix,
+			(unsigned)m_decExFmt.value, m_bInterlaced ? 1 : 0, (long long)m_rtAvgTimePerFrame);
 
 		return TRUE;
 	}
@@ -4779,12 +4800,20 @@ BOOL CDX11VideoProcessor::GetAlignmentSize(const CMediaType& mt, SIZE& Size)
 
 HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 {
+	// ─ Per-frame trace, always on. The faults land inside the render path with
+	// no engine-side marker, so every frame is bracketed here and along the way —
+	// a crash then shows exactly which sub-step died, on which frame.
+	static unsigned long long s_traceFrames = 0;
+	const unsigned long long seq = ++s_traceFrames;
+
 	REFERENCE_TIME rtStart, rtEnd;
 	if (FAILED(pSample->GetTime(&rtStart, &rtEnd))) {
 		rtStart = m_pFilter->m_FrameStats.GeTimestamp();
 	}
 	const REFERENCE_TIME rtFrameDur = m_pFilter->m_FrameStats.GetAverageFrameDuration();
 	rtEnd = rtStart + rtFrameDur;
+
+	DLog(L"[RT] ProcessSample #{} ENTER (rtStart={})", seq, (long long)rtStart);
 
 	if (m_bMLDebug && m_pMLDebugFile) {
 		fwprintf(m_pMLDebugFile, L"PS,%lld,%d\n", (long long)rtStart, (m_bMLActive ? 1 : 0));
@@ -4794,11 +4823,14 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 	m_rtStart = rtStart;
 	CRefTime rtClock(rtStart);
 
+	DLog(L"[RT] ProcessSample #{} CopySample ENTER (rtStart={})", seq, (long long)rtStart);
 	HRESULT hr = CopySample(pSample);
 	if (FAILED(hr)) {
+		DLog(L"[RT] ProcessSample #{} CopySample FAILED hr=0x{:08X}", seq, (unsigned)hr);
 		m_RenderStats.failed++;
 		return hr;
 	}
+	DLog(L"[RT] ProcessSample #{} CopySample done — Render ENTER", seq);
 
 	// The experimental tone mapper is driven by the same per-frame statistics, so it
 	// keeps them fresh on its own — see the extraction gate in Process().
@@ -4808,6 +4840,7 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 
 	// always Render(1) a frame after CopySample()
 	hr = Render(1, rtStart);
+	DLog(L"[RT] ProcessSample #{} Render returned hr=0x{:08X} — draw stats", seq, (unsigned)hr);
 	m_pFilter->m_DrawStats.Add(GetPreciseTick());
 	if (m_pFilter->m_filterState == State_Running) {
 		m_pFilter->StreamTime(rtClock);
@@ -7345,6 +7378,16 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 
 	if (!m_pFilter->GetActive()) {
 		return;
+	}
+
+	// High-level: a settings application that will RENEGOTIATE the media type or
+	// the swap chain. These are the destructive Configure paths — the ones this
+	// project has already faulted on — so the trigger and the thread it runs on
+	// are exactly what a post-mortem needs.
+	if (changeWindow || changeInputColor || changeHDR) {
+		m_pFilter->LogLine("renderer: Configure — renegotiation triggered  window=%d inputColor=%d hdr=%d "
+			"ics=%d active=1", changeWindow ? 1 : 0, changeInputColor ? 1 : 0, changeHDR ? 1 : 0,
+			m_InputColorSpaceOverride);
 	}
 
 	// apply new settings

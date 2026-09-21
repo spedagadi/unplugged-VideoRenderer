@@ -412,6 +412,10 @@ struct Settings_t {
 struct RenderStats_t {
 	unsigned framesReceived = 0;   // total input frames seen by the renderer
 	unsigned framesDrawn = 0;      // frames actually presented
+	float    meanLuma    = 1.0f;   // mean luma of the last extracted frame, 0..1
+	                               // (0 = black). Measured by the ML feature
+	                               // readback; exposed so the INGEST owner can
+	                               // see BLACK CONTENT — a present count cannot.
 	unsigned dropped = 0;          // receive-side drops (m_DrawStats.m_dropped)
 	unsigned skipped = 0;          // double-rate skip path (m_RenderStats.dropped2)
 	unsigned failed = 0;           // render failures (m_RenderStats.failed)
@@ -419,6 +423,34 @@ struct RenderStats_t {
 	double   presentLatencyMs = 0; // how far the frame on screen lags capture time
 	                               // (wall-clock delta minus stream-time delta since
 	                               // the first presented frame)
+};
+
+// ─ Optional host-injected, high-level log sink ─────────────────────────────
+//
+// A channel SEPARATE from the ML/frame debug log (ml_debug.csv). That one is for
+// image-quality work and is untouched by this. This one carries the renderer's
+// STATE and ACTIONS — init/deinit, media-type and signal changes, swap-chain
+// lifecycle — so a host that owns a capture chain can put the renderer's own
+// account on the SAME timeline as its engine and its signal monitor.
+//
+// Deliberately optional, and it must stay that way:
+//   * a host that injects nothing (MPC-HC, MPC-BE, any other player) gets NO
+//     logging — no file is opened, and every call site tests the sink first, so
+//     the renderer behaves exactly as it did before;
+//   * the HOST owns the format, the file and the clock, so these lines land in
+//     the host's log, in the host's dialect, with the host's timestamp — rather
+//     than in a second log with a second clock that nothing can be aligned to.
+//
+// A new IID rather than new methods on IVideoRenderer: adding to that vtable
+// moves its layout and would break any already-built consumer of the .ax.
+using MpcvrLogFn = void(__cdecl*)(void* ctx, const char* line);
+
+interface __declspec(uuid("7C1E9A44-2B8D-4F30-9E52-6A1D3B7F0C11"))
+IMpcvrLogSink : public IUnknown {
+	// ctx is handed back verbatim. fn may be null to detach — and a null fn at
+	// any time means "log nothing", which is the state every other host stays in.
+	// line is UTF-8, ONE complete line, no trailing newline (the host adds it).
+	STDMETHOD(SetLogSink)(void* ctx, MpcvrLogFn fn) PURE;
 };
 
 interface __declspec(uuid("1AB00F10-5F55-42AC-B53F-38649F11BE3E"))
