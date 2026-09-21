@@ -1487,22 +1487,14 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		//
 		// Three divides, run when the knee or the measured peak moves — never per
 		// pixel.
+		// cbuffer[14]: the Hable reserved knee slot (kept, unused since the mobius
+		// knee was removed). cbuffer[15..17]: the soft-plus pre-compressor.
 		const float kJ = std::clamp(m_fHdrHableKnee, 0.0f, 0.90f);
 		cbuffer[14] = kJ;
-		cbuffer[16] = cbuffer[17] = cbuffer[18] = 0.0f;
-		if (kJ > 0.001f) {
-			const float sdr = (float)std::max((int)m_iSDRDisplayNits, 1);
-			const float pk  = (m_HableScenePeakNits > 10.0f)
-				? (m_HableScenePeakNits / sdr) : (titlePeak / sdr);
-			if (pk > kJ + 0.01f && pk > 1.0f + 1e-3f) {
-				const float a = -kJ * kJ * (pk - 1.0f) / (kJ * kJ - 2.0f * kJ + pk);
-				const float b = (kJ * kJ - 2.0f * kJ * pk + pk) / std::max(pk - 1.0f, 1e-6f);
-				const float s = (b * b + 2.0f * b * kJ + kJ * kJ) / (b - a);
-				cbuffer[16] = a;
-				cbuffer[17] = b;
-				cbuffer[18] = s;
-			}
-		}
+		cbuffer[15] = m_fSoftKnee;           // <= 0 disables
+		cbuffer[16] = m_fSoftKneeRatio;      // 1.0 = identity above the knee
+		cbuffer[17] = m_fSoftKneeWidth;      // softplus transition width
+		cbuffer[18] = 0.0f;
 	}
 
 	if (m_pCorrectionConstants) {
@@ -7197,6 +7189,16 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		// Shader-constant only: the Hable branch reads it from the converter's
 		// cbuffer, so a re-push is enough. No curve rebuild — it is a per-pixel
 		// blend weight, not a table.
+		changeLuminanceParams = true;
+	}
+
+	// Soft-plus pre-compressor parameters — shader-constant only, cbuffer re-push.
+	if (config.fSoftKnee != m_fSoftKnee ||
+		config.fSoftKneeRatio != m_fSoftKneeRatio ||
+		config.fSoftKneeWidth != m_fSoftKneeWidth) {
+		m_fSoftKnee      = config.fSoftKnee;
+		m_fSoftKneeRatio = config.fSoftKneeRatio;
+		m_fSoftKneeWidth = config.fSoftKneeWidth;
 		changeLuminanceParams = true;
 	}
 

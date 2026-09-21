@@ -248,6 +248,13 @@ struct Settings_t {
 	//
 	// 0 = pure Hable, i.e. exactly the behaviour before this existed.
 	float fHdrHableKnee = 0.0f;
+	// Soft-plus pre-compressor for the Hable path (see the cbuffer comment in
+	// ps_convert_pq_to_sdr.hlsl) — re-spreads the highlight band Hable compresses
+	// least. fSoftKnee <= 0 disables (identical to before it existed); knee and
+	// width are display-relative light (1.0 = the display's white).
+	float fSoftKnee      = 0.60f;
+	float fSoftKneeRatio = 2.48f;
+	float fSoftKneeWidth = 0.42f;
 	bool  bMLHighlightEnabled = true;
 	float fMLHighlight = 0.0f;   // manual highlight roll-off [-0.3, 0.4]
 	bool  bMLDebugCopy = false;  // grade steps use the plain copy shader (shader-vs-plumbing bisect)
@@ -365,6 +372,9 @@ struct Settings_t {
 		fMLHighlightRolloffCtrl         = 0.0f;
 		fMLGammaTopUp                   = 0.0f;
 		fHdrHableKnee                   = 0.0f;
+		fSoftKnee                       = 0.60f;
+		fSoftKneeRatio                  = 2.48f;
+		fSoftKneeWidth                  = 0.42f;
 		bMLHighlightEnabled             = true;
 		fMLHighlight                    = 0.0f;
 		bMLDebugCopy                    = false;

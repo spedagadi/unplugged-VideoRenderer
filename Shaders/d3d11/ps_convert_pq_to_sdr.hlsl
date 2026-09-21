@@ -46,16 +46,17 @@ cbuffer PS_PARAMETERS : register(b0)
     // the Hable curve is replaced by IDENTITY. 0 = pure Hable, i.e. exactly the
     // behaviour before the knee existed. See IVideoRenderer.h for the rationale.
     float hableKnee;
-    float unused1;
-    // Mobius coefficients for the curve that takes over ABOVE the knee:
-    //   M(x) = hableKneS * (x + hableKneA) / (x + hableKneB)
-    // solved CPU-side for M(j) = j, M(peak) = 1, M'(j) = 1, so the joint at the
-    // knee is smooth BY CONSTRUCTION. All zero when the knee is off, in which
-    // case Hable applies unchanged and this whole branch is skipped.
-    float hableKneA;
-    float hableKneB;
-    float hableKneS;
-    float _padK;                   // keeps the cbuffer 16-byte aligned
+    // Soft-plus PRE-compressor, applied to I BEFORE Hable sees it. Display-relative
+    // light (1.0 = the display's white). It re-spreads the highlight band Hable
+    // compresses least (a bright sky at 2-12x white sits in Hable's flat region
+    // and reads "hot") so the sky occupies more of the output range, leaving
+    // everything below the knee EXACTLY identity:  min(x, knee + softplus/ratio).
+    // softKnee <= 0 disables the compressor entirely — identical to before it
+    // existed. The curve still normalises by the UNCOMPRESSED content peak.
+    float softKnee;
+    float softKneeRatio;   // 1.0 = identity above the knee; >1 compresses
+    float softKneeWidth;   // softplus transition width around the knee
+    float _padK;           // keeps the cbuffer 16-byte aligned
 };
 
 #include "../convert/conv_matrix.hlsl"
@@ -316,22 +317,23 @@ float4 main(PS_INPUT input) : SV_Target
             // is agreed; 1.0 is exactly the behaviour before this line existed.
             const float kHableGain = 1.00f;
             const float3 hv = float3(I_rel * kHableGain, I_rel * kHableGain, I_rel * kHableGain);
-            const float  hMapped = ToneMappingHablePeak(hv, peakSdrUnits).x;
 
-            // Hable knee. Below it: identity, untouched. Above it: a SOLVED mobius
-            // curve, not Hable — chosen because its join can be smooth by
-            // construction, which Hable's shape does not permit (Hable is concave
-            // everywhere, so identity meets it only at the origin and no positive
-            // knee can be both value- and slope-continuous).
-            //
-            // Hable still owns the highlights whenever the knee is OFF: hableKneS
-            // stays 0 then and this collapses to the Hable value exactly, so
-            // knee = 0 remains the A/B anchor.
-            float hFinal = hMapped;
-            if (hableKneS > 0.0) {
-                const float3 m = hableKneS * (hv + hableKneA) / (hv + hableKneB);
-                hFinal = lerp(hv.x, m.x, step(hableKnee, hv.x));
+            // Soft-plus pre-compressor (disabled when softKnee <= 0 — identical to
+            // before it existed). Below the knee the map is exactly identity; above it
+            // the band Hable compresses least is re-spread before the curve sees it.
+            // The normaliser below still uses the UNCOMPRESSED content peak, so the
+            // compressed top rides lower on the Hable input and the sky keeps headroom.
+            // Overflow-safe softplus: sp(t) = max(t,0) + log(1 + exp(-|t|)).
+            float3 hvP = hv;
+            if (softKnee > 0.0) {
+                const float t  = (hv.x - softKnee) / max(softKneeWidth, 1e-3);
+                const float sp = max(t, 0.0) + log(1.0 + exp(-abs(t)));
+                const float comp = softKnee + softKneeWidth * sp / max(softKneeRatio, 1e-3);
+                hvP = float3(min(hv.x, comp), min(hv.y, comp), min(hv.z, comp));
             }
+
+            const float hMapped = ToneMappingHablePeak(hvP, peakSdrUnits).x;
+            const float hFinal = hMapped;   // the mobius knee was removed — see cbuffer comment
             I_rel = hFinal;
 
             // --- Chroma follows the tone curve down --------------------------------

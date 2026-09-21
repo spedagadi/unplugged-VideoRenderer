@@ -442,6 +442,10 @@ private:
 	float m_PeakMaxPq = 0.0f;
 	float m_HableScenePeakNits = -1.0f;
 	float m_HablePrevPeakPq = -1.0f;        // previous raw PQ peak, for the cut test
+	// Soft-plus pre-compressor: display-relative; knee <= 0 disables.
+	float m_fSoftKnee      = 0.60f;
+	float m_fSoftKneeRatio = 2.48f;
+	float m_fSoftKneeWidth = 0.42f;
 	float m_HableScenePeakApplied = -1.0f;  // value last pushed to the cbuffer
 
 	// The gamma top-up actually added on top of the model's prediction this frame
