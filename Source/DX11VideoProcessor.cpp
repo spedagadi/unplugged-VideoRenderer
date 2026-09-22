@@ -5420,6 +5420,9 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					m_PeakMaxPq = maxPq;
 					m_SceneLocked = false;
 					m_SceneFrames = 0;
+					m_ZoneSeen = false;
+					m_ZoneChangeFrac = 0.0f;
+					for (int i = 0; i < 25; ++i) m_PrevZoneMax[i] = 0.0f;
 					for (int i = 0; i < 4; ++i) m_DeltaHistory[i] = 0.0f;
 				} else {
 					const float eps = 1.0f / kPqMax;
@@ -5495,8 +5498,27 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				m_DeltaIdx &= 3;
 				float deltaBase = 0.0f;
 				for (int i = 0; i < 4; ++i) deltaBase = std::max(deltaBase, m_DeltaHistory[i]);
+
+				// Zonal coherence — the SPATIAL half of the cut test. A cut is
+				// globally simultaneous: most of the 5x5 zone maxes move together.
+				// Occlusion (a character walking past the lamp) moves only the
+				// zones they touch — local, never majority. So this frame is a cut
+				// only if it ALSO clears the zone-majority gate.
+				if (m_ZoneSeen) {
+					int zonesMoved = 0;
+					for (int z = 0; z < 25; ++z) {
+						const float a = m_MLFeatures[52 + z];
+						const float b = m_PrevZoneMax[z];
+						if (fabsf(a - b) > 0.1f * std::max(a, b) + 0.002f) ++zonesMoved;
+					}
+					m_ZoneChangeFrac = (float)zonesMoved / 25.0f;
+				}
+				for (int z = 0; z < 25; ++z) m_PrevZoneMax[z] = m_MLFeatures[52 + z];
+				m_ZoneSeen = true;
+
 				const bool sceneCut = (delta > kThreshHigh * kLog10Pq) &&
-				                      (delta > 3.0f * deltaBase + 1e-5f);
+				                      (delta > 3.0f * deltaBase + 1e-5f) &&
+				                      (m_ZoneChangeFrac > 0.50f);
 
 				if (sceneCut) {
 					// SNAP — a real scene change arrives in ONE frame.
@@ -5530,9 +5552,10 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					// is the hysteresis coefficient — 0 = filtered, 1 = jumped.
 					if (m_bMLDebug && m_pMLDebugFile) {
 						fwprintf(m_pMLDebugFile,
-							L"HABLE_PEAK frame=%llu raw_pq=%.4f avg_pq=%.4f filt_pq=%.4f applied_nits=%.1f delta=%.4f\n",
+							L"HABLE_PEAK frame=%llu raw_pq=%.4f avg_pq=%.4f filt_pq=%.4f applied_nits=%.1f delta=%.4f zones=%.2f\n",
 							(unsigned long long)m_MLDebugFrame, (double)maxPq, (double)avgPq,
-							(double)m_PeakMaxPq, (double)m_HableScenePeakNits, (double)delta);
+							(double)m_PeakMaxPq, (double)m_HableScenePeakNits, (double)delta,
+							(double)m_ZoneChangeFrac);
 						fflush(m_pMLDebugFile);
 					}
 				}

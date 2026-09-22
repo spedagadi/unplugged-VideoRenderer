@@ -454,6 +454,13 @@ private:
 	// until the next cut, nothing else moves it.)
 	float m_DeltaHistory[4] = {};
 	int   m_DeltaIdx        = 0;
+	// Zonal coherence (2026-09-22). A cut is SPATIALLY GLOBAL: it replaces the
+	// frame, so most of the 5x5 zones' maxes (m_MLFeatures[52..76]) move. An
+	// occlusion or reframe is local — only the zones it touches move. A cut must
+	// ALSO clear the zone-majority test, not just the global peak spike.
+	float m_PrevZoneMax[25] = {};
+	bool  m_ZoneSeen        = false;
+	float m_ZoneChangeFrac  = 0.0f;   // fraction of zones moved this frame (CSV)
 	float m_HableScenePeakNits = -1.0f;
 	float m_HablePrevPeakPq = -1.0f;        // previous raw PQ peak, for the cut test
 	// Soft-plus pre-compressor: display-relative; knee <= 0 disables.
