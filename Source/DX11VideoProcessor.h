@@ -445,15 +445,15 @@ private:
 	// cannot pump; it only drifts downward (slow brighten) once locked.
 	bool m_SceneLocked = false;
 	int  m_SceneFrames = 0;
-	// Spike test + sustained re-anchor (2026-09-22). A cut is a DISCONTINUITY —
-	// the frame's delta dominates its recent 4-frame baseline — so occlusion and
-	// camera reframes (a ramp) cannot trip it. Glide is a slow IIR of the raw
-	// peak that re-anchors only after a sustained >3 dB separation, for genuine
-	// exposure changes (dollies, lights coming up).
+	// Spike test (2026-09-22): a cut is a DISCONTINUITY — the frame's delta
+	// dominates its recent 4-frame baseline, so occlusion and camera reframes
+	// (a ramp) cannot trip it, however far p99.5 wanders. (The slow re-anchor
+	// "glide" that used to live here was deleted: it re-anchored on sustained
+	// content — a character standing in frame for a second — and became the very
+	// dimming/brightening it was meant to prevent. The anchor is now a constant
+	// until the next cut, nothing else moves it.)
 	float m_DeltaHistory[4] = {};
 	int   m_DeltaIdx        = 0;
-	float m_GlidePq         = 0.0f;   // slow IIR of the measured peak (period ~60)
-	int   m_GlideHoldTicks  = 0;
 	float m_HableScenePeakNits = -1.0f;
 	float m_HablePrevPeakPq = -1.0f;        // previous raw PQ peak, for the cut test
 	// Soft-plus pre-compressor: display-relative; knee <= 0 disables.

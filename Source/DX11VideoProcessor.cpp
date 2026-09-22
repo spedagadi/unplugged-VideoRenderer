@@ -5420,8 +5420,6 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					m_PeakMaxPq = maxPq;
 					m_SceneLocked = false;
 					m_SceneFrames = 0;
-					m_GlidePq = maxPq;
-					m_GlideHoldTicks = 0;
 					for (int i = 0; i < 4; ++i) m_DeltaHistory[i] = 0.0f;
 				} else {
 					const float eps = 1.0f / kPqMax;
@@ -5500,12 +5498,6 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				const bool sceneCut = (delta > kThreshHigh * kLog10Pq) &&
 				                      (delta > 3.0f * deltaBase + 1e-5f);
 
-				// Slow IIR of the raw peak, for the sustained re-anchor (exposure
-				// changes — a dolly into light, a room the lights come up in).
-				const float glideCoeff = 1.0f - expf(-1.0f / 60.0f);
-				if (m_GlidePq <= 0.0f) m_GlidePq = maxPq;
-				else                   m_GlidePq += glideCoeff * (maxPq - m_GlidePq);
-
 				if (sceneCut) {
 					// SNAP — a real scene change arrives in ONE frame.
 					m_PeakAvgPq = avgPq;
@@ -5513,7 +5505,6 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					m_SceneLocked = false;
 					m_SceneFrames = 0;
 					for (int i = 0; i < 4; ++i) m_DeltaHistory[i] = 0.0f;
-					m_GlideHoldTicks = 0;
 				} else if (!m_SceneLocked) {
 					// SETTLE (first ~0.5 s of a scene): bounded IIR converges the
 					// anchor onto the scene's true level, then locks it absolutely.
@@ -5522,21 +5513,11 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					m_PeakAvgPq += settleCoeff * (avgPq - m_PeakAvgPq);
 					m_PeakMaxPq += settleCoeff * (maxPq - m_PeakMaxPq);
 					if (m_SceneFrames >= kSceneSettleFrames) m_SceneLocked = true;
-				} else {
-					// LOCKED — the anchor is a CONSTANT until the next cut. It does
-					// not follow content, it does not leak. The only mover is the
-					// sustained re-anchor: if the slow glide separates from the
-					// anchor by > 3 dB and STAYS there for ~1 s, the scene genuinely
-					// changed character — re-anchor onto it.
-					if (fabsf(m_GlidePq - m_PeakMaxPq) > kThreshHigh * kLog10Pq) {
-						if (++m_GlideHoldTicks >= 24) {
-							m_PeakMaxPq = m_GlidePq;   // exposure change caught up
-							m_GlideHoldTicks = 0;
-						}
-					} else {
-						m_GlideHoldTicks = 0;
-					}
 				}
+				// LOCKED — nothing else moves the anchor. A detected cut is the only
+				// way back to motion; a long graded change (a dolly into light, a
+				// room brightening over minutes) is intentionally held at the
+				// scene's opening level — the cost of absolute stillness.
 
 				m_HableScenePeakNits = exptm::PqToLinearNits(m_PeakMaxPq);
 				const float chg = m_HableScenePeakNits - m_HableScenePeakApplied;
