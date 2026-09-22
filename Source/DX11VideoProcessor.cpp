@@ -5415,42 +5415,42 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			if (maxNits > 10.0f && maxNits < 4000.0f) {
 				if (m_PeakAvgPq == 0.0f) {
 					// No state yet — take the first reading outright
-					// (libplacebo: "if (!obj->peak.avg_pq)").
+					// (libplacebo: "if (!obj->peak.avg_pq)"), as a fresh scene.
 					m_PeakAvgPq = avgPq;
 					m_PeakMaxPq = maxPq;
+					m_SceneLocked = false;
+					m_SceneFrames = 0;
 				} else {
 					const float eps = 1.0f / kPqMax;
 					if (fabsf(avgPq - m_PeakAvgPq) < eps) avgPq = m_PeakAvgPq;
 					if (fabsf(maxPq - m_PeakMaxPq) < eps) maxPq = m_PeakMaxPq;
 				}
 
-				// 3. IIR low-pass over BOTH values, one coefficient — libplacebo's
-				// own shape (smoothing_period 20, ~0.8 s at 24 fps).
+				// 3. Snap / settle / LOCK, with asymmetric drift (2026-09-22).
 				//
-				// This is the SHIMMER fix. The anchor is a per-frame maximum, and a
-				// maximum moves a little every frame — grain, motion, a flickering
-				// lamp — which the whole picture then follows, because the anchor sets
-				// the divisor. The filter damps exactly that variation.
+				// The IIR-20 under this comment used to do BOTH jobs — snap on a cut
+				// and smooth within a scene — and the two need opposite behaviour:
+				// cuts must arrive instantly, within a scene the anchor should not
+				// move at all. Because the IIR always TRACKS, a bright element that
+				// left frame (a lamp pans off, the sky shrinks) pulled the anchor
+				// down at ~5%/frame and the whole picture LIFTED over ~0.8 s — the
+				// "room breathing" that reads as the picture responding to nothing.
 				//
-				// The 0.8 s is only tolerable BECAUSE of step 4 below. On a real cut
-				// the hysteresis drives mix to 1 and both values JUMP in a single
-				// frame, so a stale normalisation is never carried across a scene
-				// change. With no working hysteresis this coefficient is precisely what
-				// makes the brightness trail the picture — which is what happened, and
-				// what the bias fix in step 4 removes.
+				// Three speeds now:
+				//   cut                        -> snap in one frame (mixc > 0.95)
+				//   settle (~12 frames / 0.5s) -> fast IIR (period 5) converges on
+				//                                the new scene's true level
+				//   locked                     -> the anchor does NOT follow content;
+				//                                only a slow DOWNWARD leak (period ~200,
+				//                                ≈8 s) when the peak actually drops,
+				//                                so the picture may brighten gently but
+				//                                can never DIM within a scene. Dimming
+				//                                pumps are visible; slow brightening is
+				//                                not, and the cut detector still sees
+				//                                live-vs-anchor on the next frame.
+				constexpr int kSceneSettleFrames = 12;   // ~0.5 s at 24 fps
 				//
-				// An earlier attempt lengthened the max's period to ~8 s to stop a
-				// pause overlay dimming the face. Wrong tool: it made the anchor lag in
-				// BOTH directions, so the scene visibly caught up in brightness seconds
-				// after every change. An overlay is a bright region statistically
-				// identical to content, so the answer to it is to EXCLUDE it from the
-				// measurement, not to filter longer.
-				const float coeff = 1.0f - expf(-1.0f / kSmoothPeriod);
-				m_PeakAvgPq += coeff * (avgPq - m_PeakAvgPq);
-
-				// The anchor takes the SAME filter as the average now — this is the
-				// shimmer fix, and the shipped libplacebo behaviour.
-				m_PeakMaxPq += coeff * (maxPq - m_PeakMaxPq);
+				// (delta / mixc are computed below, after the histogram block.)
 
 				// 4. Scene-change hysteresis. bias = the non-black CELL fraction, so a
 				// letterboxed or mostly-black frame cannot register a change on its own.
@@ -5476,12 +5476,32 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					fmaxf(fabsf(avgPq - m_PeakAvgPq), fabsf(maxPq - m_PeakMaxPq));
 				const float mixc  = exptm::smoothstepf(kThreshLow * kLog10Pq,
 				                                       kThreshHigh * kLog10Pq, delta);
-				m_PeakAvgPq = exptm::mixf(m_PeakAvgPq, avgPq, mixc);
-				// Both values snap together, exactly as libplacebo does. This line is
-				// what makes a scene change arrive in ONE frame instead of creeping in
-				// over the IIR — the "no catch-up" requirement, satisfied by the snap
-				// rather than by removing the filter.
-				m_PeakMaxPq = exptm::mixf(m_PeakMaxPq, maxPq, mixc);
+				const bool sceneCut = mixc > 0.95f;
+				if (sceneCut) {
+					// SNAP: a real scene change arrives in ONE frame, and a fresh
+					// settle window opens on the new scene.
+					m_PeakAvgPq = avgPq;
+					m_PeakMaxPq = maxPq;
+					m_SceneLocked = false;
+					m_SceneFrames = 0;
+				} else if (!m_SceneLocked) {
+					// SETTLE (first ~0.5 s of a scene): fast IIR converges on the
+					// scene's true level and absorbs the first-frames noise after a cut.
+					++m_SceneFrames;
+					const float settleCoeff = 1.0f - expf(-1.0f / 5.0f);
+					m_PeakAvgPq += settleCoeff * (avgPq - m_PeakAvgPq);
+					m_PeakMaxPq += settleCoeff * (maxPq - m_PeakMaxPq);
+					if (m_SceneFrames >= kSceneSettleFrames) m_SceneLocked = true;
+				} else {
+					// LOCKED: the anchor does not follow content. Only a slow DOWNWARD
+					// leak if the peak/avg genuinely dropped — the picture may brighten
+					// gently, but can never DIM within a scene. The next frame's delta
+					// compares live against this locked anchor, so a real change still
+					// trips the snap.
+					const float leak = 1.0f - expf(-1.0f / 200.0f);
+					if (maxPq < m_PeakMaxPq) m_PeakMaxPq += leak * (maxPq - m_PeakMaxPq);
+					if (avgPq < m_PeakAvgPq) m_PeakAvgPq += leak * (avgPq - m_PeakAvgPq);
+				}
 
 				m_HableScenePeakNits = exptm::PqToLinearNits(m_PeakMaxPq);
 				const float chg = m_HableScenePeakNits - m_HableScenePeakApplied;

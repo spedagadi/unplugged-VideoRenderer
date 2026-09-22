@@ -440,6 +440,11 @@ private:
 	// the filter IS the state, and clearing them restarts the detection.
 	float m_PeakAvgPq = 0.0f;
 	float m_PeakMaxPq = 0.0f;
+	// Scene-lock state (snap/settle/lock with asymmetric drift — see the block at
+	// UpdatePeak). The anchor is locked within a scene so the Hable normaliser
+	// cannot pump; it only drifts downward (slow brighten) once locked.
+	bool m_SceneLocked = false;
+	int  m_SceneFrames = 0;
 	float m_HableScenePeakNits = -1.0f;
 	float m_HablePrevPeakPq = -1.0f;        // previous raw PQ peak, for the cut test
 	// Soft-plus pre-compressor: display-relative; knee <= 0 disables.
