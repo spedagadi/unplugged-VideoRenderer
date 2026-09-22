@@ -5472,8 +5472,17 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// safe to add only after the anchor's statistic became p99.5 measured over
 				// the content rows, which is stable within a shot (a max spanning 0.003 PQ
 				// across 4198 frames), so it cannot fire spuriously on ordinary frames.
+				// The gate keys on the PEAK deviation alone, deliberately NOT the average
+				// (2026-09-22). A character in dark clothing walking into the frame is
+				// a large AVERAGE change but leaves the p99.5-percentile — the top of
+				// the histogram is still the same bright lights/sky — essentially
+				// untouched. Including |avg - avg_a| in delta made a dark object a
+				// false scene cut: the anchor snapped to the darker reading and the
+				// whole picture reacted. The percentile is the scene-stable statistic
+				// (0.003 PQ across a shot), and it is also exactly what catches the
+				// earlier missed-cut case (identical averages, different peaks).
 				const float delta = m_MLActiveFrac *
-					fmaxf(fabsf(avgPq - m_PeakAvgPq), fabsf(maxPq - m_PeakMaxPq));
+					fabsf(maxPq - m_PeakMaxPq);
 				const float mixc  = exptm::smoothstepf(kThreshLow * kLog10Pq,
 				                                       kThreshHigh * kLog10Pq, delta);
 				const bool sceneCut = mixc > 0.95f;
