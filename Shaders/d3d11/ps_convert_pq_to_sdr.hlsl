@@ -57,6 +57,11 @@ cbuffer PS_PARAMETERS : register(b0)
     float softKneeRatio;   // 1.0 = identity above the knee; >1 compresses
     float softKneeWidth;   // softplus transition width around the knee
     float _padK;           // keeps the cbuffer 16-byte aligned
+    float hableRefWhiteNits;   // the Hable curve's 1.0 in nits — decouples "normal
+                               // scene light" from display white (sdrNits). 0 = fall
+                               // back to sdrNits (identical to before). Clouds at
+                               // 150-200 nits are below a 200-nit reference but 2x an
+                               // 85-nit one — this axis tells the curve they are content.
 };
 
 #include "../convert/conv_matrix.hlsl"
@@ -220,6 +225,13 @@ float4 main(PS_INPUT input) : SV_Target
     }
     else {
         float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
+            // The curve's reference axis, decoupled from display white. 1.0 for the
+            // curve = hableRefWhiteNits nits; when unset (=0) that equals sdrNits and
+            // reproduces the previous picture exactly. Default ~203 (libplacebo's SDR
+            // diffuse white): clouds at 150-200 nits become ordinary content instead
+            // of 2x-white highlight, and survive; sdrNits (the display mapping) is
+            // untouched — that is the decouple.
+            const float refNits = max(hableRefWhiteNits, 1.0f);
 
         // THE DISPLAY FLOOR IS GONE FROM THIS BRANCH — deliberately, from
         // measurement, 2026-09-20.
@@ -283,10 +295,10 @@ float4 main(PS_INPUT input) : SV_Target
             float3 disp = color.rgb;   // nits / sdrNits (1.0 = white) — no floor, see above
 
             float3 ictcp = linear_to_ictcp(disp * sdrNits);
-            float I_rel = ST2084ToLinear(float4(ictcp.x, 0.0, 0.0, 0.0), 10000.0).x / max(sdrNits, 1e-3);
+            float I_rel = ST2084ToLinear(float4(ictcp.x, 0.0, 0.0, 0.0), 10000.0).x / max(refNits, 1e-3);
             // The ORIGINAL intensity in nits, kept for the chroma rescale at the
             // reconstruction below. I_rel is reassigned by the curve.
-            const float I_origNits = I_rel * max(sdrNits, 1e-3);
+            const float I_origNits = I_rel * max(refNits, 1e-3);
 
             // Normalise by the CONTENT PEAK, not Hable's fixed 4.8 — see
             // ToneMappingHablePeak().
@@ -296,7 +308,7 @@ float4 main(PS_INPUT input) : SV_Target
             // read). The measured value is the pre-tone-map scene peak, so it is a
             // genuine source-referred number rather than a title-level one.
             const float scenePeak = (hableScenePeakNits > 10.0f) ? hableScenePeakNits : maxCLL;
-            const float peakSdrUnits = max(scenePeak / max(sdrNits, 1e-3), 1.0);
+            const float peakSdrUnits = max(scenePeak / max(refNits, 1e-3), 1.0);
 
             // Pre-curve gain: the brightness control for the Hable path.
             //
@@ -370,7 +382,7 @@ float4 main(PS_INPUT input) : SV_Target
             // exact: a linear scale of R, G and B cannot move chromaticity, so the
             // anchor may move as much as it likes and the colour holds. This is the
             // same treatment as ps_ml_gamma and ps_ml_shadow.
-            const float I_newNits = I_rel * max(sdrNits, 1e-3);
+            const float I_newNits = I_rel * max(refNits, 1e-3);
             const float gGain = I_newNits / max(I_origNits, 1e-6);
 
             // ictcp still holds the ORIGINAL I here (the curve result lives in

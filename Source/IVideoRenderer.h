@@ -255,6 +255,11 @@ struct Settings_t {
 	float fSoftKnee      = 0.60f;
 	float fSoftKneeRatio = 2.48f;
 	float fSoftKneeWidth = 0.42f;
+	// The Hable curve's reference axis, decoupled from display white (sdrNits).
+	// 1.0 for the curve = this many nits; 0 = use sdrNits (identical to before).
+	// libplacebo's SDR diffuse white is 203 — clouds at 150-200 nits are content
+	// under a 200-nit reference, but 2x-white under an 85-nit one.
+	float fHdrRefWhiteNits = 203.0f;
 	bool  bMLHighlightEnabled = true;
 	float fMLHighlight = 0.0f;   // manual highlight roll-off [-0.3, 0.4]
 	bool  bMLDebugCopy = false;  // grade steps use the plain copy shader (shader-vs-plumbing bisect)
@@ -375,6 +380,7 @@ struct Settings_t {
 		fSoftKnee                       = 0.60f;
 		fSoftKneeRatio                  = 2.48f;
 		fSoftKneeWidth                  = 0.42f;
+		fHdrRefWhiteNits                = 203.0f;
 		bMLHighlightEnabled             = true;
 		fMLHighlight                    = 0.0f;
 		bMLDebugCopy                    = false;

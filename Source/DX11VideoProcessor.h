@@ -467,6 +467,7 @@ private:
 	float m_fSoftKnee      = 0.60f;
 	float m_fSoftKneeRatio = 2.48f;
 	float m_fSoftKneeWidth = 0.42f;
+	float m_fHdrRefWhiteNits = 203.0f;   // the Hable curve's 1.0 in nits; 0 = sdrNits
 	float m_HableScenePeakApplied = -1.0f;  // value last pushed to the cbuffer
 
 	// The gamma top-up actually added on top of the model's prediction this frame

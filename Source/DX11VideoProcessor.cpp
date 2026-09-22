@@ -1495,6 +1495,8 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		cbuffer[16] = m_fSoftKneeRatio;      // 1.0 = identity above the knee
 		cbuffer[17] = m_fSoftKneeWidth;      // softplus transition width
 		cbuffer[18] = 0.0f;
+		// cbuffer[19]: the Hable curve's 1.0 in nits (decoupled reference white).
+		cbuffer[19] = m_fHdrRefWhiteNits;
 	}
 
 	if (m_pCorrectionConstants) {
@@ -7269,6 +7271,12 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_fSoftKnee      = config.fSoftKnee;
 		m_fSoftKneeRatio = config.fSoftKneeRatio;
 		m_fSoftKneeWidth = config.fSoftKneeWidth;
+		changeLuminanceParams = true;
+	}
+
+	// Hable reference white — shader-constant only, cbuffer re-push.
+	if (config.fHdrRefWhiteNits != m_fHdrRefWhiteNits) {
+		m_fHdrRefWhiteNits = config.fHdrRefWhiteNits;
 		changeLuminanceParams = true;
 	}
 
