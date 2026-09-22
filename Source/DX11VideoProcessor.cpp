@@ -5453,6 +5453,15 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				//                                not, and the cut detector still sees
 				//                                live-vs-anchor on the next frame.
 				constexpr int kSceneSettleFrames = 12;   // ~0.5 s at 24 fps
+				// The LIGHTING-CHANGE gate (2026-09-22): a camera cut within one
+				// physical scene is exposure-matched by the DOP — the global mean
+				// stays in a tight band — whereas a true SCENE change (new light)
+				// moves it. A frame can snap the anchor only if the mean shifted by
+				// more than this band, so abrupt zone-global changes that carry the
+				// same exposure (camera cuts, whip-pans back into the same light)
+				// are correctly treated as light-invariant and the anchor holds.
+				// Absolute in the feature domain; tune from the meanD CSV column.
+				constexpr float kSceneMeanBand = 0.02f;
 				//
 				// (delta / mixc are computed below, after the histogram block.)
 
@@ -5516,9 +5525,11 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				for (int z = 0; z < 25; ++z) m_PrevZoneMax[z] = m_MLFeatures[52 + z];
 				m_ZoneSeen = true;
 
+				const float meanD = fabsf(avgPq - m_PeakAvgPq);
 				const bool sceneCut = (delta > kThreshHigh * kLog10Pq) &&
 				                      (delta > 3.0f * deltaBase + 1e-5f) &&
-				                      (m_ZoneChangeFrac > 0.50f);
+				                      (m_ZoneChangeFrac > 0.50f) &&
+				                      (meanD > kSceneMeanBand);
 
 				if (sceneCut) {
 					// SNAP — a real scene change arrives in ONE frame.
@@ -5552,10 +5563,10 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					// is the hysteresis coefficient — 0 = filtered, 1 = jumped.
 					if (m_bMLDebug && m_pMLDebugFile) {
 						fwprintf(m_pMLDebugFile,
-							L"HABLE_PEAK frame=%llu raw_pq=%.4f avg_pq=%.4f filt_pq=%.4f applied_nits=%.1f delta=%.4f zones=%.2f\n",
+							L"HABLE_PEAK frame=%llu raw_pq=%.4f avg_pq=%.4f filt_pq=%.4f applied_nits=%.1f delta=%.4f zones=%.2f meanD=%.4f\n",
 							(unsigned long long)m_MLDebugFrame, (double)maxPq, (double)avgPq,
 							(double)m_PeakMaxPq, (double)m_HableScenePeakNits, (double)delta,
-							(double)m_ZoneChangeFrac);
+							(double)m_ZoneChangeFrac, (double)meanD);
 						fflush(m_pMLDebugFile);
 					}
 				}
