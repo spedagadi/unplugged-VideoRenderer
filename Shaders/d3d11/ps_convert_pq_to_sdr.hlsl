@@ -389,7 +389,7 @@ float4 main(PS_INPUT input) : SV_Target
             // I_rel / I_newNits), so ictcp_to_linear returns the original colour.
             const float3 ictcpNew = linear_to_ictcp(ictcp_to_linear(ictcp) * gGain);
 
-            color.rgb = ictcp_to_linear_gamut(ictcpNew, sdrNits) / max(sdrNits, 1e-3);
+            color.rgb = ictcp_to_linear_gamut(ictcpNew, refNits) / max(refNits, 1e-3);
         }
 
         // Output gamut. 0 = the standard SDR target: map BT.2020 content onto
