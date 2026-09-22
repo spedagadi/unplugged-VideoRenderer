@@ -5420,6 +5420,9 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					m_PeakMaxPq = maxPq;
 					m_SceneLocked = false;
 					m_SceneFrames = 0;
+					m_GlidePq = maxPq;
+					m_GlideHoldTicks = 0;
+					for (int i = 0; i < 4; ++i) m_DeltaHistory[i] = 0.0f;
 				} else {
 					const float eps = 1.0f / kPqMax;
 					if (fabsf(avgPq - m_PeakAvgPq) < eps) avgPq = m_PeakAvgPq;
@@ -5481,35 +5484,58 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// whole picture reacted. The percentile is the scene-stable statistic
 				// (0.003 PQ across a shot), and it is also exactly what catches the
 				// earlier missed-cut case (identical averages, different peaks).
+				// Spike test, not level test: a real cut is a DISCONTINUITY — this frame's
+				// delta dominates its recent baseline. Occlusion (dark clothing
+				// walking past the lamp) and camera reframes move the peak as a RAMP,
+				// where every frame's delta is comparable to its own recent past — so
+				// the spike test never fires on them, however far p99.5 wanders.
+				// Measured 2026-09-22: filt_pq swung 0.4496..0.5953 inside one scene
+				// because the peak-only level test snapped on every ramp.
 				const float delta = m_MLActiveFrac *
 					fabsf(maxPq - m_PeakMaxPq);
-				const float mixc  = exptm::smoothstepf(kThreshLow * kLog10Pq,
-				                                       kThreshHigh * kLog10Pq, delta);
-				const bool sceneCut = mixc > 0.95f;
+				m_DeltaHistory[m_DeltaIdx++] = delta;
+				m_DeltaIdx &= 3;
+				float deltaBase = 0.0f;
+				for (int i = 0; i < 4; ++i) deltaBase = std::max(deltaBase, m_DeltaHistory[i]);
+				const bool sceneCut = (delta > kThreshHigh * kLog10Pq) &&
+				                      (delta > 3.0f * deltaBase + 1e-5f);
+
+				// Slow IIR of the raw peak, for the sustained re-anchor (exposure
+				// changes — a dolly into light, a room the lights come up in).
+				const float glideCoeff = 1.0f - expf(-1.0f / 60.0f);
+				if (m_GlidePq <= 0.0f) m_GlidePq = maxPq;
+				else                   m_GlidePq += glideCoeff * (maxPq - m_GlidePq);
+
 				if (sceneCut) {
-					// SNAP: a real scene change arrives in ONE frame, and a fresh
-					// settle window opens on the new scene.
+					// SNAP — a real scene change arrives in ONE frame.
 					m_PeakAvgPq = avgPq;
 					m_PeakMaxPq = maxPq;
 					m_SceneLocked = false;
 					m_SceneFrames = 0;
+					for (int i = 0; i < 4; ++i) m_DeltaHistory[i] = 0.0f;
+					m_GlideHoldTicks = 0;
 				} else if (!m_SceneLocked) {
-					// SETTLE (first ~0.5 s of a scene): fast IIR converges on the
-					// scene's true level and absorbs the first-frames noise after a cut.
+					// SETTLE (first ~0.5 s of a scene): bounded IIR converges the
+					// anchor onto the scene's true level, then locks it absolutely.
 					++m_SceneFrames;
 					const float settleCoeff = 1.0f - expf(-1.0f / 5.0f);
 					m_PeakAvgPq += settleCoeff * (avgPq - m_PeakAvgPq);
 					m_PeakMaxPq += settleCoeff * (maxPq - m_PeakMaxPq);
 					if (m_SceneFrames >= kSceneSettleFrames) m_SceneLocked = true;
 				} else {
-					// LOCKED: the anchor does not follow content. Only a slow DOWNWARD
-					// leak if the peak/avg genuinely dropped — the picture may brighten
-					// gently, but can never DIM within a scene. The next frame's delta
-					// compares live against this locked anchor, so a real change still
-					// trips the snap.
-					const float leak = 1.0f - expf(-1.0f / 200.0f);
-					if (maxPq < m_PeakMaxPq) m_PeakMaxPq += leak * (maxPq - m_PeakMaxPq);
-					if (avgPq < m_PeakAvgPq) m_PeakAvgPq += leak * (avgPq - m_PeakAvgPq);
+					// LOCKED — the anchor is a CONSTANT until the next cut. It does
+					// not follow content, it does not leak. The only mover is the
+					// sustained re-anchor: if the slow glide separates from the
+					// anchor by > 3 dB and STAYS there for ~1 s, the scene genuinely
+					// changed character — re-anchor onto it.
+					if (fabsf(m_GlidePq - m_PeakMaxPq) > kThreshHigh * kLog10Pq) {
+						if (++m_GlideHoldTicks >= 24) {
+							m_PeakMaxPq = m_GlidePq;   // exposure change caught up
+							m_GlideHoldTicks = 0;
+						}
+					} else {
+						m_GlideHoldTicks = 0;
+					}
 				}
 
 				m_HableScenePeakNits = exptm::PqToLinearNits(m_PeakMaxPq);
@@ -5523,9 +5549,9 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					// is the hysteresis coefficient — 0 = filtered, 1 = jumped.
 					if (m_bMLDebug && m_pMLDebugFile) {
 						fwprintf(m_pMLDebugFile,
-							L"HABLE_PEAK frame=%llu raw_pq=%.4f avg_pq=%.4f filt_pq=%.4f applied_nits=%.1f mix=%.3f\n",
+							L"HABLE_PEAK frame=%llu raw_pq=%.4f avg_pq=%.4f filt_pq=%.4f applied_nits=%.1f delta=%.4f\n",
 							(unsigned long long)m_MLDebugFrame, (double)maxPq, (double)avgPq,
-							(double)m_PeakMaxPq, (double)m_HableScenePeakNits, (double)mixc);
+							(double)m_PeakMaxPq, (double)m_HableScenePeakNits, (double)delta);
 						fflush(m_pMLDebugFile);
 					}
 				}
