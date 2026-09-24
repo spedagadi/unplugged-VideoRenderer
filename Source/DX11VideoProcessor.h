@@ -468,6 +468,10 @@ private:
 	float m_fSoftKneeRatio = 2.48f;
 	float m_fSoftKneeWidth = 0.42f;
 	float m_fHdrRefWhiteNits = 203.0f;   // the Hable curve's 1.0 in nits; 0 = sdrNits
+	float m_fHdrHighlightNeutral = 0.9f; // highlight neutral roll, 0..1 (0 = off)
+	// STAGE 1 (delivery only): configured chroma compensation exponent. Stored +
+	// reported as clE= in the pipeline dump; NOT applied in any shader yet.
+	float m_fHdrChromaExp = 1.35f;
 	float m_HableScenePeakApplied = -1.0f;  // value last pushed to the cbuffer
 
 	// The gamma top-up actually added on top of the model's prediction this frame

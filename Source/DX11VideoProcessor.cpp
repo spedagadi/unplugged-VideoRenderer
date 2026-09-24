@@ -1424,7 +1424,12 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 	// [13] per-scene Hable peak   [14] Hable knee   [15] spare
 	// [16..18] mobius coefficients for the curve that takes over above the knee
 	// [19] padding — cbuffers must stay 16-byte aligned
-	FLOAT cbuffer[20] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
+	// [19] the Hable curve's 1.0 in nits (decoupled reference white).
+		// [20] the nonlinear chroma compensation exponent (hableChromaExp).
+		// [21..23] pad — cbuffer ByteWidth MUST be a multiple of 16 bytes
+		// (84 vs 96 is the difference between a valid and a FAILED CreateBuffer —
+		// observed as a black picture whenever the buffer grew to 21 floats).
+		FLOAT cbuffer[24] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
 	                     (float)m_iOutputGamut,
 	                     ToneLutActive() ? 1.0f : 0.0f,
 	                     m_ToneLutKey.pqMin, m_ToneLutKey.pqMax,
@@ -1494,9 +1499,11 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		cbuffer[15] = m_fSoftKnee;           // <= 0 disables
 		cbuffer[16] = m_fSoftKneeRatio;      // 1.0 = identity above the knee
 		cbuffer[17] = m_fSoftKneeWidth;      // softplus transition width
-		cbuffer[18] = 0.0f;
+		cbuffer[18] = m_fHdrHighlightNeutral;   // highlight neutral roll, 0..1 (0 = off)
 		// cbuffer[19]: the Hable curve's 1.0 in nits (decoupled reference white).
 		cbuffer[19] = m_fHdrRefWhiteNits;
+		// [20] the nonlinear chroma compensation exponent (1.0 = none).
+		cbuffer[20] = m_fHdrChromaExp;
 	}
 
 	if (m_pCorrectionConstants) {
@@ -2687,7 +2694,7 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		// Convert to SDR inert on their own, so a reader can tell WHICH reason
 		// applies: no HDR display support, passthrough armed, DV suppressing the
 		// re-init, or the VP not ready.
-		L"pipeline: correction={} convertSdr={} passthrough={} passthroughSupport={} localToneMap={} dovi={} vpReady={} hdrRaw={} tf={} prim={} texVP={} cfmt={} rtxHdr={} toneCurve={} titlePeak={:.0f}\n"
+		L"pipeline: correction={} convertSdr={} passthrough={} passthroughSupport={} localToneMap={} dovi={} vpReady={} hdrRaw={} tf={} prim={} texVP={} cfmt={} rtxHdr={} toneCurve={} titlePeak={:.0f} cll={} fall={} mmax={} mmin={} sdata={} rcll={} rfall={} cllsz={} hlN={:.2f} clE={:.2f}\n"
 		L"rendererIn: fmt={} {}x{}  ics={}",
 		mode, domain, (m_bMLActive ? L"yes" : L"no"),
 		m_lastMLParams.MLGamma, m_lastMLParams.MLShadowToe, m_lastMLParams.MLHighlightRolloff,
@@ -2736,6 +2743,23 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		// The content peak the curves are normalised by. Distinct from the display
 		// peak: this is the top of the range being mapped FROM.
 		m_fHdrTitlePeakNits,
+		// The file's own ST 2086 as the renderer read it from the decoded side
+		// data (m_lastHdr10.hdr10). MaxCLL/MaxFALL are in cd/m², MaxMasteringLuminance
+		// in cd/m², MinMasteringLuminance scaled by 10000 (0.0001 cd/m²) — the
+		// DXGI_HDR_METADATA_HDR10 layout. The engine parses these to feed the
+		// panel's MaxCLL / MaxFALL / Mastering max / Mastering min rows on the
+		// file path (the DeckLink card path feeds those same rows from dl.*).
+		// Content-side ST 2086 (m_hdr10Cll… — display-independent copy of what
+		// the decoded side data carried; m_lastHdr10 is display-applied and
+		// stays zero on SDR swapchains).
+		m_hdr10Cll,
+		m_hdr10Fall,
+		m_hdr10Mmax,
+		m_hdr10Mmin,
+		m_sideData,
+		m_rawCll, m_rawFall, m_rawCllSize,
+		m_fHdrHighlightNeutral,
+		m_fHdrChromaExp,
 		inFmt, (int)m_srcRectWidth, (int)m_srcRectHeight, icsName);
 }
 
@@ -4920,6 +4944,18 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 
 	m_hdr10 = {};
 	if (CComQIPtr<IMediaSideData> pMediaSideData = pSample) {
+		// Side-data presence probe: which LAV side-data GUIDs actually arrived
+		// on this sample (HW-decode delivery can't be reasoned about blind).
+		{
+			static const GUID kH10p = { 0x6ff47d98, 0x3ef9, 0x4335,
+				{ 0xa6, 0x5e, 0xe7, 0x18, 0x80, 0xc1, 0x5b, 0xd9 } };
+			const BYTE* q = nullptr; size_t z = 0;
+			m_sideData =
+				(SUCCEEDED(pMediaSideData->GetSideData(IID_MediaSideDataHDR, &q, &z)) ? 1 : 0)
+				| (SUCCEEDED(pMediaSideData->GetSideData(IID_MediaSideDataHDRContentLightLevel, &q, &z)) ? 2 : 0)
+				| (SUCCEEDED(pMediaSideData->GetSideData(kH10p, &q, &z)) ? 4 : 0)
+				| (SUCCEEDED(pMediaSideData->GetSideData(IID_MediaSideDataDOVIMetadataV2, &q, &z)) ? 8 : 0);
+		}
 		if (SourceIsHDR10orHLG() && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) {
 			MediaSideDataHDR* hdr = nullptr;
 			size_t size = 0;
@@ -4949,12 +4985,29 @@ HRESULT CDX11VideoProcessor::CopySample(IMediaSample* pSample)
 
 			MediaSideDataHDRContentLightLevel* hdrCLL = nullptr;
 			size = 0;
+			m_rawCll = m_rawFall = -1; m_rawCllSize = -1;
 			hr = pMediaSideData->GetSideData(IID_MediaSideDataHDRContentLightLevel, (const BYTE**)&hdrCLL, &size);
-			if (SUCCEEDED(hr) && size == sizeof(MediaSideDataHDRContentLightLevel)) {
+			m_rawCllSize = (int)size;
+			if (SUCCEEDED(hr) && size == sizeof(MediaSideDataHDRContentLightLevel) && hdrCLL) {
 				m_hdr10.hdr10.MaxContentLightLevel      = hdrCLL->MaxCLL;
 				m_hdr10.hdr10.MaxFrameAverageLightLevel = hdrCLL->MaxFALL;
+				m_rawCll  = (int)hdrCLL->MaxCLL;
+				m_rawFall = (int)hdrCLL->MaxFALL;
 			}
 		}
+
+		// Content-side ST 2086 snapshot (see m_hdr10Cll… docs): keep the last
+		// values the SAMPLE carried. m_lastHdr10 is only written on an HDR10
+		// swapchain (SDR displays skip it and it stays zero) — the panel's
+		// MaxCLL/MaxFALL/Mastering rows must read this display-independent copy.
+		if (m_hdr10.hdr10.MaxContentLightLevel)
+			m_hdr10Cll = m_hdr10.hdr10.MaxContentLightLevel;
+		if (m_hdr10.hdr10.MaxFrameAverageLightLevel)
+			m_hdr10Fall = m_hdr10.hdr10.MaxFrameAverageLightLevel;
+		if (m_hdr10.hdr10.MaxMasteringLuminance)
+			m_hdr10Mmax = m_hdr10.hdr10.MaxMasteringLuminance;
+		if (m_hdr10.hdr10.MinMasteringLuminance)
+			m_hdr10Mmin = m_hdr10.hdr10.MinMasteringLuminance;
 
 		size_t size = 0;
 		MediaSideData3DOffset* offset = nullptr;
@@ -7277,6 +7330,21 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	// Hable reference white — shader-constant only, cbuffer re-push.
 	if (config.fHdrRefWhiteNits != m_fHdrRefWhiteNits) {
 		m_fHdrRefWhiteNits = config.fHdrRefWhiteNits;
+		changeLuminanceParams = true;
+	}
+
+	// Highlight neutral roll — shader-constant only, cbuffer re-push. A live drag
+	// on the rail therefore re-fills the converter's cbuffer alone (no curve
+	// rebuild, no graph op): the picture changes in real time.
+	if (config.fHdrHighlightNeutral != m_fHdrHighlightNeutral) {
+		m_fHdrHighlightNeutral = std::clamp(config.fHdrHighlightNeutral, 0.0f, 1.0f);
+		changeLuminanceParams = true;
+	}
+
+	// STAGE 2: the stored exponent now feeds the shader via cbuffer[20]; a change
+	// re-pushes it live so the drag takes effect immediately (guarded in HLSL).
+	if (config.fHdrChromaExp != m_fHdrChromaExp) {
+		m_fHdrChromaExp = std::clamp(config.fHdrChromaExp, -1.0f, 3.5f);
 		changeLuminanceParams = true;
 	}
 

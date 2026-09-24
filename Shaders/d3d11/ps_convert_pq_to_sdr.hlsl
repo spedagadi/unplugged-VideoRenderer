@@ -56,8 +56,10 @@ cbuffer PS_PARAMETERS : register(b0)
     float softKnee;
     float softKneeRatio;   // 1.0 = identity above the knee; >1 compresses
     float softKneeWidth;   // softplus transition width around the knee
-    float _padK;           // keeps the cbuffer 16-byte aligned
-    float hableRefWhiteNits;   // the Hable curve's 1.0 in nits — decouples "normal
+    float hableNeutralStrength;  // 0..1: highlight neutral roll in the Hable
+                                 // branch (0 = off, byte-identical to pre-feature)
+    float hableRefWhiteNits;   // the Hable curve's 1.0 in nits
+    float hableChromaExp;      // 1.0 = none; >1 desaturates compressed highlights — decouples "normal
                                // scene light" from display white (sdrNits). 0 = fall
                                // back to sdrNits (identical to before). Clouds at
                                // 150-200 nits are below a 200-nit reference but 2x an
@@ -165,7 +167,15 @@ float3 ToneMapSelectedCurve(float3 nits, float sdrNits)
     // linear while scaling Ct/Cp in PQ makes saturation depend on the gain, and
     // the gain depends on the anchor, so a moving anchor drained the colour.
     const float gGain = I_out / max(I_in, 1e-6);
-    const float3 ictcpNew = linear_to_ictcp(ictcp_to_linear(ictcp) * gGain);
+    float3 ictcpNew = linear_to_ictcp(ictcp_to_linear(ictcp) * gGain);
+    {
+        // Nonlinear chroma compensation (same guarded control as the Hable branch).
+        const float chExp = (abs(hableChromaExp) < 0.001f)
+                            ? 1.0f : clamp(hableChromaExp, -1.0f, 3.5f);
+        const float cr = pow(max(gGain, 1e-6), chExp - 1.0f);
+        ictcpNew.y *= cr;
+        ictcpNew.z *= cr;
+    }
 
     float3 mapped = ictcp_to_linear_gamut(ictcpNew, sdrNits);
     // Nits -> display-relative. The same arithmetic as the legacy floor step, which
@@ -385,11 +395,53 @@ float4 main(PS_INPUT input) : SV_Target
             const float I_newNits = I_rel * max(refNits, 1e-3);
             const float gGain = I_newNits / max(I_origNits, 1e-6);
 
-            // ictcp still holds the ORIGINAL I here (the curve result lives in
-            // I_rel / I_newNits), so ictcp_to_linear returns the original colour.
-            const float3 ictcpNew = linear_to_ictcp(ictcp_to_linear(ictcp) * gGain);
+            // Highlight saturation compensation (BT.2390 §7.2 saturation-preservation
+            // shape; libplacebo does the same to IPT's T/P in colorspace.c). The
+            // whole-color gain above preserves the source's chroma 1:1 through the
+            // map, so under compression the top of the range keeps MORE saturation
+            // than a reference that desaturates highlights — measured 2026-09-23 on
+            // Everest: our top-10% snow chroma (max−min ≈ 47) is 2× madVR's (≈ 23).
+            // Scaling chroma by an extra pow(gGain, γ−1) desaturates only where the
+            // map compresses: γ=1.0 is byte-identical to today, γ>1 pulls highlights
+            // toward neutral. DIRECTION PROBE — the exponent becomes a setting once
+            // the direction is confirmed on the bench.
+            float3 ictcpNew = linear_to_ictcp(ictcp_to_linear(ictcp) * gGain);
+            {
+                // Nonlinear chroma compensation (BT.2390-style). Allowed range -1..3.5:
+                //  >1 desaturates, 1 = none, <1 re-saturates (keeps colour
+                //  through the compression; -1 is the strongest pull-back).
+                //  Exactly 0 is the "none" sentinel (an undelivered value must
+                //  not act as an accidental boost).
+                const float chExp = (abs(hableChromaExp) < 0.001f)
+                                    ? 1.0f : clamp(hableChromaExp, -1.0f, 3.5f);
+                const float cr = pow(max(gGain, 1e-6), chExp - 1.0f);
+                ictcpNew.y *= cr;
+                ictcpNew.z *= cr;
+            }
 
             color.rgb = ictcp_to_linear_gamut(ictcpNew, refNits) / max(refNits, 1e-3);
+
+            // Highlight neutral roll (DIRECTION PROBE 2, 2026-09-23). Probes 1
+            // (headroom clip-gain) and 2 (chroma exponent) were BOTH measured
+            // no-ops: the Everest cast is in low-chroma warm grays — Ct/Cp near
+            // zero, nothing over the ceiling — so neither could act. The only
+            // lever that restores blue to an (R≈G>B) warm gray is pulling the
+            // head toward its own LUMA level-dependently: as the top of the
+            // range approaches the scene peak, the colour drains toward gray.
+            // This is the shape madVR's highlight treatment takes (its head
+            // lands on neutral white) and it matches the measured target: our
+            // top-10% mean (223,221,176) vs madVR (216,212,193); B needs +17,
+            // R/G −7 — exactly a pull toward Y of that band.
+            {
+                const float iTop = max(color.r, max(color.g, color.b));
+                const float w = smoothstep(0.55f, 0.85f, iTop);
+                const float Y = dot(color.rgb, float3(0.2126f, 0.7152f, 0.0722f));
+                // Verified 2026-09-23 on Everest vs madVR. The reference head is WARM
+                // (madVR highlight yellow-Δ = +20.6, B≈193), so strength 0.9 is the
+                // match (our Δ then 19.3 ≈ 20.6); 0.45 under-corrects (+32). Now a
+                // live cbuffer dial (hdr.highlightNeutral): 0 = off.
+                color.rgb = lerp(color.rgb, float3(Y, Y, Y), w * hableNeutralStrength);
+            }
         }
 
         // Output gamut. 0 = the standard SDR target: map BT.2020 content onto
@@ -408,6 +460,21 @@ float4 main(PS_INPUT input) : SV_Target
     // Linear to sRGB. Encoding stretches the shadow end, so the bottom of the
     // range is where a wrong floor shows up first — which is how the double-count
     // above was caught.
+
+    // Headroom fit onto the DISPLAY white, hue-preserving (VERIFIED on the bench
+    // 2026-09-23 as a warm-highlight cast): a warm pixel has R≈G>B, so at the top
+    // of the range red and green hit the 1.0 ceiling while blue is still rising —
+    // per-channel clipping then flattens R,G and the brightest whites tilt yellow
+    // (measured blue −17 in snow highlights vs madVR, identical at 85 and 400
+    // nits, identical in BT.709 and BT.2020, grade-inert). Scaling the whole
+    // colour so the max channel lands on 1.0 clips the WHITE first and keeps the
+    // blue — the top stays neutral, and only deep-highlight headroom is given up,
+    // which is the same trade madVR's peak-onto-white makes.
+    const float mTop = max(color.r, max(color.g, color.b));
+    if (mTop > 1.0f) {
+        color.rgb = color.rgb / mTop;
+    }
+
     color = saturate(color);
     color = pow(color, 1.0 / 2.2);
 

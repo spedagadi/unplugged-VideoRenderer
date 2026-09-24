@@ -260,6 +260,17 @@ struct Settings_t {
 	// libplacebo's SDR diffuse white is 203 — clouds at 150-200 nits are content
 	// under a 200-nit reference, but 2x-white under an 85-nit one.
 	float fHdrRefWhiteNits = 203.0f;
+	// Highlight neutral roll (0..1): pulls the top of the PQ->SDR output toward
+	// its own luma, level-dependently, so the head of the range lands near the
+	// source's neutral rather than carrying the source's warm grade at full
+	// strength (verified on Everest vs madVR 2026-09-23; 0.9 matched madVR's
+	// own warm head). 0 disables — byte-identical to before the feature.
+	float fHdrHighlightNeutral = 0.9f;
+	// User-configured chroma compensation exponent (STAGE 1: DELIVERY ONLY).
+	// The value is stored and reported (pipeline dump clE=) but NOT applied in
+	// any shader yet — the application lands in a later stage, once delivery is
+	// proven in the log. 1.0 = none (semantics for the future stage).
+	float fHdrChromaExp = 1.35f;
 	bool  bMLHighlightEnabled = true;
 	float fMLHighlight = 0.0f;   // manual highlight roll-off [-0.3, 0.4]
 	bool  bMLDebugCopy = false;  // grade steps use the plain copy shader (shader-vs-plumbing bisect)
@@ -381,6 +392,8 @@ struct Settings_t {
 		fSoftKneeRatio                  = 2.48f;
 		fSoftKneeWidth                  = 0.42f;
 		fHdrRefWhiteNits                = 203.0f;
+		fHdrHighlightNeutral             = 0.9f;
+		fHdrChromaExp                   = 1.35f;
 		bMLHighlightEnabled             = true;
 		fMLHighlight                    = 0.0f;
 		bMLDebugCopy                    = false;

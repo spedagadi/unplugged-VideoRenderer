@@ -110,6 +110,32 @@ protected:
 	CRect m_srcRect;
 	DXVA2_ExtendedFormat m_decExFmt = {};
 	DXVA2_ExtendedFormat m_srcExFmt = {};
+	// Content-side ST 2086 snapshot, display-independent. Maintained in
+	// CopySample from the decoded side data whenever a value is non-zero, and
+	// reported in the pipeline dump (cll=/fall=/mmax=/mmin=). Distinct from
+	// m_lastHdr10, which is only written when the swapchain is an HDR10
+	// DXGI_SWAP_CHAIN4 — on an SDR display that never happens and it stays
+	// zero, which silently blanked the panel's MaxCLL/Mastering rows
+	// (2026-09-23: sdata=7 proved the side data arrived; the dump read the
+	// display-applied copy instead of the stream copy). Plain ints on purpose:
+	// this base header must not pull DXGI HDR types.
+	UINT m_hdr10Cll  = 0;   // MaxContentLightLevel, cd/m²
+	UINT m_hdr10Fall = 0;   // MaxFrameAverageLightLevel, cd/m²
+	UINT m_hdr10Mmax = 0;   // MaxMasteringLuminance, cd/m²
+	UINT m_hdr10Mmin = 0;   // MinMasteringLuminance, 0.0001 cd/m² (DXGI_HDR_METADATA scale)
+	// RAW CLL blob as LAV delivered it (diagnostic): -1 = GUID absent, else the
+	// bytes/size exactly as read. Reported as rcll=/rfall=/cllsz= in the pipeline
+	// dump so a 0 MaxCLL row can be told apart from "LAV sent zeros", "read
+	// skipped (size mismatch)" and "GUID never arrived".
+	int m_rawCll = -1;
+	int m_rawFall = -1;
+	int m_rawCllSize = -1;
+	// Side-data presence probe (bitmap): which IMediaSideData GUIDs the decoded
+	// samples actually carry. bit0=IID_MediaSideDataHDR (static mastering),
+	// bit1=...HDRContentLightLevel (CLL), bit2=...HDR10Plus (RPU),
+	// bit3=...DOVIMetadataV2. Logged in the pipeline dump (sdata=N) so a blank
+	// MaxCLL/MaxFALL/Mastering row can be told apart from "decoder sent nothing".
+	int m_sideData = 0;
 	bool  m_bInterlaced = false;
 	REFERENCE_TIME m_rtAvgTimePerFrame = 0;
 
