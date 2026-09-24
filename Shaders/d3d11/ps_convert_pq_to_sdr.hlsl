@@ -169,10 +169,15 @@ float3 ToneMapSelectedCurve(float3 nits, float sdrNits)
     const float gGain = I_out / max(I_in, 1e-6);
     float3 ictcpNew = linear_to_ictcp(ictcp_to_linear(ictcp) * gGain);
     {
-        // Nonlinear chroma compensation (same guarded control as the Hable branch).
+        // Nonlinear chroma compensation (same guarded+gated control as Hable).
         const float chExp = (abs(hableChromaExp) < 0.001f)
                             ? 1.0f : clamp(hableChromaExp, -1.0f, 3.5f);
-        const float cr = pow(max(gGain, 1e-6), chExp - 1.0f);
+        float cr = pow(max(gGain, 1e-6), chExp - 1.0f);
+        if (cr > 1.0f) {
+            const float chroma0 = length(float2(ictcpNew.y, ictcpNew.z));
+            const float gate = smoothstep(0.02f, 0.14f, chroma0);
+            cr = 1.0f + (cr - 1.0f) * gate;
+        }
         ictcpNew.y *= cr;
         ictcpNew.z *= cr;
     }
@@ -407,14 +412,21 @@ float4 main(PS_INPUT input) : SV_Target
             // the direction is confirmed on the bench.
             float3 ictcpNew = linear_to_ictcp(ictcp_to_linear(ictcp) * gGain);
             {
-                // Nonlinear chroma compensation (BT.2390-style). Allowed range -1..3.5:
-                //  >1 desaturates, 1 = none, <1 re-saturates (keeps colour
-                //  through the compression; -1 is the strongest pull-back).
-                //  Exactly 0 is the "none" sentinel (an undelivered value must
-                //  not act as an accidental boost).
+                // Nonlinear chroma compensation (BT.2390-style). Allowed range
+                // -1..3.5: >1 desaturates, <1 re-saturates. The BOOST side
+                // (>1 ratio) is gated by the pixel's STARTING chroma so saturated
+                // colours get the full push while near-achromatic pixels (warm
+                // whites) get none — boosting cannot re-introduce the warm cast.
+                // Desat (ratio<1) is left ungated: near-neutral chroma is
+                // already ~0, so it is inert there anyway. 0-sentinel = none.
                 const float chExp = (abs(hableChromaExp) < 0.001f)
                                     ? 1.0f : clamp(hableChromaExp, -1.0f, 3.5f);
-                const float cr = pow(max(gGain, 1e-6), chExp - 1.0f);
+                float cr = pow(max(gGain, 1e-6), chExp - 1.0f);
+                if (cr > 1.0f) {
+                    const float chroma0 = length(float2(ictcpNew.y, ictcpNew.z));
+                    const float gate = smoothstep(0.02f, 0.14f, chroma0);
+                    cr = 1.0f + (cr - 1.0f) * gate;
+                }
                 ictcpNew.y *= cr;
                 ictcpNew.z *= cr;
             }
