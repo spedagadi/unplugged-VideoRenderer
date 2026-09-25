@@ -7409,9 +7409,13 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 
 	if (config.iSDRDisplayNits != m_iSDRDisplayNits) {
 		m_iSDRDisplayNits = config.iSDRDisplayNits;
-		if (SourceIsHDR()) {
-			changeLuminanceParams = true;
-		}
+		// ALWAYS re-push: sdrNits is the OUTPUT/DISPLAY scale — LuminanceScale in
+		// the converter cbuffer. The old `if (SourceIsHDR())` gate silently broke
+		// live drags on the file path, where m_decExFmt carries no colour info
+		// (flags=0 -> SourceIsHDR()==false) even though the picture IS an HDR
+		// convert: the value was stored and echoed back in logs while the frame
+		// never moved. (2026-09-25, live-drag report.)
+		changeLuminanceParams = true;
 		// SDR white is the experimental curve's OUTPUT WHITE, so the table itself
 		// is stale, not just the constant that scales it.
 		if (m_iExperimentalToneMapper != 0) {
