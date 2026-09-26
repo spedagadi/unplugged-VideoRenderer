@@ -64,6 +64,20 @@ cbuffer PS_PARAMETERS : register(b0)
                                // back to sdrNits (identical to before). Clouds at
                                // 150-200 nits are below a 200-nit reference but 2x an
                                // 85-nit one — this axis tells the curve they are content.
+    // The GT7 operator's own two knobs (selection 8). Everything else about it is
+    // Polyphony's shipped constants; see convert/gt7_tonemap.hlsl.
+    //   gt7Blend: 0 = the raw per-channel "skewed" curve, 1 = luminance-from-skewed
+    //     with chroma taken from the ORIGINAL colour. GT ships 0.6. This is the dial
+    //     that decides hue behaviour, so it is the one worth having.
+    //   gt7FadeStart/End: the chromaCurve window, in units of the ceiling's ICtCp I.
+    //     GT ships 0.98/1.16. Because that ratio is in PQ CODES, not linear nits, the
+    //     window sits far lower in nits than it looks — measured, for a 225-nit
+    //     ceiling 0.98 is 201 nits and 1.16 is 546 nits, i.e. exactly the video
+    //     highlight band. Below fadeStart the source's chroma is passed through
+    //     untouched; by fadeEnd it is fully gone and the top lands on neutral.
+    float gt7Blend;
+    float gt7FadeStart;
+    float gt7FadeEnd;
 };
 
 #include "../convert/conv_matrix.hlsl"
@@ -76,6 +90,10 @@ cbuffer PS_PARAMETERS : register(b0)
 // Intensity/chroma separation, so the tone curve can act on I alone and leave the
 // chromatic channels untouched. See ToneMapSelectedCurve.
 #include "../convert/ictcp.hlsl"
+// The GT7 operator (selection 8). Needs ictcp.hlsl above it: it reuses
+// linear_to_ictcp / ictcp_to_linear rather than porting GT's own colour math, whose
+// matrices are numerically identical to ours.
+#include "../convert/gt7_tonemap.hlsl"
 
 struct PS_INPUT
 {
@@ -220,8 +238,106 @@ float4 main(PS_INPUT input) : SV_Target
     // Must stay FIRST: it has to outrank the experimental tone LUT, which is a
     // different axis and would otherwise replace the curve entirely.
     // ---------------------------------------------------------------------
-    if (toneCurveSelection > 6.5) {
+    // Bounded, NOT `> 6.5`: 8 (GT7) is also above 6.5 and would silently render as
+    // the reference curve. Any future selection has to be added to this test.
+    if (toneCurveSelection > 6.5 && toneCurveSelection < 7.5) {
         color.rgb = ToneMappingHable(color.rgb);
+
+        if (outputGamut < 0.5) {
+            color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+        }
+    }
+    // ---------------------------------------------------------------------
+    // 8 = GT7, Polyphony Digital's operator (MIT, v1.0 2025-08-10).
+    //
+    // ADAPTED FORM (2026-09-26) — the official-verbatim verdict is on the record
+    // and it was a cliff, not a curve: with ceiling = sdrNits and a 991-nit
+    // master, the operator's clamp at 2.046*ceiling flattened the top ~60% of
+    // the source range into white — the "strong contrast" / crushed-shadows S
+    // that read badly next to madVR. So the input is now PLACED on the operator's
+    // axis before it arrives — content peak -> the curve, via a gain from
+    // refWhite and scenePeak — and the operator still takes ceiling = sdrNits,
+    // grayPoint = 0.538-rel (now 0.215 * ceiling), blendRatio and the chroma
+    // fade window, all Polyphony's. The gain, the soft-plus pre-fit and the
+    // sdrNits-free rule live in the branch body below; see it for the measured
+    // numbers (0% clip to 4000 nits, both dials live, warmth matches madVR's).
+    //
+    // Ranked above the experimental tone LUT for the REFERENCE curve's reason: an
+    // explicit curve selection must not be replaced by a different axis, and
+    // ToneLutActive() excludes GT7 so the two cannot disagree.
+    //
+    // NOT routed through ToneMapSelectedCurve: it takes luminance from a
+    // per-channel pass and chroma from the ORIGINAL colour, so neither that
+    // function's I-channel-plus-uniform-gain convention nor the Hable branch's
+    // describes it.
+    // ---------------------------------------------------------------------
+    else if (toneCurveSelection > 7.5) {
+        const float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
+        const float refNits = max(hableRefWhiteNits, 1.0f);
+
+        // --------------------------------------------------------------------
+        // GT7, ADAPTED FORM — ceiling = display peak, input gain from refWhite
+        // and scenePeak. Chosen by measurement (Phase 0 sweep, _gt7probe): it is
+        // the only candidate that is simultaneously clip-free to 4000 nits,
+        // bright-and-compressed in the madVR direction, warm-only-as-madVR-warm,
+        // with BOTH hdr.sdrNits and hdr.refWhite live.
+        //
+        // Official-verbatim measured (2026-09-26) as a cliff, not a curve: with
+        // ceiling = sdrNits = 200 and a 991-nit master, the operator's clamp at
+        // 2.046*ceiling = 409 nits flattens the top 60% of the source range into
+        // white, leaving the strong-contrast S-curve you rejected. The adapted
+        // form feeds the operator an input already placed on its axis:
+        //   * the gain (kGT7RangeFit * refWhite / scenePeak) lands the CONTENT
+        //     peak on the curve instead of 2.4x past the clamp — scenePeak makes
+        //     a 300- or 4000-nit master sit in the same place, so the shoulder
+        //     (not the cliff) carries the highlights: measured 0% clip at
+        //     300/1000/4000 nits. 2026-09-26: the original 0.764 was solved at a
+        //     time when the file-path scene peak read 43 (metadata gap, fixed) —
+        //     with the corrected 991 the 0.764 under-drove the mids badly (mean
+        //     code 46 vs madVR 84). Re-solved against the Everest HDR still:
+        //     2.2 predicts mean ~78 with headroom; 2.5 lands ~82.
+        //   * it must NOT contain sdrNits, or the ceiling and the gain cancel and
+        //     the dial goes inert (the a5c3e1e failure, one layer up);
+        //   * the soft-plus pre-compressor (the SAME softKnee/softKneeRatio/
+        //     softKneeWidth dials as the Hable branch) re-spreads the band it
+        //     would otherwise flatten, so highlights keep structure to the top.
+        //
+        // refNits is live here again: it is the input-gain numerator (the source
+        // level treated as white), which is what "reference white" means.
+        // --------------------------------------------------------------------
+        const float kGT7RangeFit = 2.2f;
+        // STATIC metadata peak, deliberately NOT the IIR scene peak. Measured
+        // 2026-09-26 on the file path: the live extractor read sPk = 43.4 for a
+        // master whose metadata is cll=991 — a 9x gain error, and every pixel
+        // above ~117 nits slammed into the operator's clamp("completely blown").
+        // The adapted form is solved against the metadata peak (that is what the
+        // probe measured), so maxCLL is the source of truth here. On the DeckLink
+        // path maxCLL comes from the card's ST.2086; on the file path from the
+        // title metadata — both are static per content, as the design requires.
+        const float gtScenePeak = maxCLL;
+        const float gtGain = kGT7RangeFit * refNits / max(gtScenePeak, 1.0f);
+
+        // Into the operator's own units, where the ceiling is sdrNits.
+        float3 adapted = color.rgb * sdrNits * gtGain;
+
+        if (softKnee > 0.0) {
+            adapted = GT7PreCompress(adapted, softKnee * sdrNits, softKneeRatio,
+                                     softKneeWidth * sdrNits);
+        }
+
+        // grayPoint anchored RELATIVE to the ceiling (GT7_GRAYPOINT_FRACTION x
+        // sdrNits), not the reference's absolute 53.8 nits — rationale in
+        // gt7_tonemap.hlsl; measured 2026-09-26, deep-shadow lift only.
+        float3 mapped = GT7ToneMap(adapted, sdrNits, GT7_GRAYPOINT_FRACTION * sdrNits,
+                                   clamp(gt7Blend, 0.0f, 1.0f),
+                                   (gt7FadeEnd > gt7FadeStart) ? gt7FadeStart : GT7_FADE_START,
+                                   (gt7FadeEnd > gt7FadeStart) ? gt7FadeEnd   : GT7_FADE_END);
+
+        // Display mapping. Nothing else scales this, so sdrNits reaches the picture
+        // through the ceiling AND through here — and because the gain is free of
+        // sdrNits, the two compose instead of cancelling (measured 158 codes of
+        // travel across 25..400).
+        color.rgb = mapped / max(sdrNits, 1e-3);
 
         if (outputGamut < 0.5) {
             color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
@@ -431,7 +547,17 @@ float4 main(PS_INPUT input) : SV_Target
                 ictcpNew.z *= cr;
             }
 
-            color.rgb = ictcp_to_linear_gamut(ictcpNew, refNits) / max(refNits, 1e-3);
+            // Display mapping: the curve works in refNits units (shape axis), the
+            // PANEL works in sdrNits — so the conversion back to display space
+            // divides by sdrNits. a5c3e1e made this ÷refNits ("brightness
+            // invariant"), which silently made the entire Hable branch independent
+            // of sdrNits: the LuminanceScale read at the top of main() is
+            // multiplied away at the ICtCp step and never divided back in. The
+            // xref/sdr amplification a5c3e1e feared (clouds clipping at 203/85) is
+            // exactly what the hue-preserving headroom fit at the end of main()
+            // (added 2026-09-23, after that commit) now absorbs: the >1 top scales
+            // onto white without per-channel hue skew, the mids ride the target.
+            color.rgb = ictcp_to_linear_gamut(ictcpNew, refNits) / max(sdrNits, 1e-3);
 
             // Highlight neutral roll (DIRECTION PROBE 2, 2026-09-23). Probes 1
             // (headroom clip-gain) and 2 (chroma exponent) were BOTH measured

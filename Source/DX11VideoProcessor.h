@@ -106,6 +106,18 @@ private:
 	CComPtr<ID3D11PixelShader> m_pPSCorrection;
 	const wchar_t* m_strCorrection = nullptr;
 
+	// [CBPROBE] sdrNits live-re-push investigation. The [SHADER-CB] log proves the
+	// CPU wrote new constants into m_pCorrectionConstants; the user says the picture
+	// does not change. The only way those two facts coexist is if the ACTIVE
+	// correction draw reads a DIFFERENT buffer than the one being updated (or the
+	// draw does not run). So: on every settings push arm a few frames, and on those
+	// frames read back what b0 the live draw actually had bound — pointer identity
+	// plus the float values (via a staging copy; DEFAULT buffers cannot be Map'd).
+	// No [CBPROBE] line after arming = the draw site never ran. That is also an answer.
+	CComPtr<ID3D11Buffer> m_pCbProbeStaging;
+	LONG m_iCbProbeTicks = 0;
+	UINT64 m_uCorrectionDraws = 0; // liveness: [CBPROBE] alive line every 300 draws
+
 	// Experimental tone mapping (libplacebo port — see namespace exptm in the .cpp).
 	// A 1D tone curve built on the CPU from the same per-frame scene statistics the
 	// Zion grade already extracts, sampled by the converter instead of evaluating a
@@ -472,6 +484,11 @@ private:
 	// STAGE 1 (delivery only): configured chroma compensation exponent. Stored +
 	// reported as clE= in the pipeline dump; NOT applied in any shader yet.
 	float m_fHdrChromaExp = 1.35f;
+	// GT7 operator (TONE_CURVE_GT7). Defaults are Polyphony's own; see
+	// Shaders/convert/gt7_tonemap.hlsl for what each one does to the picture.
+	float m_fHdrGt7Blend     = 0.6f;
+	float m_fHdrGt7FadeStart = 0.98f;
+	float m_fHdrGt7FadeEnd   = 1.16f;
 	float m_HableScenePeakApplied = -1.0f;  // value last pushed to the cbuffer
 
 	// The gamma top-up actually added on top of the model's prediction this frame
@@ -704,11 +721,14 @@ private:
 	bool MLInputIsPq() const;
 
 	bool ToneLutActive() const {
-		// The REFERENCE curve outranks the experimental mapper in the shader, so
-		// the LUT must not be built (or uploaded, or flagged in the cbuffer) while
-		// it is selected — otherwise the shader and this predicate disagree about
-		// which branch is live, and the "toneMap: active=" readout lies.
+		// The REFERENCE and GT7 curves outrank the experimental mapper in the shader,
+		// so the LUT must not be built (or uploaded, or flagged in the cbuffer) while
+		// either is selected — otherwise the shader and this predicate disagree about
+		// which branch is live, and the "toneMap: active=" readout lies. GT7 was added
+		// to this test for the same reason REFERENCE was: an explicit curve selection
+		// must not be silently replaced by a different axis.
 		return m_iHdrLocalToneMappingType != TONE_CURVE_REFERENCE
+			&& m_iHdrLocalToneMappingType != TONE_CURVE_GT7
 			&& m_iExperimentalToneMapper != 0 && m_bToneLutReady && m_pToneLutSRV != nullptr;
 	}
 

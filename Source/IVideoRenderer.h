@@ -102,6 +102,15 @@ enum :int {
 	TONE_CURVE_BT2390    = 5,
 	TONE_CURVE_ST2094_10 = 6,
 	TONE_CURVE_REFERENCE = 7,
+	// 8 = the GT7 operator (Polyphony Digital, MIT, v1.0 2025-08-10). A game
+	// tonemapper: a display-referred ~2:1 limiter that takes luminance from a
+	// per-channel pass and chroma from the ORIGINAL colour, fading it out over the
+	// highlight band. It is the curve that desaturates a warm head instead of
+	// carrying the source's grade to full strength the way the I-channel + uniform
+	// gain paths do. Its own branch in ps_convert_pq_to_sdr.hlsl (it shares no
+	// convention with the curves above), and its parameters come from
+	// fHdrGt7Blend / fHdrGt7FadeStart / fHdrGt7FadeEnd rather than the Hable ones.
+	TONE_CURVE_GT7       = 8,
 };
 
 #define SDR_NITS_DEF 50
@@ -320,6 +329,26 @@ struct Settings_t {
 	// diagnostic: monotonic config-change counter shared by s3_shell and MPCVR
 	uint32_t configSeq = 0;
 
+	// --- GT7 operator (TONE_CURVE_GT7) -------------------------------------
+	// APPENDED, not inserted next to the other hdr fields: Settings_t crosses a
+	// binary boundary (the engine links against this header and QIs the registered
+	// .ax), so inserting would silently shift every later field against a stale
+	// filter. sizeof(Settings_t) is logged on push for exactly that reason.
+	//
+	// Only the operator's two behaviour knobs are exposed. Its curve constants
+	// (alpha .25, grayPoint .538, linearSection .444, toeStrength 1.28) are what
+	// make it GT7 and stay fixed; see Shaders/convert/gt7_tonemap.hlsl.
+	//   Blend: 0 = the raw per-channel "skewed" curve, 1 = luminance from that pass
+	//   with chroma taken from the original colour. GT ships 0.6. This is the dial
+	//   that decides hue behaviour — toward 0 de-warms harder, toward 1 preserves
+	//   the source's chroma exactly (and with it the warm cast).
+	float fHdrGt7Blend      = 0.6f;
+	//   The chromaCurve window, in units of the ceiling's ICtCp I. GT ships
+	//   0.98/1.16. The ratio is in PQ CODES, so at a 225-nit ceiling that window is
+	//   ~201..546 nits — the video highlight band, not the top 2% it reads as.
+	float fHdrGt7FadeStart  = 0.98f;
+	float fHdrGt7FadeEnd    = 1.16f;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -433,6 +462,9 @@ struct Settings_t {
 		bMLBars                         = true;
 		bMLBarsHighlight                = false;
 		configSeq                       = 0;
+		fHdrGt7Blend                    = 0.6f;
+		fHdrGt7FadeStart                = 0.98f;
+		fHdrGt7FadeEnd                  = 1.16f;
 	}
 };
 

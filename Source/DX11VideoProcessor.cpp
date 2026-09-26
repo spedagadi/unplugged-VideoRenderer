@@ -1426,18 +1426,20 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 	// [19] padding — cbuffers must stay 16-byte aligned
 	// [19] the Hable curve's 1.0 in nits (decoupled reference white).
 		// [20] the nonlinear chroma compensation exponent (hableChromaExp).
-		// [21..23] pad — cbuffer ByteWidth MUST be a multiple of 16 bytes
-		// (84 vs 96 is the difference between a valid and a FAILED CreateBuffer —
-		// observed as a black picture whenever the buffer grew to 21 floats).
+		// [21..23] the GT7 operator's blend + chroma-fade window (selection 8).
+		// cbuffer ByteWidth MUST stay a multiple of 16 bytes (84 vs 96 is the
+		// difference between a valid and a FAILED CreateBuffer — observed as a black
+		// picture whenever the buffer grew to 21 floats). 24 floats = 96 bytes and
+		// the three pad slots are now used, so the next field takes this to 28.
 		FLOAT cbuffer[24] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
 	                     (float)m_iOutputGamut,
 	                     ToneLutActive() ? 1.0f : 0.0f,
 	                     m_ToneLutKey.pqMin, m_ToneLutKey.pqMax,
 	                     (float)kToneLutSize, 0,
-	                     // 7 = the upstream REFERENCE curve. The clamp's upper bound
-	                     // must cover it or discard() quietly rewrites it to 3
-	                     // (Hable), i.e. the row would do nothing.
-	                     (float)discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_REFERENCE),
+	                     // 7 = the upstream REFERENCE curve, 8 = GT7. The clamp's upper
+	                     // bound must cover BOTH or discard() quietly rewrites the
+	                     // selection to 3 (Hable), i.e. the row would do nothing.
+	                     (float)discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_GT7),
 	                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 	// The metadata, guarded exactly as SetHDR10ShaderParams guards it.
@@ -1447,11 +1449,28 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// the card's ST.2086 frame metadata is unsupported on HDMI and the values
 		// arrive as media SIDE data, which a captured frame does not carry — so
 		// m_lastHdr10 stays zeroed and the control is what the curves actually get.
+		//
+		// FILE content has the opposite problem, measured 2026-09-26: on an SDR
+		// display m_lastHdr10 is NEVER written (it only lands when an HDR10 swapchain
+		// is live — see the side-data snapshot comment ~line 5025), yet the sample's
+		// metadata DOES arrive and is snapshotted into the display-independent
+		// m_hdr10Cll/Fall/Mmax/Mmin (the very numbers the pipeline echo prints as
+		// rcll=991 etc). The code below used to fall straight to
+		// m_lastHdr10(=0) -> titlePeak(=100), so GT7's adapted gain divided by 100
+		// instead of 991 and "every source pixel above ~101 nits hit the clamp" —
+		// the blown picture persisted no matter what the dials said.
 		const float titlePeak = std::clamp(m_fHdrTitlePeakNits, 100.0f, 4000.0f);
-		float mMin = (float)m_lastHdr10.hdr10.MinMasteringLuminance;
-		float mMax = (float)m_lastHdr10.hdr10.MaxMasteringLuminance;
-		float cll  = (float)m_lastHdr10.hdr10.MaxContentLightLevel;
-		float fall = (float)m_lastHdr10.hdr10.MaxFrameAverageLightLevel;
+		// Display-independent snapshots first; m_lastHdr10 next (an HDR10 swapchain
+		// that is actually live); titlePeak last. m_hdr10Cll etc are only written
+		// when the sample carries the field, so zero means "absent" unambiguously.
+		const UINT cll_  = m_hdr10Cll  ? m_hdr10Cll  : m_lastHdr10.hdr10.MaxContentLightLevel;
+		const UINT fall_ = m_hdr10Fall ? m_hdr10Fall : m_lastHdr10.hdr10.MaxFrameAverageLightLevel;
+		const UINT mmax_ = m_hdr10Mmax ? m_hdr10Mmax : m_lastHdr10.hdr10.MaxMasteringLuminance;
+		const UINT mmin_ = m_hdr10Mmin ? m_hdr10Mmin : m_lastHdr10.hdr10.MinMasteringLuminance;
+		float mMin = (float)mmin_;
+		float mMax = (float)mmax_;
+		float cll  = (float)cll_;
+		float fall = (float)fall_;
 		if (mMin <= 0.0f)  mMin = 0.0f;
 		if (mMax <= 10.0f) mMax = titlePeak;
 		if (cll <= 10.0f)  cll = mMax;
@@ -1504,10 +1523,34 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		cbuffer[19] = m_fHdrRefWhiteNits;
 		// [20] the nonlinear chroma compensation exponent (1.0 = none).
 		cbuffer[20] = m_fHdrChromaExp;
+
+		// [21..23] the GT7 operator's two knobs (selection 8). These were the three
+		// pad slots, so the buffer is STILL 24 floats / 96 bytes — no growth, and no
+		// repeat of the 21-float (84-byte) CreateBuffer failure that produced a black
+		// picture with nothing on screen to explain it. The NEXT field added here has
+		// to take the array to 28, never 25/26/27.
+		cbuffer[21] = m_fHdrGt7Blend;
+		cbuffer[22] = m_fHdrGt7FadeStart;
+		cbuffer[23] = m_fHdrGt7FadeEnd;
 	}
 
 	if (m_pCorrectionConstants) {
+		// Live proof the ACTIVE converter's constants are being rewritten: the
+		// constant buffer contents follow every settings push (not per-frame).
+		// curve= and gtB= are here so "I selected GT7 and nothing changed" is
+		// answerable from one line: the clamped selection that reached the buffer,
+		// not the one the UI asked for.
+		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} refW={:.1f} sPk={:.1f}",
+			(uintptr_t)m_pCorrectionConstants.p, 10000.0f / m_iSDRDisplayNits, m_iSDRDisplayNits,
+			m_fHdrHighlightNeutral, m_fHdrChromaExp,
+			discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_GT7),
+			m_fHdrGt7Blend,
+			m_fHdrRefWhiteNits, m_HableScenePeakNits);
 		m_pDeviceContext->UpdateSubresource(m_pCorrectionConstants, 0, nullptr, &cbuffer, 0, 0);
+		// Arm the read-back: the next few correction draws report the buffer they
+		// ACTUALLY had bound at b0 and its float values. [CBPROBE] absent after this
+		// line = the correction draw is not running at all.
+		InterlockedExchange(&m_iCbProbeTicks, 5);
 	}
 	else {
 		D3D11_BUFFER_DESC BufferDesc = {
@@ -6428,6 +6471,77 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				ID3D11ShaderResourceView* none[1] = {};
 				m_pDeviceContext->PSSetShaderResources(1, 1, none);
 			}
+
+			// [CBPROBE] read-back, armed by every [SHADER-CB] push. Nothing rebound
+			// b0 between the draw above and this query, so this is the state the
+			// correction pixel shader drew with.
+			if (++m_uCorrectionDraws % 300 == 1) {
+				DLog(L"renderer: [CBPROBE] alive: correction draw #{} (raw-passthrough={})",
+					m_uCorrectionDraws, m_bHDRPassthroughRaw ? 1 : 0);
+			}
+			if (InterlockedCompareExchange(&m_iCbProbeTicks, 0, 0) > 0) {
+				InterlockedDecrement(&m_iCbProbeTicks);
+				ID3D11Buffer* pBound = nullptr;
+				m_pDeviceContext->PSGetConstantBuffers(0, 1, &pBound);
+				const bool bSame = pBound == (ID3D11Buffer*)m_pCorrectionConstants;
+				float f0 = 0, f18 = 0, f20 = 0, f8 = 0, f21 = 0, f19 = 0, f13 = 0, f9 = 0, f15 = 0;
+				D3D11_BUFFER_DESC bd = {};
+				if (pBound) {
+					pBound->GetDesc(&bd);
+				}
+				// Failure codes are LOGGED, never silent: a zero read without a
+				// failed hr below means the GPU buffer really holds zero.
+				HRESULT hrStage = S_OK, hrMap = 0x1337C0DE; // sentinel: map never attempted
+				if (pBound && bd.ByteWidth >= sizeof(FLOAT) * 24) {
+					if (!m_pCbProbeStaging) {
+						const D3D11_BUFFER_DESC sd = {
+							.ByteWidth        = sizeof(FLOAT) * 24,
+							.Usage            = D3D11_USAGE_STAGING,
+							.BindFlags        = 0,
+							.CPUAccessFlags   = D3D11_CPU_ACCESS_READ,
+							.MiscFlags        = 0,
+							.StructureByteStride = 0,
+						};
+						hrStage = m_pDevice->CreateBuffer(&sd, nullptr, &m_pCbProbeStaging);
+						if (FAILED(hrStage)) {
+							m_pCbProbeStaging = nullptr;
+						}
+					}
+					if (m_pCbProbeStaging) {
+						m_pDeviceContext->CopyResource(m_pCbProbeStaging, pBound);
+						D3D11_MAPPED_SUBRESOURCE ms = {};
+						hrMap = m_pDeviceContext->Map(m_pCbProbeStaging, 0, D3D11_MAP_READ, 0, &ms);
+						if (SUCCEEDED(hrMap)) {
+							const float* pf = (const float*)ms.pData;
+							f0 = pf[0]; f18 = pf[18]; f20 = pf[20];
+							// [8] the curve selection and [21] the GT7 blend, read back
+							// from the buffer the draw actually had bound: this is what
+							// proves "GT7 ran" rather than "GT7 was asked for".
+							f8 = pf[8]; f21 = pf[21];
+							// [19] refWhite and [13] the scene peak — the two inputs to
+							// the GT7 adapted gain. If the picture is "blown" the first
+							// suspect is one of these being a value we did not intend:
+							// refWhite=0 (silent, fallback to 1.0) or sPk<=10 (silent,
+							// fallback to maxCLL) would both change the gain ~10x.
+							f19 = pf[19]; f13 = pf[13];
+							// [9] the maxCLL the shader actually divides by, and [15] the
+							// softKnee pre-compressor gate. The GT7 branch now reads slot
+							// 9 directly as its scene peak; on the file path m_lastHdr10
+							// may not populate, and the CPU falls back (<=10 -> mMax ->
+							// <=10 -> titlePeak clamped to as low as 100) — which would
+							// make cbuffer[9] ~100 instead of 991 and blow the gain 10x.
+							f9 = pf[9]; f15 = pf[15];
+							m_pDeviceContext->Unmap(m_pCbProbeStaging, 0);
+						}
+					}
+				}
+				DLog(L"renderer: [CBPROBE] correction draw: bound=0x{:x} updated=0x{:x} same={} b0size={} b0usage={} stageHr={:x} mapHr={:x} LuminanceScale read={:.4f} expect={:.4f} hlN read={:.2f} clE read={:.4f} curve read={:.0f} gtB read={:.2f} refW read={:.1f} sPk read={:.1f} mCLL read={:.1f} knee read={:.2f}",
+					(uintptr_t)pBound, (uintptr_t)(ID3D11Buffer*)m_pCorrectionConstants, bSame ? 1 : 0, bd.ByteWidth, (int)bd.Usage,
+					(UINT)hrStage, (UINT)hrMap, f0, 10000.0f / m_iSDRDisplayNits, f18, f20, f8, f21, f19, f13, f9, f15);
+				if (pBound) {
+					pBound->Release();
+				}
+			}
 		}
 
 		if (m_pPSHDR10ToneMapping) {
@@ -7235,18 +7349,36 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 
 	if (config.bHdrLocalToneMapping != m_bHdrLocalToneMapping ||
 			config.iHdrLocalToneMappingType != m_iHdrLocalToneMappingType) {
-		const bool bCurveChanged = config.iHdrLocalToneMappingType != m_iHdrLocalToneMappingType;
+		const bool bEnableChanged = config.bHdrLocalToneMapping != m_bHdrLocalToneMapping;
+		const bool bCurveChanged  = config.iHdrLocalToneMappingType != m_iHdrLocalToneMappingType;
 		m_bHdrLocalToneMapping = config.bHdrLocalToneMapping;
 		m_iHdrLocalToneMappingType = config.iHdrLocalToneMappingType;
-		changeHDR = true;
-		// The PQ->SDR converter's constant buffer carries the curve selection now,
-		// so a change has to re-push it. Without this the "Tone curve" row would
-		// still do nothing live on an SDR display — the same class of bug as the
-		// selection being read only by a shader that never gets built.
+
+		// changeHDR belongs to the ENABLE toggle only — and the split matters more
+		// than it looks, for two reasons.
 		//
-		// changeHDR alone is not enough: it drives the HDR-output machinery, which
-		// is dormant here.
-		if (bCurveChanged) {
+		// 1. changeHDR is expensive and dangerous on an HDR source: it reaches
+		//    ReleaseSwapChain() + m_pFilter->Init(true) + InitMediaType() (see the
+		//    `if (changeHDR)` block ~line 7676). That is the exact teardown the
+		//    bHDRPassthroughRaw comment below records as a hard fault — and the
+		//    diagnosis there was that the FAULT LAY IN THE TEARDOWN, not in the
+		//    setting. Dragging a curve row should not rebuild the graph.
+		// 2. It also made the live path dead code. That block `return`s, and
+		//    changeLuminanceParams is not consumed until ~7735, so the flag set here
+		//    was DISCARDED and the new selection only landed as a side effect of
+		//    InitMediaType re-creating everything.
+		//
+		// Nothing about the SELECTION needs a rebuild. Verified against every read of
+		// m_iHdrLocalToneMappingType: it is cbuffer[8] on the PQ->SDR path, an argument
+		// to SetHDR10ShaderParams() re-read per frame on the HDR-output path (which
+		// creates that shader lazily), a stats/OSD string, and the ToneLutActive()
+		// predicate. The two sites that CREATE the HDR10 tone-map shader gate on
+		// m_bHdrLocalToneMapping, never on the type — which is why the enable toggle
+		// keeps changeHDR and the type does not.
+		if (bEnableChanged) {
+			changeHDR = true;
+		}
+		if (bCurveChanged || bEnableChanged) {
 			changeLuminanceParams = true;
 		}
 	}
@@ -7348,6 +7480,24 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		changeLuminanceParams = true;
 	}
 
+	// GT7 operator knobs — cbuffer[21..23], live re-push like the two above, so a
+	// drag on the rail changes the picture without a curve rebuild or a graph op.
+	// The fade window is validated as a PAIR: an inverted or degenerate window would
+	// make smoothstep return garbage, and the shader falls back to Polyphony's
+	// 0.98/1.16 when it sees one.
+	if (config.fHdrGt7Blend != m_fHdrGt7Blend) {
+		m_fHdrGt7Blend = std::clamp(config.fHdrGt7Blend, 0.0f, 1.0f);
+		changeLuminanceParams = true;
+	}
+	if (config.fHdrGt7FadeStart != m_fHdrGt7FadeStart) {
+		m_fHdrGt7FadeStart = std::clamp(config.fHdrGt7FadeStart, 0.05f, 3.0f);
+		changeLuminanceParams = true;
+	}
+	if (config.fHdrGt7FadeEnd != m_fHdrGt7FadeEnd) {
+		m_fHdrGt7FadeEnd = std::clamp(config.fHdrGt7FadeEnd, 0.05f, 4.0f);
+		changeLuminanceParams = true;
+	}
+
 	if (config.iExperimentalToneMapper != m_iExperimentalToneMapper) {
 		m_iExperimentalToneMapper = config.iExperimentalToneMapper;
 		// Also covers switching back to Off: ToneLutActive() goes false, the next
@@ -7408,6 +7558,8 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	}
 
 	if (config.iSDRDisplayNits != m_iSDRDisplayNits) {
+		DLog(L"renderer: [SDR] display nits {} -> {}  converting={}  (live re-push)",
+			m_iSDRDisplayNits, config.iSDRDisplayNits, config.bConvertToSdr ? 1 : 0);
 		m_iSDRDisplayNits = config.iSDRDisplayNits;
 		// ALWAYS re-push: sdrNits is the OUTPUT/DISPLAY scale — LuminanceScale in
 		// the converter cbuffer. The old `if (SourceIsHDR())` gate silently broke
