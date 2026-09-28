@@ -78,6 +78,10 @@ cbuffer PS_PARAMETERS : register(b0)
     float gt7Blend;
     float gt7FadeStart;
     float gt7FadeEnd;
+    // GT7 Adapt (selection 10): weight of the MEASURED scene peak in the peak this
+    // curve maps FROM. 0 = plain GT7 (metadata peak alone), 1 = scene peak alone.
+    // cbuffer[24] — see the 16-byte alignment note in DX11VideoProcessor.cpp.
+    float gt7Adapt;
 };
 
 #include "../convert/conv_matrix.hlsl"
@@ -271,7 +275,12 @@ float4 main(PS_INPUT input) : SV_Target
     // function's I-channel-plus-uniform-gain convention nor the Hable branch's
     // describes it.
     // ---------------------------------------------------------------------
-    else if (toneCurveSelection > 7.5) {
+    // Bounded on BOTH sides, and now on both values: 8 = GT7, 10 = GT7 Adapt (this
+    // branch, one different input — see gtScenePeak below). 9 (SPLINE) is also above
+    // 7.5 and must fall through to the experimental-LUT branch, not be rendered as
+    // GT7, which is why the old test could not simply become `> 7.5`.
+    else if ((toneCurveSelection > 7.5 && toneCurveSelection < 8.5)
+          || (toneCurveSelection > 9.5 && toneCurveSelection < 10.5)) {
         const float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
         const float refNits = max(hableRefWhiteNits, 1.0f);
 
@@ -314,14 +323,41 @@ float4 main(PS_INPUT input) : SV_Target
         // probe measured), so maxCLL is the source of truth here. On the DeckLink
         // path maxCLL comes from the card's ST.2086; on the file path from the
         // title metadata — both are static per content, as the design requires.
-        const float gtScenePeak = maxCLL;
+        // GT7 ADAPT (selection 10) is the deliberate exception to the above, for the
+        // case the paragraph describes but cannot solve: a path that carries NO
+        // usable peak (cll=0, no mastering display, a Title peak that is a guess).
+        // There the choice is not "metadata vs measurement" — it is "a wrong static
+        // number vs a partly-right measured one", and a blend is the safe form of
+        // that. It is a blend and not a switch because the failure is asymmetric:
+        // a peak too LOW slams the top into the clamp (the sPk=43 disaster above),
+        // while one too HIGH costs only a little exposure. At the default w=0.25 a
+        // 9x extractor error moves the anchor 25% of the way, not 100%.
+        //
+        // The timing comes free from hableScenePeakNits: it is already IIR-smoothed
+        // with a snap on scene cuts, so this tracks AT a cut, in one frame, and
+        // holds inside a scene. Continuous tracking would be auto-gain — which is
+        // precisely what the paragraph above is written against.
+        float gtScenePeak = maxCLL;
+        if (toneCurveSelection > 9.5 && hableScenePeakNits > 0.0) {
+            gtScenePeak = lerp(maxCLL, hableScenePeakNits, saturate(gt7Adapt));
+        }
         const float gtGain = kGT7RangeFit * refNits / max(gtScenePeak, 1.0f);
 
         // Into the operator's own units, where the ceiling is sdrNits.
         float3 adapted = color.rgb * sdrNits * gtGain;
 
         if (softKnee > 0.0) {
-            adapted = GT7PreCompress(adapted, softKnee * sdrNits, softKneeRatio,
+            // Detail-preserving (same idea as the Hable branch): compress a local
+            // base (4-tap diagonal average, linear, in the operator's units) and
+            // keep the per-pixel residual, so a low knee + ratio>1 re-spreads the
+            // highlight band without flattening mid-tone texture into 8-bit patches.
+            const float2 bd = 0.0025;
+            float3 base = ST2084ToLinear(tex.Sample(samp, input.Tex + float2( bd.x,  bd.y)), LuminanceScale).rgb
+                        + ST2084ToLinear(tex.Sample(samp, input.Tex + float2(-bd.x,  bd.y)), LuminanceScale).rgb
+                        + ST2084ToLinear(tex.Sample(samp, input.Tex + float2( bd.x, -bd.y)), LuminanceScale).rgb
+                        + ST2084ToLinear(tex.Sample(samp, input.Tex + float2(-bd.x, -bd.y)), LuminanceScale).rgb;
+            base = base * 0.25 * sdrNits * gtGain;
+            adapted = GT7PreCompress(adapted, base, softKnee * sdrNits, softKneeRatio,
                                      softKneeWidth * sdrNits);
         }
 
@@ -467,12 +503,43 @@ float4 main(PS_INPUT input) : SV_Target
             // The normaliser below still uses the UNCOMPRESSED content peak, so the
             // compressed top rides lower on the Hable input and the sky keeps headroom.
             // Overflow-safe softplus: sp(t) = max(t,0) + log(1 + exp(-|t|)).
+            //
+            // DETAIL-PRESERVING (2026-09-27). The plain pointwise form scales local
+            // luminance texture by ~1/ratio across the WHOLE above-knee band. At the
+            // low knee this needs (0.21 — the value that keeps ultra-bright DV skies
+            // from clipping), that band is most of the image, and on an 8-bit output
+            // the shrunken texture rounds to flat patches: the "oil-painting"
+            // background. So compress a LOCAL BASE (the tone) and hand the per-pixel
+            // residual (the texture) back at full amplitude — the sky still gets its
+            // headroom, the foliage keeps its detail. Base = a 4-tap diagonal average
+            // of linear luma in I_rel units; the residual carries everything the base
+            // smoothed away, including the I-vs-luma offset at the centre pixel.
             float3 hvP = hv;
             if (softKnee > 0.0) {
-                const float t  = (hv.x - softKnee) / max(softKneeWidth, 1e-3);
-                const float sp = max(t, 0.0) + log(1.0 + exp(-abs(t)));
+                const float2 bd = 0.0025;   // base radius in UV (~a few px at 4K)
+                const float3 lumaW = float3(0.2627, 0.6780, 0.0593);  // BT.2020 luma
+                float base = dot(ST2084ToLinear(tex.Sample(samp, input.Tex + float2( bd.x,  bd.y)), LuminanceScale).rgb, lumaW)
+                           + dot(ST2084ToLinear(tex.Sample(samp, input.Tex + float2(-bd.x,  bd.y)), LuminanceScale).rgb, lumaW)
+                           + dot(ST2084ToLinear(tex.Sample(samp, input.Tex + float2( bd.x, -bd.y)), LuminanceScale).rgb, lumaW)
+                           + dot(ST2084ToLinear(tex.Sample(samp, input.Tex + float2(-bd.x, -bd.y)), LuminanceScale).rgb, lumaW);
+                base = base * 0.25 / max(refNits, 1e-3);
+                const float det  = I_rel - base;
+                const float t    = (base - softKnee) / max(softKneeWidth, 1e-3);
+                const float sp   = max(t, 0.0) + log(1.0 + exp(-abs(t)));
                 const float comp = softKnee + softKneeWidth * sp / max(softKneeRatio, 1e-3);
-                hvP = float3(min(hv.x, comp), min(hv.y, comp), min(hv.z, comp));
+                // Residual (detail) is restored at FULL amplitude only in the mid-
+                // tones, and attenuated toward the highlight band. Restoring it
+                // fully on a bright base pushes micro-texture back up to the clip
+                // point — the artificial white "peaking" on bright walls/skies —
+                // because compressing highlights is exactly what the pre-compressor
+                // is FOR. Gate on base level using only knee/width: below
+                // knee+width keep all detail (no painting), by knee+3*width keep
+                // only the compressed fraction (no peaking).
+                const float keep = 1.0 - (1.0 - 1.0 / max(softKneeRatio, 1e-3))
+                                   * smoothstep(softKnee + softKneeWidth,
+                                                softKnee + 3.0 * softKneeWidth, base);
+                const float Ic   = min(base, comp) + det * keep;
+                hvP = float3(Ic, Ic, Ic);
             }
 
             const float hMapped = ToneMappingHablePeak(hvP, peakSdrUnits).x;

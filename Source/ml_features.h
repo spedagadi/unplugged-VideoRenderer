@@ -78,3 +78,44 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch,
                      float* outTextureEnergy = nullptr,
                      float* outPeakP995 = nullptr,
                      float* outActiveFrac = nullptr);
+
+// ---------------------------------------------------------------------------
+// DELIVERED-FRAME STATISTICS (the closed-loop instrument)
+//
+// BuildMLFeatures answers "what is the SOURCE like". Nothing in the renderer
+// could answer "what did we DELIVER" — the models consume source-PQ statistics
+// and act on the rendered frame without ever seeing it, so a change to the tone
+// curve (or refWhite, or the calibration LUT) silently invalidates every
+// prediction they make. These statistics are the missing measurement.
+//
+// They are computed on the frame's OWN encoded values (the R16_UNORM readback,
+// 0..1, reported here scaled to 0..255 so they compare directly against a screen
+// grab) and are NOT remapped into any source domain: a delivered frame is
+// display-referred, and remapping it into PQ would be the double-remap bug this
+// file has already shipped once.
+//
+// Deliberately a SEPARATE function rather than more feature slots: features[] is
+// the exact contract the Zion XGBoost models were trained on.
+struct MLRenderedLumaStats {
+	float p01 = -1.0f, p05 = -1.0f, p25 = -1.0f, p50 = -1.0f;
+	float p75 = -1.0f, p95 = -1.0f, p99 = -1.0f;
+	float mean = -1.0f;
+	// Fraction of samples at or below 4/255 — the "crushed to black" measure. A
+	// shadow model that never outputs a perfect 0 (measured, repeatedly) still
+	// crushes when the toe lands below the display's first visible code, and this
+	// is the number that shows it.
+	float crushFrac = -1.0f;
+	// Mean of the samples in (4, 48]/255 — the toe band. Distinguishes "the shadow
+	// band is dark" from "the shadow band is absent".
+	float shadowMean = -1.0f;
+	int   shadowCount = 0;
+	bool  valid = false;
+};
+
+// `contentTop`/`contentBottom` are the letterbox rows the bar detector already
+// found, and passing them is NOT optional: on a 2.39:1 film 26% of the readback is
+// black bar, which pins p25 at 0 and inflates crushFrac by that same 26% — the
+// first build measured the matte and reported it as shadow crush.
+void BuildRenderedLumaStats(const uint16_t* luma16, const int rowPitch,
+                            MLRenderedLumaStats& out,
+                            int contentTop = 0, int contentBottom = -1);

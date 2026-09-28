@@ -174,20 +174,25 @@ float3 GT7ToneMap(float3 rgbNits, float ceilingNits, float grayPointNits,
 // ratio 1.0 = identity above the knee, below the knee exactly identity.
 // Overflow-safe: sp(t) = max(t,0) + log(1+exp(-|t|)), exponent always <= 0.
 //
-// NEEDED for the adapted form (ceiling = sdrNits with the 991-nit master fed in):
-// without a pre-fit, 14.8% of a 1000-nit range and 41% of a 4000-nit one lands
-// above the operator's clamp (2.046*ceiling) and flattens — the measured
-// "strong contrast" at sdrNits=200. With the shipped defaults (knee 0.60, ratio
-// 2.48, width 0.42) nothing clips at any peak measured. The gain lands the
-// CONTENT peak on the curve; the pre-fit re-spreads the band the clamp would
-// flatten, so the shoulder — not the cliff — carries the top of the master.
-float3 GT7PreCompress(float3 x, float knee, float ratio, float width)
+// DETAIL-PRESERVING (2026-09-27): `base` is a local average of the input (the
+// tone); the compressor acts on the base and the per-pixel residual (x - base,
+// the texture) is added back at full amplitude. A pointwise min(x, comp) scales
+// local contrast by ~1/ratio across the whole above-knee band, and at the low
+// knee this needs (0.21, for ultra-bright DV/HDR sky headroom) that band is most
+// of the image — on an 8-bit output the shrunken texture rounds to flat
+// "oil-painting" patches. Compressing the base keeps the headroom AND the detail.
+float3 GT7PreCompress(float3 x, float3 base, float knee, float ratio, float width)
 {
     const float w = max(width, 1e-3);
-    const float3 t  = (x - knee) / w;
+    const float3 t  = (base - knee) / w;
     const float3 sp = max(t, 0.0) + log(1.0 + exp(-abs(t)));
     const float3 comp = knee + w * sp / max(ratio, 1e-3);
-    return min(x, comp);
+    // Detail (residual) restored fully in the mid-tones, attenuated toward the
+    // highlight band — full restoration on a bright base pushes micro-texture to
+    // the clip point (artificial white peaking). Gate on base level via knee/width.
+    const float3 keep = 1.0 - (1.0 - 1.0 / max(ratio, 1e-3))
+                        * smoothstep(knee + w, knee + 3.0 * w, base);
+    return min(base, comp) + (x - base) * keep;
 }
 
 #endif // GT7_TONEMAP_HLSL_INCLUDED

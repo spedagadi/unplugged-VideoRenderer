@@ -131,6 +131,7 @@ private:
 	CComPtr<ID3D11SamplerState>       m_pToneLutSampler;
 	int   m_iExperimentalToneMapper = 0;    // 0 = off (shipped path), 1 = spline
 	float m_fToneLutContrast = 0.50f;       // pl_tone_map_spline "Contrast", 0.00 .. 1.50
+	float m_fToneLutPivotScale = 1.0f;      // scales the scene avg feeding the spline pivot
 
 	// Everything the curve is built from. Keeping the whole input set in one place is
 	// deliberate: the rebuild test used to name fields one at a time, which stops
@@ -142,6 +143,7 @@ private:
 		float pqMax = 0.0f;
 		float pqAvg = 0.0f;        // scene average, PQ — drives the pivot
 		float contrast = -1.0f;
+		float pivotScale = -1.0f;  // scene-avg scale into the pivot (1 = libplacebo)
 		// Display white in NITS. Named for what it is because the obvious
 		// alternative — 10000/this — is LuminanceScale, and swapping the two
 		// silently scaled the whole curve by dispNits/(10000/dispNits).
@@ -289,6 +291,20 @@ private:
 	CComPtr<ID3D11Texture2D> m_MLDownsample;   // 256x144 R16_UNORM luma cache
 	CComPtr<ID3D11Texture2D> m_MLStaging;      // CPU-readable copy
 	CComPtr<ID3D11PixelShader> m_pPSMLDownsample;
+
+	// DELIVERED-frame instrument (debug-gated, see BuildRenderedLumaStats). The
+	// models measure the SOURCE and act on the render without ever seeing it; these
+	// two caches hold what the tone curve produced and what the grade produced,
+	// downsampled at draw time and reduced at scene rate into [DELIVERED] lines.
+	CComPtr<ID3D11Texture2D> m_MLDeliveredCurveOut;  // post-correction, pre-grade
+	CComPtr<ID3D11Texture2D> m_MLDeliveredPostGrade; // post-grade, pre-cal/dither
+	MLRenderedLumaStats m_DeliveredCurveOut;
+	MLRenderedLumaStats m_DeliveredPostGrade;
+	bool m_bDeliveredA = false;   // cache A holds this frame's correction output
+	bool m_bDeliveredB = false;   // cache B holds this frame's post-grade frame
+	// The instrument's OWN throttle — deliberately not the peak anchor's cut/lock
+	// state. See ReadDeliveredStats' call site in Render().
+	uint64_t m_uDeliveredLastFrame = 0;
 
 	// Zion ML debug (registry: MLDebugLog / MLDebugPassthrough)
 	bool m_bMLDebug = false;
@@ -489,6 +505,9 @@ private:
 	float m_fHdrGt7Blend     = 0.6f;
 	float m_fHdrGt7FadeStart = 0.98f;
 	float m_fHdrGt7FadeEnd   = 1.16f;
+	// GT7 Adapt (TONE_CURVE_GT7_ADAPT): weight of the measured scene peak in the
+	// peak this curve maps FROM. 0 = plain GT7. cbuffer[24].
+	float m_fHdrGt7Adapt     = 0.25f;
 	float m_HableScenePeakApplied = -1.0f;  // value last pushed to the cbuffer
 
 	// The gamma top-up actually added on top of the model's prediction this frame
@@ -729,6 +748,7 @@ private:
 		// must not be silently replaced by a different axis.
 		return m_iHdrLocalToneMappingType != TONE_CURVE_REFERENCE
 			&& m_iHdrLocalToneMappingType != TONE_CURVE_GT7
+			&& m_iHdrLocalToneMappingType != TONE_CURVE_GT7_ADAPT
 			&& m_iExperimentalToneMapper != 0 && m_bToneLutReady && m_pToneLutSRV != nullptr;
 	}
 
@@ -741,8 +761,16 @@ private:
 	// grade alone, so selecting the tone mapper with the grade off left the
 	// extractor never running, the features at zero, and the mapper permanently
 	// inactive — a setting that is applied, reported back, and does nothing.
+	// The per-frame scene statistics (maxscl / avg → the measured peak) are now
+	// computed UNCONDITIONALLY, not only when the Zion grade or the spline wants
+	// them. The measured peak/avg feed GT7 and any future consumer regardless of
+	// which tone curve is selected; gating them on the consumer left them at 0
+	// exactly when they were most needed (e.g. metadata-less DV, or GT7 with the
+	// grade off). The CONSUMERS stay separately gated: the grade passes on
+	// m_bMLActive, the spline LUT build on expTm (UpdateToneLut self-gates).
+	// Cost: one GPU->CPU readback per frame, always.
 	bool MLStatsNeeded() const {
-		return m_bMLActive || (m_bML && m_iMLMode == ML_Auto) || m_iExperimentalToneMapper != 0;
+		return true;
 	}
 
 	void UpdateMLActive();
@@ -846,6 +874,12 @@ private:
 							const CRect& srcRect, const CRect& destRect,
 							ID3D11PixelShader* pPixelShader, ID3D11Buffer* pConstantBuffer,
 							const int iRotation, const bool bFlip);
+
+	// DELIVERED-frame instrument: downsample a frame boundary into its 256x144 cache
+	// (draw time, debug-gated), and reduce both caches into [DELIVERED] log lines
+	// (scene rate). See BuildRenderedLumaStats.
+	void DownsampleDelivered(const Tex2D_t& src, ID3D11Texture2D* dst);
+	void ReadDeliveredStats(unsigned long long frame);
 
 	HRESULT TextureResizeShader(const Tex2D_t& Tex, ID3D11Texture2D* pRenderTarget,
 								const CRect& srcRect, const CRect& destRect,

@@ -357,3 +357,78 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 	const float f0_den = std::min(0.90f, std::max(features[0], 1e-6f));
 	features[87] = 0.5444f / f0_den;
 }
+
+void BuildRenderedLumaStats(const uint16_t* luma16, const int rowPitch,
+                            MLRenderedLumaStats& out,
+                            int contentTop, int contentBottom)
+{
+	if (!luma16) {
+		return;
+	}
+	const int w = ML_DOWNSAMPLE_W;
+	const int h = ML_DOWNSAMPLE_H;
+	if (contentBottom < 0) {
+		contentBottom = h - 1;
+	}
+	contentTop    = std::max(0, std::min(contentTop,    h - 1));
+	contentBottom = std::max(contentTop, std::min(contentBottom, h - 1));
+	const int rows = contentBottom - contentTop + 1;
+
+	// 256 bins is coarser than the readback's 16 bits and that is the point: these
+	// numbers are compared against 8-bit screen grabs, so a bin IS one output code.
+	// A 65536-bin histogram would be exact and pointless.
+	thread_local uint32_t bins[256] = {};
+	ZeroMemory(bins, sizeof(bins));
+
+	int64_t sum = 0;
+	int64_t crush = 0;
+	int64_t shadowSum = 0;
+	int shadowCount = 0;
+	const int64_t crushLimit = (int64_t)(4.0 / 255.0 * 65535.0 + 0.5);
+	const int64_t shadowHi   = (int64_t)(48.0 / 255.0 * 65535.0 + 0.5);
+
+	for (int y = contentTop; y <= contentBottom; y++) {
+		const uint16_t* row = luma16 + (size_t)y * rowPitch;
+		for (int x = 0; x < w; x++) {
+			const int64_t v = row[x];
+			sum += v;
+			if (v <= crushLimit) {
+				crush++;
+			} else if (v <= shadowHi) {
+				shadowSum += v;
+				shadowCount++;
+			}
+			bins[v >> 8]++;
+		}
+	}
+
+	const int64_t total = (int64_t)w * rows;   // CONTENT samples, not the whole readback
+	const double k = 255.0 / 65535.0;
+	out.mean      = (float)(sum * k / total);
+	out.crushFrac = (float)((double)crush / total);
+	out.shadowMean   = shadowCount ? (float)(shadowSum * k / shadowCount) : 0.0f;
+	out.shadowCount  = shadowCount;
+
+	// Walk the histogram once for every percentile wanted. The bins are few enough
+	// that a fresh cumulative walk per percentile is cheaper than bookkeeping.
+	auto pct = [&](double q) -> float {
+		const int64_t target = (int64_t)(q * total);
+		int64_t acc = 0;
+		for (int b = 0; b < 256; b++) {
+			acc += bins[b];
+			if (acc >= target) {
+				// bin centre, in output codes
+				return (float)(b + 0.5);
+			}
+		}
+		return 255.0f;
+	};
+	out.p01 = pct(0.01);
+	out.p05 = pct(0.05);
+	out.p25 = pct(0.25);
+	out.p50 = pct(0.50);
+	out.p75 = pct(0.75);
+	out.p95 = pct(0.95);
+	out.p99 = pct(0.99);
+	out.valid = true;
+}

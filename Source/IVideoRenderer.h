@@ -111,6 +111,24 @@ enum :int {
 	// convention with the curves above), and its parameters come from
 	// fHdrGt7Blend / fHdrGt7FadeStart / fHdrGt7FadeEnd rather than the Hable ones.
 	TONE_CURVE_GT7       = 8,
+	// 9 = the experimental tone mapper (libplacebo spline). Made a first-class entry
+	// in the Tone-curve list so it is mutually exclusive with the named curves by
+	// construction: the engine drives iExperimentalToneMapper from this value, which
+	// arms the scene-stat extractor + LUT build, and the shader's toneLut branch
+	// replaces the curve entirely. (GT7's `> 7.5` test is bounded to `< 8.5` so 9
+	// reaches the LUT branch instead of being swallowed.)
+	TONE_CURVE_SPLINE    = 9,
+	// 10 = GT7 Adapt: the GT7 operator UNCHANGED, with one different input. Where
+	// plain GT7 takes the peak it maps FROM from static metadata (maxCLL, falling
+	// back to the Title peak), Adapt blends that with the measured per-scene peak:
+	//   peak = lerp(maxCLL, scenePeak, fHdrGt7Adapt)
+	// which is only safe because the measurement is already IIR-smoothed with a
+	// snap on scene cuts (see m_HableScenePeakNits) — so it moves AT a cut, in one
+	// frame, and holds inside a scene. A tracker that followed the frame peak
+	// continuously is auto-gain, and that is the failure this curve exists to
+	// avoid; it is also why plain GT7 stays the default whenever maxCLL is real.
+	// fHdrGt7Adapt = 0 makes this curve byte-identical to TONE_CURVE_GT7.
+	TONE_CURVE_GT7_ADAPT = 10,
 };
 
 #define SDR_NITS_DEF 50
@@ -349,6 +367,21 @@ struct Settings_t {
 	float fHdrGt7FadeStart  = 0.98f;
 	float fHdrGt7FadeEnd    = 1.16f;
 
+	// Spline shadow-pivot scale (litmus dial for the spline's black floor). The
+	// spline places its knee/pivot from the SCENE AVERAGE (St2094PickKnee); a bright
+	// average drives the pivot up and lifts the whole shadow band = high black
+	// floor. This scales the measured average that feeds the pivot: 1.0 = libplacebo
+	// as-is, lower = pivot sits lower = deeper blacks. APPENDED (binary boundary).
+	float fToneLutPivotScale = 1.0f;
+
+	// GT7 Adapt (TONE_CURVE_GT7_ADAPT) only: how much of the peak the curve maps
+	// FROM is decided by the measured scene peak rather than by static metadata.
+	// 0 = pure metadata (identical to plain GT7), 1 = the scene peak alone. The
+	// endpoints are two pictures that have both been seen on this box, so the dial
+	// is a position between known-good and known-bad rather than an abstract gain.
+	// APPENDED (binary boundary).
+	float fHdrGt7Adapt = 0.25f;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -465,6 +498,8 @@ struct Settings_t {
 		fHdrGt7Blend                    = 0.6f;
 		fHdrGt7FadeStart                = 0.98f;
 		fHdrGt7FadeEnd                  = 1.16f;
+		fToneLutPivotScale              = 1.0f;
+		fHdrGt7Adapt                    = 0.25f;
 	}
 };
 

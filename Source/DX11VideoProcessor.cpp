@@ -901,6 +901,8 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_pFaceDownParams.Release();
 	m_MLDownsample.Release();
 	m_MLStaging.Release();
+	m_MLDeliveredCurveOut.Release();
+	m_MLDeliveredPostGrade.Release();
 	m_FaceDownsample.Release();
 	m_FaceStaging.Release();
 	m_pMLParams.Release();
@@ -1241,7 +1243,16 @@ static void SplineMap(float* lut, int n, const Params& p) {
 	// gamma exponent, multiplied by an extra tuning coefficient designed to make
 	// the slope closer to 1.0 when the difference in peaks is low, and closer to
 	// linear when the difference between peaks is high.
-	const float ratio_raw = p.input_max / fmaxf(p.output_max, 1e-6f) - 1.0f;
+	// libplacebo computes this peak RATIO in LINEAR NITS (input_max/output_max of the
+	// actual luminance range). Here input_max/output_max are PQ CODES (the index axis),
+	// and PQ is perceptual: 1000/85 nits is a ratio of ~11.8 but their PQ codes ratio to
+	// ~0.24. Feeding the PQ ratio collapsed slope_tuning's exponent to ~0.08, so
+	// slope = pow(linear_slope, ~0.08) ≈ 1 — a near-1:1 PQ map that LIFTS the shadows
+	// (the high black floor), and left both `contrast` and the pivot dial with almost no
+	// leverage (their effect rides on that exponent). Convert to nits for the ratio only;
+	// the index axis stays PQ (that is what the knee interpolation needs).
+	const float ratio_raw = PqToLinearNits(p.input_max)
+	                      / fmaxf(PqToLinearNits(p.output_max), 1e-6f) - 1.0f;
 	const float ratio = clampf(p.slope_tuning * ratio_raw, p.slope_offset, 1.0f + p.slope_offset);
 	slope = powf(fmaxf(slope, 1e-6f), (1.0f - p.spline_contrast) * ratio);
 
@@ -1427,19 +1438,21 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 	// [19] the Hable curve's 1.0 in nits (decoupled reference white).
 		// [20] the nonlinear chroma compensation exponent (hableChromaExp).
 		// [21..23] the GT7 operator's blend + chroma-fade window (selection 8).
+		// [24]     the GT7 Adapt scene-peak weight (selection 10).
 		// cbuffer ByteWidth MUST stay a multiple of 16 bytes (84 vs 96 is the
 		// difference between a valid and a FAILED CreateBuffer — observed as a black
-		// picture whenever the buffer grew to 21 floats). 24 floats = 96 bytes and
-		// the three pad slots are now used, so the next field takes this to 28.
-		FLOAT cbuffer[24] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
+		// picture whenever the buffer grew to 21 floats). 24 floats = 96 bytes; slot
+		// 24 was the first free pad slot, and taking it grew the array to 28 = 112
+		// bytes, exactly as the old comment prescribed — never 25/26/27.
+		FLOAT cbuffer[28] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
 	                     (float)m_iOutputGamut,
 	                     ToneLutActive() ? 1.0f : 0.0f,
 	                     m_ToneLutKey.pqMin, m_ToneLutKey.pqMax,
 	                     (float)kToneLutSize, 0,
-	                     // 7 = the upstream REFERENCE curve, 8 = GT7. The clamp's upper
-	                     // bound must cover BOTH or discard() quietly rewrites the
+	                     // 7 = REFERENCE, 8 = GT7, 9 = SPLINE, 10 = GT7 ADAPT. Upper bound
+	                     // must cover ALL of them or discard() quietly rewrites the
 	                     // selection to 3 (Hable), i.e. the row would do nothing.
-	                     (float)discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_GT7),
+	                     (float)discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_GT7_ADAPT),
 	                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 	// The metadata, guarded exactly as SetHDR10ShaderParams guards it.
@@ -1528,10 +1541,14 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// pad slots, so the buffer is STILL 24 floats / 96 bytes — no growth, and no
 		// repeat of the 21-float (84-byte) CreateBuffer failure that produced a black
 		// picture with nothing on screen to explain it. The NEXT field added here has
-		// to take the array to 28, never 25/26/27.
+		// to take the array to 28, never 25/26/27 — which is what happened here.
 		cbuffer[21] = m_fHdrGt7Blend;
 		cbuffer[22] = m_fHdrGt7FadeStart;
 		cbuffer[23] = m_fHdrGt7FadeEnd;
+		// [24] GT7 Adapt (selection 10): weight of the measured scene peak in the
+		// peak the curve maps FROM. Harmless for every other selection — only the
+		// GT7 branch reads it, and only when the selection is 10.
+		cbuffer[24] = m_fHdrGt7Adapt;
 	}
 
 	if (m_pCorrectionConstants) {
@@ -1540,11 +1557,14 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// curve= and gtB= are here so "I selected GT7 and nothing changed" is
 		// answerable from one line: the clamped selection that reached the buffer,
 		// not the one the UI asked for.
-		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} refW={:.1f} sPk={:.1f}",
+		// ad= is GT7 Adapt's scene-peak weight and sPk= the measured peak it blends
+		// toward, so the anchor the shader actually used is one line's arithmetic:
+		// peak = cll*(1-ad) + sPk*ad.
+		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} ad={:.2f} refW={:.1f} sPk={:.1f}",
 			(uintptr_t)m_pCorrectionConstants.p, 10000.0f / m_iSDRDisplayNits, m_iSDRDisplayNits,
 			m_fHdrHighlightNeutral, m_fHdrChromaExp,
-			discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_GT7),
-			m_fHdrGt7Blend,
+			discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_GT7_ADAPT),
+			m_fHdrGt7Blend, m_fHdrGt7Adapt,
 			m_fHdrRefWhiteNits, m_HableScenePeakNits);
 		m_pDeviceContext->UpdateSubresource(m_pCorrectionConstants, 0, nullptr, &cbuffer, 0, 0);
 		// Arm the read-back: the next few correction draws report the buffer they
@@ -1744,6 +1764,7 @@ void CDX11VideoProcessor::UpdateToneLut()
 	key.pqMax     = exptm::LinearNitsToPq(std::clamp(m_fHdrTitlePeakNits, 100.0f, 4000.0f));
 	key.pqAvg     = m_MLToneAvgSmooth;   // measured: this is the pivot's input
 	key.contrast  = m_fToneLutContrast;
+	key.pivotScale = std::clamp(m_fToneLutPivotScale, 0.0f, 1.0f);
 	key.dispNits  = displayNits;
 	key.blackNits = m_fHdrDisplayMinNits;
 
@@ -1765,6 +1786,7 @@ void CDX11VideoProcessor::UpdateToneLut()
 	const bool configChanged = key.pqMin != m_ToneLutKey.pqMin ||
 	                           key.pqMax != m_ToneLutKey.pqMax ||
 	                           key.contrast != m_ToneLutKey.contrast ||
+	                           key.pivotScale != m_ToneLutKey.pivotScale ||
 	                           key.dispNits != m_ToneLutKey.dispNits ||
 	                           key.blackNits != m_ToneLutKey.blackNits;
 	m_nToneLutFrame++;
@@ -1777,7 +1799,11 @@ void CDX11VideoProcessor::UpdateToneLut()
 	exptm::Params p;
 	p.input_min  = exptm::LinearNitsToPq(key.pqMin);
 	p.input_max  = key.pqMax;
-	p.input_avg  = key.pqAvg;
+	// The scene average drives ONLY the spline's knee/pivot (St2094PickKnee), and a
+	// bright average is what lifts the shadow band into a high black floor. Scaling
+	// it here is the litmus dial: lower = pivot sits lower = deeper blacks, with the
+	// highlight shoulder untouched. 1.0 = libplacebo as-is.
+	p.input_avg  = key.pqAvg * key.pivotScale;
 	p.output_min = exptm::LinearNitsToPq(key.blackNits);
 	p.output_max = exptm::LinearNitsToPq(key.dispNits);
 	p.spline_contrast = key.contrast;
@@ -3415,6 +3441,77 @@ HRESULT CDX11VideoProcessor::LoadSkinLUT()
 	return hr;
 }
 
+// DELIVERED-frame instrument ---------------------------------------------------
+//
+// The Zion models consume SOURCE-PQ statistics and act on the rendered frame
+// without ever seeing it (the extractor reads the pre-correction texture, the
+// grade passes read the post-correction one). So a change to the tone curve, to
+// refWhite or to the calibration LUT silently invalidates every prediction the
+// models make, and the only thing that notices is the viewer. These two caches
+// are the missing measurement: what the tone curve produced, and what the grade
+// produced, in the delivered frame's own encoded codes (0..255, comparable to a
+// screen grab).
+//
+// Both downsamples run at DRAW time into caches this class owns, so neither
+// depends on a post-scale chain texture outliving the frame. Both are
+// debug-gated: with the instrument off this is exactly zero extra work.
+void CDX11VideoProcessor::DownsampleDelivered(const Tex2D_t& src, ID3D11Texture2D* dst)
+{
+	if (!m_pPSMLDownsample || !dst || !src.pShaderResource) {
+		return;
+	}
+	const CRect fullRect(0, 0, ML_DOWNSAMPLE_W, ML_DOWNSAMPLE_H);
+	const CRect texRect(0, 0, src.desc.Width, src.desc.Height);
+	TextureCopyRect(src, dst, texRect, fullRect, m_pPSMLDownsample, nullptr, 0, false);
+}
+
+void CDX11VideoProcessor::ReadDeliveredStats(unsigned long long frame)
+{
+	if (!m_bMLDebug || !m_pMLDebugFile || !m_MLStaging) {
+		return;
+	}
+
+	// One Map per boundary, sequentially, into the shared staging. Scene rate only:
+	// a read-back is the one genuinely expensive thing here, and a scene is the
+	// unit the statistics mean anything at.
+	auto readOne = [&](ID3D11Texture2D* cache, bool have, MLRenderedLumaStats& out) {
+		out = MLRenderedLumaStats();
+		if (!cache || !have) {
+			return;
+		}
+		m_pDeviceContext->CopyResource(m_MLStaging, cache);
+		D3D11_MAPPED_SUBRESOURCE mr = {};
+		if (FAILED(m_pDeviceContext->Map(m_MLStaging, 0, D3D11_MAP_READ, 0, &mr))) {
+			return;
+		}
+		// Content rows only. The bar detector has already found them for the source
+		// statistics; reusing them is what keeps a 2.39:1 film's matte from being
+		// reported as 26% shadow crush.
+		BuildRenderedLumaStats((const uint16_t*)mr.pData,
+		                       (int)(mr.RowPitch / sizeof(uint16_t)), out,
+		                       m_MLBarDetected.contentTop, m_MLBarDetected.contentBottom);
+		m_pDeviceContext->Unmap(m_MLStaging, 0);
+	};
+	readOne(m_MLDeliveredCurveOut.p,  m_bDeliveredA, m_DeliveredCurveOut);
+	readOne(m_MLDeliveredPostGrade.p, m_bDeliveredB, m_DeliveredPostGrade);
+	m_bDeliveredA = m_bDeliveredB = false;
+
+	auto fmt = [](const MLRenderedLumaStats& s) -> std::wstring {
+		if (!s.valid) {
+			return L"n/a";
+		}
+		wchar_t b[192];
+		swprintf_s(b, L"p01=%.0f p05=%.0f p25=%.0f p50=%.0f p75=%.0f p95=%.0f p99=%.0f mean=%.1f crush=%.3f shMean=%.0f shN=%d",
+		           (double)s.p01, (double)s.p05, (double)s.p25, (double)s.p50,
+		           (double)s.p75, (double)s.p95, (double)s.p99, (double)s.mean,
+		           (double)s.crushFrac, (double)s.shadowMean, s.shadowCount);
+		return b;
+	};
+	fwprintf(m_pMLDebugFile, L"DELIVERED frame=%llu curveOut: %s | postGrade: %s\n",
+	         frame, fmt(m_DeliveredCurveOut).c_str(), fmt(m_DeliveredPostGrade).c_str());
+	fflush(m_pMLDebugFile);
+}
+
 void CDX11VideoProcessor::CreateMLTextures()
 {
 	if (m_MLDownsample || !m_pDevice) {
@@ -3444,6 +3541,21 @@ void CDX11VideoProcessor::CreateMLTextures()
 	if (FAILED(hr)) {
 		DLog(L"CDX11VideoProcessor::CreateMLTextures() failed to create the staging texture: {}", hr);
 		m_MLDownsample.Release();
+	}
+
+	// DELIVERED-frame instrument: two more caches of the SAME shape. They share
+	// m_MLStaging at read-back time (one Map each, scene rate, sequential — the same
+	// thread owns both), so this costs two textures and no extra staging. A failed
+	// create just disables that boundary's measurement; the log says so.
+	hr = m_pDevice->CreateTexture2D(&cache, nullptr, &m_MLDeliveredCurveOut);
+	if (FAILED(hr)) {
+		DLog(L"CDX11VideoProcessor::CreateMLTextures(): delivered cache A unavailable ({})", hr);
+		m_MLDeliveredCurveOut.Release();
+	}
+	hr = m_pDevice->CreateTexture2D(&cache, nullptr, &m_MLDeliveredPostGrade);
+	if (FAILED(hr)) {
+		DLog(L"CDX11VideoProcessor::CreateMLTextures(): delivered cache B unavailable ({})", hr);
+		m_MLDeliveredPostGrade.Release();
 	}
 
 	// Face detection: 480x288 BGRA8 downsample + staging
@@ -5430,6 +5542,23 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			m_bMLFeaturesStale = false;
 			UpdateToneLut();
 
+			// DELIVERED instrument. Placed HERE — beside the extraction, which is
+			// known to run — and throttled on its own frame counter rather than on the
+			// peak anchor's cut/lock state machine. Two earlier placements rode on that
+			// machine and both failed silently: nested inside its "applied peak moved"
+			// branch it never ran, and keyed on `m_SceneFrames == kSceneSettleFrames` it
+			// ran EVERY frame, because m_SceneFrames freezes at that value once the
+			// anchor locks. An instrument that logs nothing and an instrument that logs
+			// 2001 lines a minute are the same bug: a trigger borrowed from someone
+			// else's state.
+			//
+			// 30 render frames is ~0.5 s at 60, ~1.25 s at 24 — fine for a scene-level
+			// number, and the read-back (2 Maps) is the only real cost.
+			if (m_bMLDebug && m_MLDebugFrame - m_uDeliveredLastFrame >= 30) {
+				m_uDeliveredLastFrame = m_MLDebugFrame;
+				ReadDeliveredStats(m_MLDebugFrame);
+			}
+
 			// --- Per-scene peak for the Hable curve --------------------------
 			// m_MLFeatures[0] is the per-scene peak of the signal the tone curve is
 			// about to consume, in PQ. Measured on the PRE-tone-map texture, and
@@ -5668,6 +5797,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 						fflush(m_pMLDebugFile);
 					}
 				}
+
 			}
 		}
 	}
@@ -6266,6 +6396,15 @@ HRESULT CDX11VideoProcessor::ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2
 
 HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRenderTarget, const CRect& srcRect, const CRect& dstRect)
 {
+	// DELIVERED instrument, boundary B: `Tex` is the post-grade frame — after the
+	// Zion shadow/highlight/gamma steps, before the calibration LUT and the dither
+	// this pass adds. Sampled FIRST, before anything here binds its own resources,
+	// so the downsample cannot disturb the final blit's slot layout.
+	if (m_bMLDebug) {
+		DownsampleDelivered(Tex, m_MLDeliveredPostGrade.p);
+		m_bDeliveredB = true;
+	}
+
 	CComPtr<ID3D11RenderTargetView> pRenderTargetView;
 
 	HRESULT hr = m_pDevice->CreateRenderTargetView(pRenderTarget, nullptr, &pRenderTargetView);
@@ -6470,6 +6609,16 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			if (bToneLut) {
 				ID3D11ShaderResourceView* none[1] = {};
 				m_pDeviceContext->PSSetShaderResources(1, 1, none);
+			}
+
+			// DELIVERED instrument, boundary A: the frame the tone curve just wrote.
+			// StepSetting advanced pTex to the chain texture this step rendered INTO,
+			// so *pTex is the correction's output — unless the correction is the last
+			// step and drew straight to the swap chain, in which case there is no
+			// texture to sample and boundary A reports n/a.
+			if (m_bMLDebug && pRT != pRenderTarget) {
+				DownsampleDelivered(*pTex, m_MLDeliveredCurveOut.p);
+				m_bDeliveredA = true;
 			}
 
 			// [CBPROBE] read-back, armed by every [SHADER-CB] push. Nothing rebound
@@ -7497,6 +7646,13 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_fHdrGt7FadeEnd = std::clamp(config.fHdrGt7FadeEnd, 0.05f, 4.0f);
 		changeLuminanceParams = true;
 	}
+	// GT7 Adapt's scene-peak weight (selection 10 only). Live re-push, and note the
+	// clamp: 0 is a legal value (it makes the curve identical to plain GT7), so this
+	// must not be an "if (v > 0)" style enable.
+	if (config.fHdrGt7Adapt != m_fHdrGt7Adapt) {
+		m_fHdrGt7Adapt = std::clamp(config.fHdrGt7Adapt, 0.0f, 1.0f);
+		changeLuminanceParams = true;
+	}
 
 	if (config.iExperimentalToneMapper != m_iExperimentalToneMapper) {
 		m_iExperimentalToneMapper = config.iExperimentalToneMapper;
@@ -7515,6 +7671,11 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	if (config.fToneLutContrast != m_fToneLutContrast) {
 		m_fToneLutContrast = config.fToneLutContrast;
 		m_bToneLutReady = false;   // the curve is built from it
+	}
+
+	if (config.fToneLutPivotScale != m_fToneLutPivotScale) {
+		m_fToneLutPivotScale = config.fToneLutPivotScale;
+		m_bToneLutReady = false;   // pivot scale changes the built curve
 	}
 
 	if (config.iHdrToggleDisplay != m_iHdrToggleDisplay) {
