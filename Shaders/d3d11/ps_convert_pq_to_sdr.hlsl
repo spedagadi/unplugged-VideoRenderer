@@ -82,6 +82,12 @@ cbuffer PS_PARAMETERS : register(b0)
     // curve maps FROM. 0 = plain GT7 (metadata peak alone), 1 = scene peak alone.
     // cbuffer[24] — see the 16-byte alignment note in DX11VideoProcessor.cpp.
     float gt7Adapt;
+    // GT7_ALPHA, 0.25 = Polyphony. This is the shoulder's REACH, not its shape: the
+    // curve lands on the ceiling at 1.21x ceiling at 0.50, 1.47x at 0.25 and 1.87x at
+    // 0.10, and clamps above that. Raising refWhite buys exposure but pushes content
+    // past that point, so this is the term that lets exposure rise without the
+    // highlights dying. 0 = fall back to the shipped constant. cbuffer[25].
+    float gt7Alpha;
 };
 
 #include "../convert/conv_matrix.hlsl"
@@ -367,7 +373,8 @@ float4 main(PS_INPUT input) : SV_Target
         float3 mapped = GT7ToneMap(adapted, sdrNits, GT7_GRAYPOINT_FRACTION * sdrNits,
                                    clamp(gt7Blend, 0.0f, 1.0f),
                                    (gt7FadeEnd > gt7FadeStart) ? gt7FadeStart : GT7_FADE_START,
-                                   (gt7FadeEnd > gt7FadeStart) ? gt7FadeEnd   : GT7_FADE_END);
+                                   (gt7FadeEnd > gt7FadeStart) ? gt7FadeEnd   : GT7_FADE_END,
+                                   (gt7Alpha > 0.001f) ? gt7Alpha : GT7_ALPHA);
 
         // Display mapping. Nothing else scales this, so sdrNits reaches the picture
         // through the ceiling AND through here — and because the gain is free of

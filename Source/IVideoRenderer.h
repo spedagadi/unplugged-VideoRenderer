@@ -409,6 +409,21 @@ struct Settings_t {
 	// APPENDED (binary boundary).
 	float fMLTargetMid = 0.0f;
 
+	// GT7 shoulder REACH (the curve's alpha, 0.25 = Polyphony's shipped value).
+	//
+	// This is not a shape control, it is a headroom control. GT7's exponential
+	// shoulder lands on the display ceiling at a fixed multiple of it — 1.21x at
+	// alpha 0.50, 1.47x at 0.25, 1.87x at 0.10 — and min(blended, ceiling) destroys
+	// everything above that point. The adapted gain puts the content peak at
+	// 2.2*refWhite/sdrNits x ceiling, so refWhite and this clamp are the same
+	// decision wearing two names: raising refWhite to brighten the picture pushes
+	// content past the reach and flattens the highlights.
+	//
+	// Lowering alpha moves the wall instead. That is what lets exposure rise without
+	// paying in clouds, which is the coupling that has been blocking the luminosity
+	// work. 0.25 = exactly today's picture. APPENDED (binary boundary).
+	float fHdrGt7Alpha = 0.25f;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -529,6 +544,7 @@ struct Settings_t {
 		fHdrGt7Adapt                    = 0.25f;
 		fMLShadowPedestal               = 0.0f;
 		fMLTargetMid                    = 0.0f;
+		fHdrGt7Alpha                    = 0.25f;
 	}
 };
 

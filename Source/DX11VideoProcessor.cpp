@@ -1552,6 +1552,9 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// peak the curve maps FROM. Harmless for every other selection — only the
 		// GT7 branch reads it, and only when the selection is 10.
 		cbuffer[24] = m_fHdrGt7Adapt;
+		// [25] the shoulder's reach (GT7_ALPHA). Takes a padding slot, so the buffer
+		// stays 28 floats / 112 bytes — no alignment risk.
+		cbuffer[25] = m_fHdrGt7Alpha;
 	}
 
 	if (m_pCorrectionConstants) {
@@ -2062,14 +2065,19 @@ void CDX11VideoProcessor::UpdateMLActive()
 // The constants MUST stay in step with the shader. If GT7_ALPHA, GT7_LINEAR_SECTION
 // or kGT7RangeFit changes there, this stops predicting and the mid-tone target goes
 // quietly wrong, so they are named here rather than folded into one expression.
-static float PredictGt7Encoded(float srcNits, float refWhiteNits, float peakNits, float ceilingNits)
+static float PredictGt7Encoded(float srcNits, float refWhiteNits, float peakNits, float ceilingNits,
+                               float alpha)
 {
 	if (srcNits <= 0.0f || peakNits <= 0.0f || ceilingNits <= 0.0f) {
 		return 0.0f;
 	}
 	const float kGT7RangeFit   = 2.2f;    // ps_convert_pq_to_sdr.hlsl
-	const float kGT7Alpha      = 0.25f;   // GT7_ALPHA,          gt7_tonemap.hlsl
 	const float kGT7LinearSec  = 0.444f;  // GT7_LINEAR_SECTION, gt7_tonemap.hlsl
+	// The user's reach, with the shader's own "0 means unset" fallback applied
+	// identically. This MUST track gt7Alpha: the mid-tone target solves against this
+	// prediction, so a prediction that ignores the curve's actual alpha computes a
+	// gamma for a curve that is not running.
+	const float kGT7Alpha      = (alpha > 0.001f) ? alpha : 0.25f;
 
 	const float gain = kGT7RangeFit * refWhiteNits / peakNits;
 	const float x    = srcNits * gain;                 // the operator's own units
@@ -2182,7 +2190,8 @@ void CDX11VideoProcessor::SetMLParams()
 			    m_iSDRDisplayNits > 0 && m_fCurvePeakNits > 10.0f) {
 				const float srcAvgNits = exptm::PqToLinearNits(m_MLFeatures[1]);
 				const float cur = PredictGt7Encoded(srcAvgNits, m_fHdrRefWhiteNits,
-				                                    m_fCurvePeakNits, (float)m_iSDRDisplayNits);
+				                                    m_fCurvePeakNits, (float)m_iSDRDisplayNits,
+				                                    m_fHdrGt7Alpha);
 				if (cur > 0.001f && cur < 0.999f) {
 					autoTopUp = logf(cur) / logf(m_fMLTargetMid) - gamma;
 				}
@@ -7784,6 +7793,13 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	// must not be an "if (v > 0)" style enable.
 	if (config.fHdrGt7Adapt != m_fHdrGt7Adapt) {
 		m_fHdrGt7Adapt = std::clamp(config.fHdrGt7Adapt, 0.0f, 1.0f);
+		changeLuminanceParams = true;
+	}
+	// The shoulder's reach. Bounded away from 1.0, where k = (LS-1)/(alpha-1) divides
+	// by zero, and from 0 — the shader reads 0 as "unset" and falls back to Polyphony's
+	// 0.25, so a clamped-to-zero value would silently mean something else.
+	if (config.fHdrGt7Alpha != m_fHdrGt7Alpha) {
+		m_fHdrGt7Alpha = std::clamp(config.fHdrGt7Alpha, 0.02f, 0.90f);
 		changeLuminanceParams = true;
 	}
 

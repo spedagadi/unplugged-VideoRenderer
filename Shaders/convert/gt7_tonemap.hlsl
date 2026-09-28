@@ -115,10 +115,22 @@ float GT7EvaluateCurve(float x, float peakNits, float kA, float kB, float kC,
 }
 
 // Precompute the shoulder constants for one ceiling. They depend only on the
-// ceiling, so fxc hoists them out of the three channel calls below.
-void GT7InitCurve(float peakNits, out float kA, out float kB, out float kC, out float kneeNits)
+// ceiling and the curve's alpha, so fxc hoists them out of the three channel calls.
+//
+// `alpha` is GT7_ALPHA (0.25), and it is now a parameter because it is the control
+// that decides how far the shoulder REACHES before it lands on the ceiling. The
+// curve hits the ceiling exactly at
+//
+//     x/peak = -k * ln( (1 - LS - k) / (-k * exp(LS/k)) )      [k = (LS-1)/(a-1)]
+//
+// which is 1.21x at alpha 0.50, 1.47x at 0.25 and 1.87x at 0.10. Everything above
+// that is clamped, so alpha is what limits how much exposure the adapted gain can
+// buy before highlights start dying: raising refWhite brightens the picture AND
+// pushes content past that point, and alpha is the only term that moves the point.
+void GT7InitCurve(float peakNits, float alpha, out float kA, out float kB, out float kC, out float kneeNits)
 {
-    const float k  = (GT7_LINEAR_SECTION - 1.0f) / (GT7_ALPHA - 1.0f);
+    const float a  = (alpha > 0.001f) ? alpha : GT7_ALPHA;   // 0 = "unset" -> Polyphony
+    const float k  = (GT7_LINEAR_SECTION - 1.0f) / (a - 1.0f);
     kA       = peakNits * GT7_LINEAR_SECTION + peakNits * k;
     kB       = -peakNits * k * exp(GT7_LINEAR_SECTION / k);
     kC       = -1.0f / (k * peakNits);
@@ -139,10 +151,10 @@ void GT7InitCurve(float peakNits, out float kA, out float kB, out float kC, out 
 //   fadeStart/End  -> the chromaCurve window, in units of the ceiling's ICtCp I,
 //                     below which chroma is handed through untouched.
 float3 GT7ToneMap(float3 rgbNits, float ceilingNits, float grayPointNits,
-                  float blendRatio, float fadeStart, float fadeEnd)
+                  float blendRatio, float fadeStart, float fadeEnd, float alpha)
 {
     float kA, kB, kC, kneeNits;
-    GT7InitCurve(ceilingNits, kA, kB, kC, kneeNits);
+    GT7InitCurve(ceilingNits, alpha, kA, kB, kC, kneeNits);
 
     // Per-channel tone mapping — the reference calls this the "skewed" color.
     const float3 skewedNits = float3(GT7EvaluateCurve(rgbNits.r, ceilingNits, kA, kB, kC, kneeNits, grayPointNits),
