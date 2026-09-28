@@ -3475,6 +3475,23 @@ void CDX11VideoProcessor::ReadDeliveredStats(unsigned long long frame)
 		return;
 	}
 
+	// Where the picture actually sits inside the WINDOW, in readback rows.
+	// m_videoRect is the destination rect the frame is letterboxed into, so this is
+	// the delivered frame's own content band — independent of what the bar detector
+	// found on the source, which lives in a different coordinate space.
+	m_DeliveredTopRow = 0;
+	m_DeliveredBotRow = ML_DOWNSAMPLE_H - 1;
+	{
+		const int winH = (int)m_windowRect.Height();
+		const int vidH = (int)m_videoRect.Height();
+		if (winH > 0 && vidH > 0) {
+			const float v0 = (float)m_videoRect.top / (float)winH;
+			const float v1 = (float)(m_videoRect.top + vidH) / (float)winH;
+			m_DeliveredTopRow = (int)floorf(v0 * ML_DOWNSAMPLE_H);
+			m_DeliveredBotRow = (int)ceilf(v1 * ML_DOWNSAMPLE_H) - 1;
+		}
+	}
+
 	// One Map per boundary, sequentially, into the shared staging. Scene rate only:
 	// a read-back is the one genuinely expensive thing here, and a scene is the
 	// unit the statistics mean anything at.
@@ -3488,12 +3505,18 @@ void CDX11VideoProcessor::ReadDeliveredStats(unsigned long long frame)
 		if (FAILED(m_pDeviceContext->Map(m_MLStaging, 0, D3D11_MAP_READ, 0, &mr))) {
 			return;
 		}
-		// Content rows only. The bar detector has already found them for the source
-		// statistics; reusing them is what keeps a 2.39:1 film's matte from being
-		// reported as 26% shadow crush.
+		// Content rows, mapped into the space THIS cache was captured in.
+		//
+		// Not m_MLBarDetected: those rows are measured on the convert output, which
+		// is VIDEO-sized, while these caches come off the post-scale chain, which is
+		// WINDOW-sized. Reusing them crops the wrong rows — a 2.39:1 film has the same
+		// bar FRACTION in both spaces, so the result looks plausible and is still
+		// wrong, which is why crush sat at a constant 0.258 on every scene no matter
+		// what was playing. Map the content rect through m_videoRect/m_windowRect,
+		// exactly as the bar cbuffer's uBarV0/uBarSpan do.
 		BuildRenderedLumaStats((const uint16_t*)mr.pData,
 		                       (int)(mr.RowPitch / sizeof(uint16_t)), out,
-		                       m_MLBarDetected.contentTop, m_MLBarDetected.contentBottom);
+		                       m_DeliveredTopRow, m_DeliveredBotRow);
 		m_pDeviceContext->Unmap(m_MLStaging, 0);
 	};
 	readOne(m_MLDeliveredCurveOut.p,  m_bDeliveredA, m_DeliveredCurveOut);
@@ -3511,8 +3534,14 @@ void CDX11VideoProcessor::ReadDeliveredStats(unsigned long long frame)
 		           (double)s.crushFrac, (double)s.shadowMean, s.shadowCount);
 		return b;
 	};
-	fwprintf(m_pMLDebugFile, L"DELIVERED frame=%llu curveOut: %s | postGrade: %s\n",
-	         frame, fmt(m_DeliveredCurveOut).c_str(), fmt(m_DeliveredPostGrade).c_str());
+	// crop= is printed so every number on the line is auditable: if the band is wrong
+	// (or the source's own bars differ from the window's), that shows here instead of
+	// silently becoming "shadow crush".
+	fwprintf(m_pMLDebugFile, L"DELIVERED frame=%llu crop=%d..%d/%d win=%dx%d vid=%dx%d | curveOut: %s | postGrade: %s\n",
+	         frame, m_DeliveredTopRow, m_DeliveredBotRow, ML_DOWNSAMPLE_H,
+	         (int)m_windowRect.Width(), (int)m_windowRect.Height(),
+	         (int)m_videoRect.Width(), (int)m_videoRect.Height(),
+	         fmt(m_DeliveredCurveOut).c_str(), fmt(m_DeliveredPostGrade).c_str());
 	fflush(m_pMLDebugFile);
 }
 

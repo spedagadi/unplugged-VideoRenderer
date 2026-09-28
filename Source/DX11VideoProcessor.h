@@ -313,6 +313,10 @@ private:
 	// The instrument's OWN throttle — deliberately not the peak anchor's cut/lock
 	// state. See ReadDeliveredStats' call site in Render().
 	uint64_t m_uDeliveredLastFrame = 0;
+	// Content band in the DELIVERED (window-sized) caches. Logged with every line so
+	// the crop is auditable rather than assumed.
+	int m_DeliveredTopRow = 0;
+	int m_DeliveredBotRow = ML_DOWNSAMPLE_H - 1;
 
 	// Zion ML debug (registry: MLDebugLog / MLDebugPassthrough)
 	bool m_bMLDebug = false;
