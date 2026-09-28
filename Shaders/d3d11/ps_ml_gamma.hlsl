@@ -121,38 +121,19 @@ float srcLumAt(float2 uv)
 // Unified tone curve: shadow toe → gamma (sky-relaxed guard) → highlight rolloff →
 // sky cloud-band lift. Operates on I_norm; returns graded I_norm. `sky` = S *
 // MLSkyStrength (0 when sky features are off → exactly the global path).
-float applyToneCurve(float x, float sky, float skinW, float inContent)
+float applyToneCurve(float x, float sky, float skinW)
 {
 	// 1. Shadow toe: DV L2 offset pedestal lift — raises dark end toward knee
+	//
+	// MISLABELLED, and knowingly left alone: this is a GAIN (the lift is
+	// proportional to x), so despite the name it cannot raise a pixel already at
+	// code 0-4. MLShadowToe is the shadow model's output and its prediction is
+	// calibrated to this form, so reshaping it would silently invalidate the model.
+	// The real offset is MLShadowPedestal, applied after the reconstruction below.
 	if (MLShadowToe > 0.005 && x < MLShadowKnee && x > 0.0) {
 		float t = 1.0 - x / max(MLShadowKnee, 0.01);
 		x += MLShadowToe * x * t * t;
 		x = saturate(x);
-	}
-
-	// 1b. Shadow PEDESTAL: a true offset, independent of x.
-	//
-	// The toe above is a GAIN — its lift is proportional to x, so despite the
-	// comment it is not a pedestal and cannot raise a pixel already at code 0-4.
-	// Measured: crushFrac was IDENTICAL (0.454 -> 0.454) before and after the whole
-	// grade while mean rose 34%. That is not a tuning problem, it is pow(0,g) = 0.
-	// This term is the only thing in the curve that can lift a crushed shadow.
-	//
-	// Deliberately SEPARATE from MLShadowToe rather than a change to it: MLShadowToe
-	// is the shadow model's output and its prediction is calibrated to the
-	// multiplicative form. Editing that shape would silently invalidate the model —
-	// the exact failure this grade keeps rediscovering.
-	//
-	// Gated on inContent because the letterbox matte is black in the source, and the
-	// bar repaint is off in practice — an ungated offset would turn it grey. Tapers to
-	// zero at the knee, so midtones are untouched by construction, and 0 is exactly
-	// the previous picture.
-	if (MLShadowPedestal > 0.0 && inContent > 0.5) {
-		const float k = max(MLShadowKnee, 0.01);
-		if (x < k) {
-			const float t = 1.0 - x / k;
-			x = saturate(x + MLShadowPedestal * t * t);
-		}
 	}
 
 	// 2. Gamma with a sky-relaxed guard leg. Both legs use the SAME curve family
@@ -238,7 +219,8 @@ float4 main(PS_INPUT input) : SV_Target
 	// === UNIFIED TONE CURVE (shadow toe → gamma → highlight rolloff) ===
 	// Global — applied to every pixel identically; S=0 reproduces the global path.
 	const float skyT = S * MLSkyStrength;
-	I_norm = applyToneCurve(I_norm, skyT, skinW, inContent);
+	const float I_normIn = I_norm;   // pre-curve level: the pedestal's taper key
+	I_norm = applyToneCurve(I_norm, skyT, skinW);
 
 	// Skin tone-preservation (stage 5): steer the WHOLE person region's luma back
 	// toward the source skin tone. The gate is a POISSON-RELAXED FIELD of the pure
@@ -287,6 +269,33 @@ float4 main(PS_INPUT input) : SV_Target
 	// Inverse: ICtCp → linear nits, scaled by the curve's gain, → output encoding.
 	// `ictcp` still holds the ORIGINAL I here (only the local I_norm was curved).
 	float3 rgb_out = ictcp_to_linear(ictcp) * g;
+
+	// Shadow PEDESTAL — added as LIGHT, after the reconstruction, because it cannot
+	// be done anywhere above here.
+	//
+	// The curve's move reaches the screen as a GAIN on the original colour (g, and
+	// rgb_out *= g) — that is what keeps hue and relative saturation locked while the
+	// Auto gamma ramps. The consequence is that 0 * g == 0 for any g: no luma-only
+	// term in this shader can raise a pixel that is already black. Measured, twice:
+	// crushFrac was unchanged across the whole grade, and unchanged again when this
+	// was first tried through I_norm like a second toe.
+	//
+	// So this is a neutral (equal on R,G,B — adds light, not chroma) amount, sized so
+	// that an otherwise-black pixel ENCODES to MLShadowPedestal. Tapered to zero at
+	// the shadow knee off the pre-curve level, so midtones and highlights are
+	// untouched by construction, and gated on inContent because the letterbox matte
+	// is black in the source and the bar repaint is off in practice — ungated, this
+	// would turn it grey. 0 = the previous picture exactly.
+	if (MLShadowPedestal > 0.0 && inContent > 0.5) {
+		const float t = 1.0 - saturate(I_normIn / max(MLShadowKnee, 0.01));
+		if (t > 0.0) {
+			// encoded = pow(lin / peak, 1/2.2)  =>  lin = peak * encoded^2.2
+			const float add = (IsPQ > 0.5)
+				? ST2084ToLinear(float4(MLShadowPedestal, 0.0, 0.0, 0.0), 10000.0).x
+				: SDR_PEAK_NITS * pow(MLShadowPedestal, 2.2);
+			rgb_out += add * t * t;
+		}
+	}
 
 	if (IsPQ > 0.5) {
 		color.rgb = LinearToST2084(float4(rgb_out, 0.0), 10000.0).rgb;
