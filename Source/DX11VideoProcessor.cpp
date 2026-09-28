@@ -1489,6 +1489,9 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		if (cll <= 10.0f)  cll = mMax;
 		if (fall <= 1.0f)  fall = cll;
 		cbuffer[9]  = cll;
+		// The same number the curve divides by, published for the CPU-side
+		// prediction that drives the relative mid-tone target.
+		m_fCurvePeakNits = cll;
 		cbuffer[10] = fall;
 		cbuffer[11] = mMax;
 		cbuffer[12] = mMin;
@@ -2050,6 +2053,44 @@ void CDX11VideoProcessor::UpdateMLActive()
 	UpdatePostScaleTexures();
 }
 
+// CPU mirror of the GT7 path in ps_convert_pq_to_sdr.hlsl / convert/gt7_tonemap.hlsl:
+// for one SOURCE luminance in nits, return the ENCODED (gamma-2.2, 0..1) value the
+// correction pass will hand to the grade. This is what lets the grade know what the
+// curve is about to deliver without measuring anything — the curve is closed-form
+// and every input to it is already on this side of the API.
+//
+// The constants MUST stay in step with the shader. If GT7_ALPHA, GT7_LINEAR_SECTION
+// or kGT7RangeFit changes there, this stops predicting and the mid-tone target goes
+// quietly wrong, so they are named here rather than folded into one expression.
+static float PredictGt7Encoded(float srcNits, float refWhiteNits, float peakNits, float ceilingNits)
+{
+	if (srcNits <= 0.0f || peakNits <= 0.0f || ceilingNits <= 0.0f) {
+		return 0.0f;
+	}
+	const float kGT7RangeFit   = 2.2f;    // ps_convert_pq_to_sdr.hlsl
+	const float kGT7Alpha      = 0.25f;   // GT7_ALPHA,          gt7_tonemap.hlsl
+	const float kGT7LinearSec  = 0.444f;  // GT7_LINEAR_SECTION, gt7_tonemap.hlsl
+
+	const float gain = kGT7RangeFit * refWhiteNits / peakNits;
+	const float x    = srcNits * gain;                 // the operator's own units
+
+	const float k    = (kGT7LinearSec - 1.0f) / (kGT7Alpha - 1.0f);
+	const float kA   = ceilingNits * kGT7LinearSec + ceilingNits * k;
+	const float kB   = -ceilingNits * k * expf(kGT7LinearSec / k);
+	const float kC   = -1.0f / (k * ceilingNits);
+	const float knee = kGT7LinearSec * ceilingNits;
+
+	float out;
+	if (x >= knee) {
+		out = kA + kB * expf(x * kC);                  // the exponential shoulder
+	} else {
+		out = x;      // GT7_TOE_STRENGTH is 1.0 in this port, so the toe branch IS
+		              // identity — which is why this prediction is simple.
+	}
+	out = fminf(out, ceilingNits);                     // min(blended, ceiling), as GT does
+	return powf(fmaxf(out / ceilingNits, 0.0f), 1.0f / 2.2f);   // the shader's encode
+}
+
 void CDX11VideoProcessor::SetMLParams()
 {
 	float gamma   = 1.0f;
@@ -2114,7 +2155,40 @@ void CDX11VideoProcessor::SetMLParams()
 			// MLGammaTopUp so the gamma pass can hold it back inside skin using the
 			// trained skin LUT. Folded in, it would be inseparable from the model's
 			// own judgement and there would be nothing to gate.
-			gammaTopUp = fminf(0.50f, fmaxf(-0.50f, m_fMLGammaTopUp));
+			// ---- RELATIVE MID-TONE TARGET -------------------------------------
+			// The models read SOURCE statistics and emit an absolute value, so they
+			// cannot see what the tone curve already did to the picture: change
+			// refWhite or sdrNits and the input vector is identical while the delivered
+			// mid-tone moves a long way. That is why the top-up has to be ridden by
+			// hand — it has been absorbing a delivery error the model is blind to.
+			//
+			// The curve is closed-form, so its effect on the source's average can be
+			// COMPUTED rather than measured. Solve for the exponent that lands the
+			// delivered mid-tone on the user's target and the grade becomes insensitive
+			// to the delivery: refWhite is then free to do its real job (setting how
+			// hard the shoulder works, i.e. highlight safety) while luminosity is set
+			// independently. Those two have been fighting all day because they were
+			// the same control.
+			//
+			// pow(x, 1/g) = target  =>  g = ln(x) / ln(target), and the shader applies
+			// g = MLGamma + MLGammaTopUp, so the top-up is the difference.
+			//
+			// m_fMLTargetMid == 0 disables all of this and leaves the manual top-up
+			// exactly as it was, so it cannot change anyone's picture by surprise.
+			float autoTopUp = 0.0f;
+			if (m_fMLTargetMid > 0.001f && MLFeatureDomainIsPq() &&
+			    (m_iHdrLocalToneMappingType == TONE_CURVE_GT7 ||
+			     m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT) &&
+			    m_iSDRDisplayNits > 0 && m_fCurvePeakNits > 10.0f) {
+				const float srcAvgNits = exptm::PqToLinearNits(m_MLFeatures[1]);
+				const float cur = PredictGt7Encoded(srcAvgNits, m_fHdrRefWhiteNits,
+				                                    m_fCurvePeakNits, (float)m_iSDRDisplayNits);
+				if (cur > 0.001f && cur < 0.999f) {
+					autoTopUp = logf(cur) / logf(m_fMLTargetMid) - gamma;
+				}
+			}
+			m_MLAutoTopUp = autoTopUp;
+			gammaTopUp = fminf(0.50f, fmaxf(-0.50f, autoTopUp + m_fMLGammaTopUp));
 			m_MLGammaTopUpApplied = gammaTopUp;
 		}
 		float highlightPred = 0.0f;
@@ -7796,7 +7870,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	}
 
 	if (config.bMLEnabled != m_bML || config.iMLMode != m_iMLMode ||
-			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow || config.fMLShadowDehaze != m_fMLShadowDehaze || config.fMLHighlightRolloffCtrl != m_fMLHighlightRolloffCtrl || config.fMLGammaTopUp != m_fMLGammaTopUp || config.fMLShadowPedestal != m_fMLShadowPedestal ||
+			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow || config.fMLShadowDehaze != m_fMLShadowDehaze || config.fMLHighlightRolloffCtrl != m_fMLHighlightRolloffCtrl || config.fMLGammaTopUp != m_fMLGammaTopUp || config.fMLShadowPedestal != m_fMLShadowPedestal || config.fMLTargetMid != m_fMLTargetMid ||
 			config.fMLHighlight != m_fMLHighlight ||
 			config.bMLGammaEnabled != m_bMLGammaEnabled ||
 			config.bMLShadowEnabled != m_bMLShadowEnabled ||
@@ -7831,6 +7905,9 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_fMLHighlightRolloffCtrl = config.fMLHighlightRolloffCtrl;
 		m_fMLGammaTopUp = config.fMLGammaTopUp;
 		m_fMLShadowPedestal = std::clamp(config.fMLShadowPedestal, 0.0f, 0.08f);
+		// 0 is a meaningful value here — it means OFF, manual top-up only — so the
+		// clamp must not be an enable test.
+		m_fMLTargetMid = std::clamp(config.fMLTargetMid, 0.0f, 0.95f);
 		m_fMLHighlight = config.fMLHighlight;
 		m_bMLToneCurveEnabled = config.bMLToneCurveEnabled;
 		m_bMLGammaEnabled   = config.bMLGammaEnabled;

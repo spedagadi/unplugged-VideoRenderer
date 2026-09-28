@@ -390,6 +390,25 @@ struct Settings_t {
 	// byte-identical to the previous picture. APPENDED (binary boundary).
 	float fMLShadowPedestal = 0.0f;
 
+	// RELATIVE mid-tone target (the Zion grade's one closed-loop control).
+	//
+	// Every other grade input is SOURCE-referred: the models read the pre-correction
+	// texture, so they emit the same value no matter what the tone curve did to the
+	// picture, and the user compensates by hand. This is the delivery-side target the
+	// grade is blind without: the encoded level (0..1, 0 = black 1 = white) that the
+	// scene's AVERAGE should end up at.
+	//
+	// The renderer computes what the curve will deliver for this source's average
+	// (closed-form, CPU-side — PredictGt7Encoded) and solves for the gamma that moves
+	// it onto this value. So refWhite is free to do its actual job — setting how hard
+	// the shoulder works, i.e. highlight safety — while luminosity is chosen
+	// independently. Those two have been the same control, which is why brightening
+	// the image cost the clouds.
+	//
+	// 0 = OFF: the manual fMLGammaTopUp behaves exactly as it always has.
+	// APPENDED (binary boundary).
+	float fMLTargetMid = 0.0f;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -509,6 +528,7 @@ struct Settings_t {
 		fToneLutPivotScale              = 1.0f;
 		fHdrGt7Adapt                    = 0.25f;
 		fMLShadowPedestal               = 0.0f;
+		fMLTargetMid                    = 0.0f;
 	}
 };
 

@@ -335,6 +335,12 @@ private:
 	float m_fMLHighlightRolloffCtrl = 0.0f; // signed offset on the model's rolloff in Auto (rim soften)
 	float m_MLRolloffCtrlApplied = 0.0f;   // what was actually applied (telemetry)
 	float m_fMLGammaTopUp = 0.0f;          // signed offset ADDED to the model's gamma in Auto (midtone lift)
+	// RELATIVE mid-tone target: the encoded (0..1) value the grade should leave the
+	// scene's average at, regardless of what the tone curve did on the way here.
+	// 0 = disabled, which leaves the manual top-up exactly as it always was.
+	float m_fMLTargetMid = 0.0f;
+	float m_MLAutoTopUp = 0.0f;      // what the target computed, for the readout
+	float m_fCurvePeakNits = 0.0f;   // the peak the curve actually divides by
 	// Shadow pedestal: a true OFFSET in the toe, independent of the pixel's value.
 	// The toe (m_fMLShadow / MLShadowToe) is a gain — lift proportional to x — so it
 	// cannot raise a crushed shadow at all (measured: crushFrac unchanged across the
