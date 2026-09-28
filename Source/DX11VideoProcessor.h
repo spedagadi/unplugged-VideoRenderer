@@ -313,10 +313,13 @@ private:
 	// The instrument's OWN throttle — deliberately not the peak anchor's cut/lock
 	// state. See ReadDeliveredStats' call site in Render().
 	uint64_t m_uDeliveredLastFrame = 0;
-	// Content band in the DELIVERED (window-sized) caches. Logged with every line so
-	// the crop is auditable rather than assumed.
+	// Content RECT in the DELIVERED (window-sized) caches — pillarbox columns from
+	// m_videoRect plus the film's own letterbox rows mapped through it. Logged with
+	// every line so the crop is auditable rather than assumed.
 	int m_DeliveredTopRow = 0;
 	int m_DeliveredBotRow = ML_DOWNSAMPLE_H - 1;
+	int m_DeliveredLeftCol = 0;
+	int m_DeliveredRightCol = ML_DOWNSAMPLE_W - 1;
 
 	// Zion ML debug (registry: MLDebugLog / MLDebugPassthrough)
 	bool m_bMLDebug = false;

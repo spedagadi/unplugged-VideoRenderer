@@ -112,10 +112,15 @@ struct MLRenderedLumaStats {
 	bool  valid = false;
 };
 
-// `contentTop`/`contentBottom` are the letterbox rows the bar detector already
-// found, and passing them is NOT optional: on a 2.39:1 film 26% of the readback is
-// black bar, which pins p25 at 0 and inflates crushFrac by that same 26% — the
-// first build measured the matte and reported it as shadow crush.
+// The content RECT, and it has to be two-dimensional. A 2.39:1 film in a 16:9
+// window has a letterbox (rows) and a 16:9 window on an ultrawide display has a
+// pillarbox (columns) — measured, a 3440x1440 window showing a 2560x1440 video is
+// 25.6% black COLUMNS, which no row crop can remove. Cropping only rows produced a
+// crushFrac that was mostly matte and sent a whole feature down the wrong path.
+//
+// The matte is not cosmetic: it pins p01/p05/p25 at 0, dominates crushFrac, and
+// drags mean toward black in proportion to how wrong the display's aspect is.
 void BuildRenderedLumaStats(const uint16_t* luma16, const int rowPitch,
                             MLRenderedLumaStats& out,
-                            int contentTop = 0, int contentBottom = -1);
+                            int contentTop = 0, int contentBottom = -1,
+                            int contentLeft = 0, int contentRight = -1);

@@ -3475,20 +3475,41 @@ void CDX11VideoProcessor::ReadDeliveredStats(unsigned long long frame)
 		return;
 	}
 
-	// Where the picture actually sits inside the WINDOW, in readback rows.
-	// m_videoRect is the destination rect the frame is letterboxed into, so this is
-	// the delivered frame's own content band — independent of what the bar detector
-	// found on the source, which lives in a different coordinate space.
+	// The content RECT in the delivered frame's own space, in readback pixels.
+	//
+	// Two mattes stack here and both have to come out:
+	//   1. the PILLARBOX the player adds — m_videoRect is the destination rect, so
+	//      everything outside it is black. On an ultrawide display this is the big
+	//      one: 3840x2160 fitted into a 3440x1440 window is 2560x1440, i.e. 25.6% of
+	//      the frame is black COLUMNS, which no row crop can touch.
+	//   2. the film's own LETTERBOX, which lives INSIDE m_videoRect. The bar detector
+	//      finds it on the source readback (rows of ML_DOWNSAMPLE_H), so it has to be
+	//      mapped through the video rect before it means anything in window space.
+	// Cropping only (2) left the pillarbox in; cropping only (1) threw the film's
+	// matte away and kept its rows. Both produced a crushFrac that looked like
+	// content and was geometry.
 	m_DeliveredTopRow = 0;
 	m_DeliveredBotRow = ML_DOWNSAMPLE_H - 1;
+	m_DeliveredLeftCol = 0;
+	m_DeliveredRightCol = ML_DOWNSAMPLE_W - 1;
 	{
+		const int winW = (int)m_windowRect.Width();
 		const int winH = (int)m_windowRect.Height();
+		const int vidW = (int)m_videoRect.Width();
 		const int vidH = (int)m_videoRect.Height();
-		if (winH > 0 && vidH > 0) {
-			const float v0 = (float)m_videoRect.top / (float)winH;
-			const float v1 = (float)(m_videoRect.top + vidH) / (float)winH;
-			m_DeliveredTopRow = (int)floorf(v0 * ML_DOWNSAMPLE_H);
-			m_DeliveredBotRow = (int)ceilf(v1 * ML_DOWNSAMPLE_H) - 1;
+		if (winW > 0 && winH > 0 && vidW > 0 && vidH > 0) {
+			// Pillarbox: the video rect's own horizontal extent.
+			m_DeliveredLeftCol  = (int)floorf((float)m_videoRect.left / winW * ML_DOWNSAMPLE_W);
+			m_DeliveredRightCol = (int)ceilf((float)(m_videoRect.left + vidW) / winW * ML_DOWNSAMPLE_W) - 1;
+
+			// Letterbox inside the video rect, mapped from source-readback rows.
+			// contentBottom < 0 means the detector has not produced a band yet —
+			// fall back to the full video rect rather than a zero-height crop.
+			const bool haveBars = (m_MLBarDetected.contentBottom >= m_MLBarDetected.contentTop);
+			const float barTop = haveBars ? (float)m_MLBarDetected.contentTop / ML_DOWNSAMPLE_H : 0.0f;
+			const float barBot = haveBars ? (float)(m_MLBarDetected.contentBottom + 1) / ML_DOWNSAMPLE_H : 1.0f;
+			m_DeliveredTopRow = (int)floorf(((float)m_videoRect.top + barTop * vidH) / winH * ML_DOWNSAMPLE_H);
+			m_DeliveredBotRow = (int)ceilf (((float)m_videoRect.top + barBot * vidH) / winH * ML_DOWNSAMPLE_H) - 1;
 		}
 	}
 
@@ -3516,7 +3537,8 @@ void CDX11VideoProcessor::ReadDeliveredStats(unsigned long long frame)
 		// exactly as the bar cbuffer's uBarV0/uBarSpan do.
 		BuildRenderedLumaStats((const uint16_t*)mr.pData,
 		                       (int)(mr.RowPitch / sizeof(uint16_t)), out,
-		                       m_DeliveredTopRow, m_DeliveredBotRow);
+		                       m_DeliveredTopRow, m_DeliveredBotRow,
+		                       m_DeliveredLeftCol, m_DeliveredRightCol);
 		m_pDeviceContext->Unmap(m_MLStaging, 0);
 	};
 	readOne(m_MLDeliveredCurveOut.p,  m_bDeliveredA, m_DeliveredCurveOut);
@@ -3537,11 +3559,15 @@ void CDX11VideoProcessor::ReadDeliveredStats(unsigned long long frame)
 	// crop= is printed so every number on the line is auditable: if the band is wrong
 	// (or the source's own bars differ from the window's), that shows here instead of
 	// silently becoming "shadow crush".
-	fwprintf(m_pMLDebugFile, L"DELIVERED frame=%llu crop=%d..%d/%d win=%dx%d vid=%dx%d | curveOut: %s | postGrade: %s\n",
-	         frame, m_DeliveredTopRow, m_DeliveredBotRow, ML_DOWNSAMPLE_H,
-	         (int)m_windowRect.Width(), (int)m_windowRect.Height(),
-	         (int)m_videoRect.Width(), (int)m_videoRect.Height(),
-	         fmt(m_DeliveredCurveOut).c_str(), fmt(m_DeliveredPostGrade).c_str());
+	fwprintf(m_pMLDebugFile,
+		L"DELIVERED frame=%llu crop=[%d..%d]x[%d..%d] of %dx%d win=%dx%d vid=%dx%d (%.1f%% of frame) | curveOut: %s | postGrade: %s\n",
+		frame, m_DeliveredTopRow, m_DeliveredBotRow, m_DeliveredLeftCol, m_DeliveredRightCol,
+		ML_DOWNSAMPLE_H, ML_DOWNSAMPLE_W,
+		(int)m_windowRect.Width(), (int)m_windowRect.Height(),
+		(int)m_videoRect.Width(), (int)m_videoRect.Height(),
+		100.0 * (m_DeliveredBotRow - m_DeliveredTopRow + 1) * (m_DeliveredRightCol - m_DeliveredLeftCol + 1)
+		      / (ML_DOWNSAMPLE_H * ML_DOWNSAMPLE_W),
+		fmt(m_DeliveredCurveOut).c_str(), fmt(m_DeliveredPostGrade).c_str());
 	fflush(m_pMLDebugFile);
 }
 

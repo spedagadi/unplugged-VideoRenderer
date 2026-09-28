@@ -360,7 +360,8 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 
 void BuildRenderedLumaStats(const uint16_t* luma16, const int rowPitch,
                             MLRenderedLumaStats& out,
-                            int contentTop, int contentBottom)
+                            int contentTop, int contentBottom,
+                            int contentLeft, int contentRight)
 {
 	if (!luma16) {
 		return;
@@ -370,9 +371,15 @@ void BuildRenderedLumaStats(const uint16_t* luma16, const int rowPitch,
 	if (contentBottom < 0) {
 		contentBottom = h - 1;
 	}
+	if (contentRight < 0) {
+		contentRight = w - 1;
+	}
 	contentTop    = std::max(0, std::min(contentTop,    h - 1));
 	contentBottom = std::max(contentTop, std::min(contentBottom, h - 1));
+	contentLeft   = std::max(0, std::min(contentLeft,   w - 1));
+	contentRight  = std::max(contentLeft, std::min(contentRight, w - 1));
 	const int rows = contentBottom - contentTop + 1;
+	const int cols = contentRight - contentLeft + 1;
 
 	// 256 bins is coarser than the readback's 16 bits and that is the point: these
 	// numbers are compared against 8-bit screen grabs, so a bin IS one output code.
@@ -389,7 +396,7 @@ void BuildRenderedLumaStats(const uint16_t* luma16, const int rowPitch,
 
 	for (int y = contentTop; y <= contentBottom; y++) {
 		const uint16_t* row = luma16 + (size_t)y * rowPitch;
-		for (int x = 0; x < w; x++) {
+		for (int x = contentLeft; x <= contentRight; x++) {
 			const int64_t v = row[x];
 			sum += v;
 			if (v <= crushLimit) {
@@ -402,7 +409,7 @@ void BuildRenderedLumaStats(const uint16_t* luma16, const int rowPitch,
 		}
 	}
 
-	const int64_t total = (int64_t)w * rows;   // CONTENT samples, not the whole readback
+	const int64_t total = (int64_t)rows * cols;   // CONTENT samples, not the readback
 	const double k = 255.0 / 65535.0;
 	out.mean      = (float)(sum * k / total);
 	out.crushFrac = (float)((double)crush / total);
