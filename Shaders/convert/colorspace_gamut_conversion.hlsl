@@ -135,7 +135,29 @@ float3 Colorspace_Gamut_Compress_2020_to_709(const float3 rgb)
     // the compression travels toward.
     const float Y = saturate(dot(mapped, float3(0.2126, 0.7152, 0.0722)));
 
-    const float k = min(min(GamutChannelLimitK(mapped.r, Y), GamutChannelLimitK(mapped.g, Y)),
-                        GamutChannelLimitK(mapped.b, Y));
+    float k = min(min(GamutChannelLimitK(mapped.r, Y), GamutChannelLimitK(mapped.g, Y)),
+                  GamutChannelLimitK(mapped.b, Y));
+
+    // Land INSIDE the boundary, not on it. This is the part that matters.
+    //
+    // k as computed above is the LARGEST scale that keeps every channel in [0,1] —
+    // i.e. it parks the colour precisely on the edge of the 709 triangle. But that
+    // edge is the locus of MAXIMUM saturation, so a deep sky blue pulled onto it
+    // comes out with red at exactly 0 and its saturation entirely intact: the
+    // correction is mathematically correct and visually a no-op. Measured: the sky
+    // stayed cobalt next to madVR's muted teal.
+    //
+    // Real gamut MAPPING compresses the volume inward. Squaring does that with one
+    // multiply and has exactly the right shape: k = 1 (in gamut) is untouched, so
+    // nothing a display can show is altered at all; only colours that had to move
+    // are pulled further in, and the harder they had to move the harder they are
+    // pulled. Any value below the boundary is still in gamut, so this cannot
+    // reintroduce the overflow it is correcting.
+    //
+    // The exponent is the strength. 2.0 is a starting point; raise it for a more
+    // aggressive roll-off (madVR-like), 1.0 recovers the boundary-clamping behaviour
+    // this replaced.
+    k = k * k;
+
     return saturate(Y + k * (mapped - Y));
 }
