@@ -89,3 +89,53 @@ float3 Colorspace_Gamut_Conversion_2020_to_709(const float3 rgb)
 {
     return mul(convert_matrix_2020_to_709, rgb);
 }
+
+// 2020 -> 709 as gamut MAPPING rather than gamut CLIPPING.
+//
+// The matrix above has a red row with negative coefficients
+// (R709 = 1.6605 R - 0.5876 G - 0.0728 B), so a bright cyan-leaning pixel — low red,
+// high green and blue — comes out with a NEGATIVE red, which the caller's saturate()
+// clamps to zero. Red never comes back. Measured on a snow field: R 209.9 / G 234.2 /
+// B 232.4 against madVR's 219.6 / 229.7 / 231.0 — blue identical, red ten codes short,
+// saturation doubled. It reads as "the whites are going blue" and it is really a red
+// collapse, and it gets WORSE as exposure rises, because brighter highlights sit
+// further outside the 709 triangle.
+//
+// A gamut boundary is not a wall per channel, it is the edge of the triangle, and the
+// correct thing to do when a colour is outside it is to travel toward the pixel's own
+// neutral point until it is inside. That keeps HUE exactly — the direction from the
+// neutral axis is unchanged — and removes only saturation. Clamping per channel does
+// the opposite: it changes hue as a side effect of a numerical overflow.
+//
+// k = 1 keeps the colour; k = 0 is fully neutral. For a channel outside [0,1] the
+// limit is where that channel lands exactly on the boundary, and the binding channel
+// is the one that needs the smallest k.
+// The largest saturation scale k in [0,1] that keeps one channel inside [0,1] once
+// the colour is moved toward the neutral point Y: c'(k) = Y + k*(c - Y).
+// A plain function, not a lambda — these shaders compile with fxc for ps_5_0, which
+// has no lambda support.
+float GamutChannelLimitK(const float c, const float Y)
+{
+    if (c < 0.0f) {
+        const float d = Y - c;                                   // > 0 when c < 0 <= Y
+        return (d > 1e-6f) ? saturate(Y / d) : 0.0f;
+    }
+    if (c > 1.0f) {
+        const float d = c - Y;
+        return (d > 1e-6f) ? saturate((1.0f - Y) / d) : 0.0f;
+    }
+    return 1.0f;
+}
+
+float3 Colorspace_Gamut_Compress_2020_to_709(const float3 rgb)
+{
+    const float3 mapped = Colorspace_Gamut_Conversion_2020_to_709(rgb);
+
+    // The primaries conversion is luminance-preserving, so this is the neutral point
+    // the compression travels toward.
+    const float Y = saturate(dot(mapped, float3(0.2126, 0.7152, 0.0722)));
+
+    const float k = min(min(GamutChannelLimitK(mapped.r, Y), GamutChannelLimitK(mapped.g, Y)),
+                        GamutChannelLimitK(mapped.b, Y));
+    return saturate(Y + k * (mapped - Y));
+}

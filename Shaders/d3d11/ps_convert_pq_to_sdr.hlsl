@@ -229,7 +229,7 @@ float4 main(PS_INPUT input) : SV_Target
     //
     //     color = ST2084ToLinear(color, LuminanceScale);
     //     color.rgb = ToneMappingHable(color.rgb);
-    //     color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+    //     color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb);
     //     color = pow(color, 1.0 / 2.2);
     //
     // Kept so a regression can be isolated by switching a row instead of
@@ -254,7 +254,7 @@ float4 main(PS_INPUT input) : SV_Target
         color.rgb = ToneMappingHable(color.rgb);
 
         if (outputGamut < 0.5) {
-            color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb);
         }
     }
     // ---------------------------------------------------------------------
@@ -383,7 +383,7 @@ float4 main(PS_INPUT input) : SV_Target
         color.rgb = mapped / max(sdrNits, 1e-3);
 
         if (outputGamut < 0.5) {
-            color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb);
         }
     }
     else if (toneLutEnable > 0.5) {
@@ -394,7 +394,7 @@ float4 main(PS_INPUT input) : SV_Target
         color.rgb = ToneMapExperimental(color.rgb);
 
         if (outputGamut < 0.5) {
-            color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb);
         }
     }
     else {
@@ -665,7 +665,7 @@ float4 main(PS_INPUT input) : SV_Target
         // Runs on the display-relative values the curve just produced: the gamut
         // matrices are only valid in linear light, and the offset is already out.
         if (outputGamut < 0.5) {
-            color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb);
         }
     }
 
