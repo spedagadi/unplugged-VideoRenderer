@@ -538,6 +538,10 @@ private:
 	// (1.47x at 0.25, 1.87x at 0.10). This is what limits how much exposure
 	// fHdrRefWhiteNits can buy before the highlights clamp. cbuffer[25].
 	float m_fHdrGt7Alpha     = 0.25f;
+	// How much of the shoulder's luminance compression is passed on to chroma.
+	// 0 = none (previous picture), 1 = chroma compresses as hard as luminance.
+	// cbuffer[26].
+	float m_fHdrGt7Desat     = 0.0f;
 	float m_HableScenePeakApplied = -1.0f;  // value last pushed to the cbuffer
 
 	// The gamma top-up actually added on top of the model's prediction this frame

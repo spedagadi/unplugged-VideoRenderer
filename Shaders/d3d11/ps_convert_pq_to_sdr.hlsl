@@ -88,6 +88,10 @@ cbuffer PS_PARAMETERS : register(b0)
     // past that point, so this is the term that lets exposure rise without the
     // highlights dying. 0 = fall back to the shipped constant. cbuffer[25].
     float gt7Alpha;
+    // How much of the shoulder's luminance compression is passed on to chroma.
+    // 0 = none (previous behaviour), 1 = chroma compresses exactly as hard as
+    // luminance. cbuffer[26].
+    float gt7Desat;
 };
 
 #include "../convert/conv_matrix.hlsl"
@@ -375,6 +379,32 @@ float4 main(PS_INPUT input) : SV_Target
                                    (gt7FadeEnd > gt7FadeStart) ? gt7FadeStart : GT7_FADE_START,
                                    (gt7FadeEnd > gt7FadeStart) ? gt7FadeEnd   : GT7_FADE_END,
                                    (gt7Alpha > 0.001f) ? gt7Alpha : GT7_ALPHA);
+
+        // LUMINANCE-LINKED DESATURATION.
+        //
+        // HDR can carry a cobalt blue at 300 nits. SDR at 85 cannot show that chroma
+        // at that luminance without it reading garish — the colour is inside the
+        // BT.709 triangle, so gamut mapping has no jurisdiction over it at all. What
+        // has to give is chroma, in proportion to how much luminance the curve
+        // compressed. madVR does this; we did not, because the grade scales RGB
+        // uniformly (deliberately, to stop hue drifting) and GT7's own chroma fade
+        // only operates at 0.98..1.16 of the ceiling's I — nowhere near a mid-bright
+        // sky. So a saturated master arrives at SDR with its HDR chroma intact.
+        //
+        // compression < 1 only where the shoulder actually worked, so below the knee
+        // this is a no-op by construction: untouched midtones, no global wash.
+        //
+        // Lerping toward the pixel's own neutral point keeps HUE exactly and removes
+        // only saturation — the same geometry the gamut compression uses, for the same
+        // reason. gt7Desat 0 = lerp(1, x, 0) = 1 = the previous picture, byte for byte.
+        if (gt7Desat > 0.001f) {
+            const float lumIn  = dot(adapted, float3(0.2126, 0.7152, 0.0722));
+            const float lumOut = dot(mapped,  float3(0.2126, 0.7152, 0.0722));
+            const float compression = lumOut / max(lumIn, 1e-4);
+            const float chromaScale = saturate(lerp(1.0, compression, saturate(gt7Desat)));
+            const float lum = lumOut;
+            mapped = lerp(float3(lum, lum, lum), mapped, chromaScale);
+        }
 
         // Display mapping. Nothing else scales this, so sdrNits reaches the picture
         // through the ceiling AND through here — and because the gain is free of

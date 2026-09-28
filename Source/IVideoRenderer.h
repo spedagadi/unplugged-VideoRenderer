@@ -424,6 +424,22 @@ struct Settings_t {
 	// work. 0.25 = exactly today's picture. APPENDED (binary boundary).
 	float fHdrGt7Alpha = 0.25f;
 
+	// Luminance-linked DESATURATION (GT7 / GT7 Adapt).
+	//
+	// HDR carries chroma that SDR cannot show at the same luminance even when the
+	// colour is comfortably inside the BT.709 triangle — a cobalt sky is in gamut and
+	// still looks garish once the highlights are pulled down to 85 nits. Gamut mapping
+	// has no jurisdiction there, because nothing overflowed. What has to give is
+	// saturation, in proportion to how much the tone curve compressed.
+	//
+	// This passes a fraction of the shoulder's own compression through to chroma, by
+	// moving the pixel toward its neutral point (hue preserved exactly, only
+	// saturation removed). Below the knee the compression is 1, so midtones are
+	// untouched — it cannot become a global wash.
+	//
+	// 0 = off, i.e. byte-identical to the previous picture. APPENDED (binary boundary).
+	float fHdrGt7Desat = 0.0f;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -545,6 +561,7 @@ struct Settings_t {
 		fMLShadowPedestal               = 0.0f;
 		fMLTargetMid                    = 0.0f;
 		fHdrGt7Alpha                    = 0.25f;
+		fHdrGt7Desat                    = 0.0f;
 	}
 };
 

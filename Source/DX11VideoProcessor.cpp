@@ -1555,6 +1555,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// [25] the shoulder's reach (GT7_ALPHA). Takes a padding slot, so the buffer
 		// stays 28 floats / 112 bytes — no alignment risk.
 		cbuffer[25] = m_fHdrGt7Alpha;
+		cbuffer[26] = m_fHdrGt7Desat;   // luminance-linked chroma compression
 	}
 
 	if (m_pCorrectionConstants) {
@@ -7800,6 +7801,12 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	// 0.25, so a clamped-to-zero value would silently mean something else.
 	if (config.fHdrGt7Alpha != m_fHdrGt7Alpha) {
 		m_fHdrGt7Alpha = std::clamp(config.fHdrGt7Alpha, 0.02f, 0.90f);
+		changeLuminanceParams = true;
+	}
+	// 0 is the "off" value and must survive the clamp, so this is a range clamp and
+	// not an enable test.
+	if (config.fHdrGt7Desat != m_fHdrGt7Desat) {
+		m_fHdrGt7Desat = std::clamp(config.fHdrGt7Desat, 0.0f, 1.0f);
 		changeLuminanceParams = true;
 	}
 
