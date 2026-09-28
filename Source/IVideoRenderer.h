@@ -382,6 +382,14 @@ struct Settings_t {
 	// APPENDED (binary boundary).
 	float fHdrGt7Adapt = 0.25f;
 
+	// Shadow PEDESTAL (Zion grade): a true offset added in the toe, independent of
+	// the pixel's own value. The existing shadow toe is a GAIN (lift proportional to
+	// x), so despite being documented as a pedestal it cannot raise a pixel already
+	// at code 0-4 — measured, crushFrac was identical (0.454) before and after the
+	// entire grade while mean rose 34%. This is the actuator for that. 0 = off, i.e.
+	// byte-identical to the previous picture. APPENDED (binary boundary).
+	float fMLShadowPedestal = 0.0f;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -500,6 +508,7 @@ struct Settings_t {
 		fHdrGt7FadeEnd                  = 1.16f;
 		fToneLutPivotScale              = 1.0f;
 		fHdrGt7Adapt                    = 0.25f;
+		fMLShadowPedestal               = 0.0f;
 	}
 };
 

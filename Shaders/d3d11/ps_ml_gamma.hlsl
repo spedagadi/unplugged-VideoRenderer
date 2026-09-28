@@ -97,7 +97,10 @@ cbuffer MLParams : register(b0)
 	// The user's signed offset on the model's gamma, kept SEPARATE from MLGamma so
 	// it can be held back inside skin by the trained skin LUT below.
 	float MLGammaTopUp;
-	float _padGT0;
+	// Shadow PEDESTAL — a true offset, independent of x (see applyToneCurve). Takes a
+	// padding slot at the tail, which only this shader declares, so the shared
+	// MLParams_t grows by nothing and every existing offset is unchanged.
+	float MLShadowPedestal;
 	float _padGT1;
 	float _padGT2;
 };
@@ -118,13 +121,38 @@ float srcLumAt(float2 uv)
 // Unified tone curve: shadow toe → gamma (sky-relaxed guard) → highlight rolloff →
 // sky cloud-band lift. Operates on I_norm; returns graded I_norm. `sky` = S *
 // MLSkyStrength (0 when sky features are off → exactly the global path).
-float applyToneCurve(float x, float sky, float skinW)
+float applyToneCurve(float x, float sky, float skinW, float inContent)
 {
 	// 1. Shadow toe: DV L2 offset pedestal lift — raises dark end toward knee
 	if (MLShadowToe > 0.005 && x < MLShadowKnee && x > 0.0) {
 		float t = 1.0 - x / max(MLShadowKnee, 0.01);
 		x += MLShadowToe * x * t * t;
 		x = saturate(x);
+	}
+
+	// 1b. Shadow PEDESTAL: a true offset, independent of x.
+	//
+	// The toe above is a GAIN — its lift is proportional to x, so despite the
+	// comment it is not a pedestal and cannot raise a pixel already at code 0-4.
+	// Measured: crushFrac was IDENTICAL (0.454 -> 0.454) before and after the whole
+	// grade while mean rose 34%. That is not a tuning problem, it is pow(0,g) = 0.
+	// This term is the only thing in the curve that can lift a crushed shadow.
+	//
+	// Deliberately SEPARATE from MLShadowToe rather than a change to it: MLShadowToe
+	// is the shadow model's output and its prediction is calibrated to the
+	// multiplicative form. Editing that shape would silently invalidate the model —
+	// the exact failure this grade keeps rediscovering.
+	//
+	// Gated on inContent because the letterbox matte is black in the source, and the
+	// bar repaint is off in practice — an ungated offset would turn it grey. Tapers to
+	// zero at the knee, so midtones are untouched by construction, and 0 is exactly
+	// the previous picture.
+	if (MLShadowPedestal > 0.0 && inContent > 0.5) {
+		const float k = max(MLShadowKnee, 0.01);
+		if (x < k) {
+			const float t = 1.0 - x / k;
+			x = saturate(x + MLShadowPedestal * t * t);
+		}
 	}
 
 	// 2. Gamma with a sky-relaxed guard leg. Both legs use the SAME curve family
@@ -210,7 +238,7 @@ float4 main(PS_INPUT input) : SV_Target
 	// === UNIFIED TONE CURVE (shadow toe → gamma → highlight rolloff) ===
 	// Global — applied to every pixel identically; S=0 reproduces the global path.
 	const float skyT = S * MLSkyStrength;
-	I_norm = applyToneCurve(I_norm, skyT, skinW);
+	I_norm = applyToneCurve(I_norm, skyT, skinW, inContent);
 
 	// Skin tone-preservation (stage 5): steer the WHOLE person region's luma back
 	// toward the source skin tone. The gate is a POISSON-RELAXED FIELD of the pure

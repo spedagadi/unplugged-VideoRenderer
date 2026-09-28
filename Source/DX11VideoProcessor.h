@@ -214,6 +214,9 @@ private:
 		float MLSkinLUTCB1;
 		float MLChromaGate;        // 1.0 = chroma pass active
 		float MLHuntGate;          // 1.0 = hunt active
+		// NOT free, despite the name: these six carry the shadow/contrast/sky debug
+		// flags and the zone parameters that ps_ml_shadow reads. A new field goes at
+		// the END of the struct instead.
 		float _reserved[6];
 		// P0 — black bars repaint
 		float uBarTop;
@@ -264,7 +267,12 @@ private:
 		// to a term it cannot see. Appended tail: every offset above is unchanged,
 		// and only ps_ml_gamma.hlsl declares this far.
 		float MLGammaTopUp;
-		float _padGT0;
+		// Shadow PEDESTAL: a true offset in the toe, independent of x. Takes a
+		// padding slot rather than growing the struct — the layout is shared by every
+		// ps_ml_*.hlsl and its size is locked to a 16-byte boundary. Only ps_ml_gamma
+		// declares this far, so no other shader's offsets move. 0 = off, and off is
+		// byte-identical to the previous picture.
+		float MLShadowPedestal;
 		float _padGT1;
 		float _padGT2;
 	};
@@ -320,6 +328,11 @@ private:
 	float m_fMLHighlightRolloffCtrl = 0.0f; // signed offset on the model's rolloff in Auto (rim soften)
 	float m_MLRolloffCtrlApplied = 0.0f;   // what was actually applied (telemetry)
 	float m_fMLGammaTopUp = 0.0f;          // signed offset ADDED to the model's gamma in Auto (midtone lift)
+	// Shadow pedestal: a true OFFSET in the toe, independent of the pixel's value.
+	// The toe (m_fMLShadow / MLShadowToe) is a gain — lift proportional to x — so it
+	// cannot raise a crushed shadow at all (measured: crushFrac unchanged across the
+	// whole grade). This is the term that can. 0 = off.
+	float m_fMLShadowPedestal = 0.0f;
 	bool  m_bMLContrastEnabled = true;
 	float m_fMLContrast = 0.15f; // micro-contrast clarity strength (exponent) — overwritten by config
 	float m_fMLContrastZoneLo = 0.15f;

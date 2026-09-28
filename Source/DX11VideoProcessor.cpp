@@ -2359,7 +2359,11 @@ void CDX11VideoProcessor::SetMLParams()
 	// gamma pass can gate it by the trained skin LUT. Stays 0 when the model did
 	// not predict, which is also the "no top-up" default.
 	params.MLGammaTopUp = gammaTopUp;
-	params._padGT0 = 0.0f;
+	// Shadow pedestal — the offset the toe's gain cannot be. Bounded to 8% of white:
+	// it is a fraction of I_norm, and a value large enough to matter for crushed
+	// shadows is also large enough to grey out the letterbox matte if the shader's
+	// in-content gate ever fails. 0 = the previous picture exactly.
+	params.MLShadowPedestal = fminf(0.08f, fmaxf(0.0f, m_fMLShadowPedestal));
 	params._padGT1 = 0.0f;
 	params._padGT2 = 0.0f;
 
@@ -7737,7 +7741,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	}
 
 	if (config.bMLEnabled != m_bML || config.iMLMode != m_iMLMode ||
-			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow || config.fMLShadowDehaze != m_fMLShadowDehaze || config.fMLHighlightRolloffCtrl != m_fMLHighlightRolloffCtrl || config.fMLGammaTopUp != m_fMLGammaTopUp ||
+			config.fMLGamma != m_fMLGamma || config.fMLShadow != m_fMLShadow || config.fMLShadowDehaze != m_fMLShadowDehaze || config.fMLHighlightRolloffCtrl != m_fMLHighlightRolloffCtrl || config.fMLGammaTopUp != m_fMLGammaTopUp || config.fMLShadowPedestal != m_fMLShadowPedestal ||
 			config.fMLHighlight != m_fMLHighlight ||
 			config.bMLGammaEnabled != m_bMLGammaEnabled ||
 			config.bMLShadowEnabled != m_bMLShadowEnabled ||
@@ -7771,6 +7775,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_fMLShadowDehaze = config.fMLShadowDehaze;
 		m_fMLHighlightRolloffCtrl = config.fMLHighlightRolloffCtrl;
 		m_fMLGammaTopUp = config.fMLGammaTopUp;
+		m_fMLShadowPedestal = std::clamp(config.fMLShadowPedestal, 0.0f, 0.08f);
 		m_fMLHighlight = config.fMLHighlight;
 		m_bMLToneCurveEnabled = config.bMLToneCurveEnabled;
 		m_bMLGammaEnabled   = config.bMLGammaEnabled;
