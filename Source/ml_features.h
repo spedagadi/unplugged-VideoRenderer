@@ -71,13 +71,20 @@ struct MLBarBounds {
 // own thresh_low (0.01) and pinned its hysteresis mix at 0 — so no scene change
 // ever snapped and the IIR ramp alone set the peak. Measured: filt_pq ramping
 // 0.3202 -> 0.3785 over ~80 frames with mix = 0.000 on every line.
+// `outMeanNits`, when given, receives the mean luminance in NITS over the content
+// rows. Deliberately separate from features[1]: that is the mean of PQ CODES, and
+// the mean of codes decodes to a fraction of a nit — useless for anything that
+// reasons about exposure, which is why an auto-exposure solver built on it never
+// fired. Averaging in nits is the only form of "the scene average" that means
+// something physically.
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch,
                      float features[ML_FEATURE_DIM],
                      MLLumaDomain domain = MLLumaDomain::PQ,
                      MLBarBounds* bars = nullptr,
                      float* outTextureEnergy = nullptr,
                      float* outPeakP995 = nullptr,
-                     float* outActiveFrac = nullptr);
+                     float* outActiveFrac = nullptr,
+                     float* outMeanNits = nullptr);
 
 // ---------------------------------------------------------------------------
 // DELIVERED-FRAME STATISTICS (the closed-loop instrument)

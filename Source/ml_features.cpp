@@ -61,6 +61,22 @@ inline float SdrGammaToPQ(float y_sdr)
 	return SdrNitsToPQ(100.0f * powf(y_sdr, 2.2f));
 }
 
+// ST.2084 decode, PQ code -> nits. The exact inverse of SdrNitsToPQ above.
+// Needed because the MEAN of PQ codes is not the mean of nits: PQ is perceptual, so
+// decoding an average code gives a number far below the average luminance (a scene
+// averaging PQ 0.18 decodes to ~0.8 nits while its mean luminance is tens). Anything
+// solving an exposure from "the scene average" must average in nits, not in codes.
+inline float PqToNits(float pq)
+{
+	if (pq <= 0.0f) return 0.0f;
+	const float p = powf(pq, 1.0f / 78.84375f);
+	const float num = p - 0.8359375f;
+	if (num <= 0.0f) return 0.0f;
+	const float den = 18.8515625f - 18.6875f * p;
+	if (den <= 0.0f) return 10000.0f;
+	return 10000.0f * powf(num / den, 1.0f / 0.1593017578125f);
+}
+
 // Summed area table with a 1-cell margin so zone queries need no bounds checks.
 float SatQuery(const std::vector<float>& sat, int stride,
                int y0, int y1, int x0, int x1)
@@ -77,7 +93,7 @@ constexpr float kCropLimit = 0.01f;
 
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[ML_FEATURE_DIM],
                      MLLumaDomain domain, MLBarBounds* bars, float* outTextureEnergy,
-                     float* outPeakP995, float* outActiveFrac)
+                     float* outPeakP995, float* outActiveFrac, float* outMeanNits)
 {
 	const int w = ML_DOWNSAMPLE_W;
 	const int h = ML_DOWNSAMPLE_H;
@@ -130,6 +146,25 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 			if (bin > max_bin) max_bin = bin;
 			if (fv > 0.5f) bright++;
 		}
+	}
+
+	// 1a-bis) mean luminance in NITS over the CONTENT rows only. A second pass,
+	// because the content bounds are not known until the first one finishes. This is
+	// the number an exposure solver needs: the mean of the PQ codes (features[1])
+	// decodes to a fraction of a nit and is useless for it.
+	if (outMeanNits) {
+		const int y0 = (contentTop >= 0 && contentTop < h) ? contentTop : 0;
+		const int y1 = (contentBottom >= y0 && contentBottom < h) ? contentBottom : h - 1;
+		double acc = 0.0;
+		int64_t cnt = 0;
+		for (int y = y0; y <= y1; y++) {
+			const float* rowv = tv.data() + (size_t)y * w;
+			for (int x = 0; x < w; x++) {
+				acc += PqToNits(rowv[x]);
+				cnt++;
+			}
+		}
+		*outMeanNits = cnt ? (float)(acc / (double)cnt) : 0.0f;
 	}
 
 	// 1b) texture energy — fraction of interior pixels whose feature-domain

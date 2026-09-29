@@ -500,6 +500,12 @@ private:
 	// the filter IS the state, and clearing them restarts the detection.
 	float m_PeakAvgPq = 0.0f;
 	float m_PeakMaxPq = 0.0f;
+	// Mean luminance in NITS over the content rows, per frame and then filtered with
+	// the same snap/settle/lock cadence as the peak. The exposure solver runs on this;
+	// the PQ-coded average (m_PeakAvgPq) decodes to a fraction of a nit and cannot be
+	// used for exposure at all.
+	float m_MLMeanNitsRaw = 0.0f;
+	float m_MeanNitsSmooth = -1.0f;
 	// Scene-lock state (snap/settle/lock with asymmetric drift — see the block at
 	// UpdatePeak). The anchor is locked within a scene so the Hable normaliser
 	// cannot pump; it only drifts downward (slow brighten) once locked.

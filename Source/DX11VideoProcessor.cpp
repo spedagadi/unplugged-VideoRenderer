@@ -1585,12 +1585,15 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// ad= is GT7 Adapt's scene-peak weight and sPk= the measured peak it blends
 		// toward, so the anchor the shader actually used is one line's arithmetic:
 		// peak = cll*(1-ad) + sPk*ad.
-		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} ad={:.2f} refW={:.1f} sPk={:.1f}",
+		// refW is the EFFECTIVE reference white (the solved value when auto exposure
+		// is on) and avgN the scene mean in nits it was solved from, so "is auto
+		// exposure doing anything" is answerable from one log line.
+		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} ad={:.2f} refW={:.1f} sPk={:.1f} avgN={:.1f}",
 			(uintptr_t)m_pCorrectionConstants.p, 10000.0f / m_iSDRDisplayNits, m_iSDRDisplayNits,
 			m_fHdrHighlightNeutral, m_fHdrChromaExp,
 			discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_GT7_ADAPT),
 			m_fHdrGt7Blend, m_fHdrGt7Adapt,
-			m_fEffRefWhite, m_HableScenePeakNits);
+			m_fEffRefWhite, m_HableScenePeakNits, m_MeanNitsSmooth);
 		m_pDeviceContext->UpdateSubresource(m_pCorrectionConstants, 0, nullptr, &cbuffer, 0, 0);
 		// Arm the read-back: the next few correction draws report the buffer they
 		// ACTUALLY had bound at b0 and its float values. [CBPROBE] absent after this
@@ -2556,7 +2559,7 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	// VP, so only the SOURCE decides its domain; the correction is downstream of it.
 	const MLLumaDomain domain =
 		MLFeatureDomainIsPq() ? MLLumaDomain::PQ : MLLumaDomain::SDRGamma22;
-	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain, &m_MLBarDetected, &m_MLRawTexture, &m_MLPeakPq995, &m_MLActiveFrac);
+	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain, &m_MLBarDetected, &m_MLRawTexture, &m_MLPeakPq995, &m_MLActiveFrac, &m_MLMeanNitsRaw);
 	m_pDeviceContext->Unmap(m_MLStaging, 0);
 
 	if (m_bMLDebug && m_pMLDebugFile) {
@@ -5811,6 +5814,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					// A fresh anchor means a fresh title or session: the exposure
 					// ratchet must not carry across it.
 					m_fRefWhiteAuto = 0.0f;
+					m_MeanNitsSmooth = m_MLMeanNitsRaw;
 					m_ZoneSeen = false;
 					m_ZoneChangeFrac = 0.0f;
 					for (int i = 0; i < 25; ++i) m_PrevZoneMax[i] = 0.0f;
@@ -5926,6 +5930,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					// SNAP — a real scene change arrives in ONE frame.
 					m_PeakAvgPq = avgPq;
 					m_PeakMaxPq = maxPq;
+					m_MeanNitsSmooth = m_MLMeanNitsRaw;
 					m_SceneLocked = false;
 					m_SceneFrames = 0;
 					for (int i = 0; i < 4; ++i) m_DeltaHistory[i] = 0.0f;
@@ -5936,6 +5941,11 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					const float settleCoeff = 1.0f - expf(-1.0f / 5.0f);
 					m_PeakAvgPq += settleCoeff * (avgPq - m_PeakAvgPq);
 					m_PeakMaxPq += settleCoeff * (maxPq - m_PeakMaxPq);
+					if (m_MeanNitsSmooth < 0.0f) {
+						m_MeanNitsSmooth = m_MLMeanNitsRaw;
+					} else {
+						m_MeanNitsSmooth += settleCoeff * (m_MLMeanNitsRaw - m_MeanNitsSmooth);
+					}
 					if (m_SceneFrames >= kSceneSettleFrames) m_SceneLocked = true;
 				}
 				// LOCKED — nothing else moves the anchor. A detected cut is the only
@@ -5956,8 +5966,12 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// below. Validated before writing it: T=0.42 predicts ~200 for a 33-nit
 				// indoor scene average (the title that needed 200 by hand) and ~66 for a
 				// 100-nit outdoor one (Everest, tuned to 80 by hand).
+				// m_MeanNitsSmooth, NOT PqToLinearNits(m_PeakAvgPq): the mean of PQ
+				// codes decodes to a fraction of a nit, so the solver built on it never
+				// passed its own >1 nit guard and silently did nothing. The extractor
+				// now averages in nits over the content rows.
 				if (m_bAutoRefWhite && m_fCurvePeakNits > 10.0f && m_iSDRDisplayNits > 0) {
-					const float srcAvg = exptm::PqToLinearNits(m_PeakAvgPq);
+					const float srcAvg = m_MeanNitsSmooth;
 					if (srcAvg > 1.0f) {
 						float want = powf(m_fRefWhiteTarget, 2.2f) * (float)m_iSDRDisplayNits
 						             * m_fCurvePeakNits / (2.2f * srcAvg);
