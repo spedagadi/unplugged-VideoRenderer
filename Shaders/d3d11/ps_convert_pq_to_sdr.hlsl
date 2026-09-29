@@ -271,10 +271,15 @@ float4 main(PS_INPUT input) : SV_Target
         color.rgb = ToneMappingHable(color.rgb);
 
         if (outputGamut < 0.5) {
-            color.rgb = (gamutMapHere > 0.5)
-                        ? Colorspace_Gamut_Compress_2020_to_709(color.rgb,
-                                                              (gamutCap > 0.001f) ? gamutCap : 1.0f)
-                        : color.rgb;
+            color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+            // The CONSTRAINT is conditional; the conversion above is not. An earlier
+            // edit folded the two into one gated call, so when the chroma pass took
+            // over the constraint (gamutMapHere = 0) the primaries conversion vanished
+            // with it and the frame reached the panel still in 2020 primaries —
+            // washed out exactly as if the output gamut were BT.2020.
+            if (gamutMapHere > 0.5)
+                color.rgb = Colorspace_Gamut_Constrain(color.rgb,
+                                                       (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
     }
     // ---------------------------------------------------------------------
@@ -429,10 +434,15 @@ float4 main(PS_INPUT input) : SV_Target
         color.rgb = mapped / max(sdrNits, 1e-3);
 
         if (outputGamut < 0.5) {
-            color.rgb = (gamutMapHere > 0.5)
-                        ? Colorspace_Gamut_Compress_2020_to_709(color.rgb,
-                                                              (gamutCap > 0.001f) ? gamutCap : 1.0f)
-                        : color.rgb;
+            color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+            // The CONSTRAINT is conditional; the conversion above is not. An earlier
+            // edit folded the two into one gated call, so when the chroma pass took
+            // over the constraint (gamutMapHere = 0) the primaries conversion vanished
+            // with it and the frame reached the panel still in 2020 primaries —
+            // washed out exactly as if the output gamut were BT.2020.
+            if (gamutMapHere > 0.5)
+                color.rgb = Colorspace_Gamut_Constrain(color.rgb,
+                                                       (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
     }
     else if (toneLutEnable > 0.5) {
@@ -443,10 +453,15 @@ float4 main(PS_INPUT input) : SV_Target
         color.rgb = ToneMapExperimental(color.rgb);
 
         if (outputGamut < 0.5) {
-            color.rgb = (gamutMapHere > 0.5)
-                        ? Colorspace_Gamut_Compress_2020_to_709(color.rgb,
-                                                              (gamutCap > 0.001f) ? gamutCap : 1.0f)
-                        : color.rgb;
+            color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+            // The CONSTRAINT is conditional; the conversion above is not. An earlier
+            // edit folded the two into one gated call, so when the chroma pass took
+            // over the constraint (gamutMapHere = 0) the primaries conversion vanished
+            // with it and the frame reached the panel still in 2020 primaries —
+            // washed out exactly as if the output gamut were BT.2020.
+            if (gamutMapHere > 0.5)
+                color.rgb = Colorspace_Gamut_Constrain(color.rgb,
+                                                       (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
     }
     else {
@@ -717,10 +732,15 @@ float4 main(PS_INPUT input) : SV_Target
         // Runs on the display-relative values the curve just produced: the gamut
         // matrices are only valid in linear light, and the offset is already out.
         if (outputGamut < 0.5) {
-            color.rgb = (gamutMapHere > 0.5)
-                        ? Colorspace_Gamut_Compress_2020_to_709(color.rgb,
-                                                              (gamutCap > 0.001f) ? gamutCap : 1.0f)
-                        : color.rgb;
+            color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+            // The CONSTRAINT is conditional; the conversion above is not. An earlier
+            // edit folded the two into one gated call, so when the chroma pass took
+            // over the constraint (gamutMapHere = 0) the primaries conversion vanished
+            // with it and the frame reached the panel still in 2020 primaries —
+            // washed out exactly as if the output gamut were BT.2020.
+            if (gamutMapHere > 0.5)
+                color.rgb = Colorspace_Gamut_Constrain(color.rgb,
+                                                       (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
     }
 
