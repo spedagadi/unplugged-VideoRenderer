@@ -188,7 +188,24 @@ float3 GT7ToneMap(float3 rgbNits, float ceilingNits, float grayPointNits,
     // Luminance from the skewed color, chroma from the ORIGINAL, scaled.
     const float3 scaledNits = ictcp_to_linear(float3(skewedUcs.x, ucs.y * chromaScale, ucs.z * chromaScale));
 
-    return min(lerp(skewedNits, scaledNits, blendRatio), ceilingNits);
+    const float3 blended = lerp(skewedNits, scaledNits, blendRatio);
+
+    // SOFT ceiling, not min(). The reference clamps hard at framebufferLuminanceTarget_,
+    // which is fine for a game whose content peak sits near the ceiling. The adapted
+    // form puts the content peak at 1.5-3x the ceiling, so a hard min turns everything
+    // above it into a FLAT PLATEAU at exactly white -- and a plateau has an edge.
+    // Measured as three separate complaints that were one defect: a seam across lit
+    // faces (the lit side crosses the ceiling and clips flat while the shadow side
+    // does not, the contour following the lighting), the snow plume losing its billow
+    // structure, and p99 sitting at 255 where madVR keeps 246. All three grow with
+    // blend, because blend weights the reconstruction that crosses the ceiling.
+    //
+    // Polynomial smooth-min: identical to min() below ceiling - k/2, then rolls off
+    // and approaches the ceiling asymptotically. No plateau, therefore no edge, and
+    // nothing is ever pinned to exactly white.
+    const float k = ceilingNits * 0.30;
+    const float3 h = saturate(0.5 + 0.5 * (ceilingNits - blended) / k);
+    return lerp(ceilingNits, blended, h) - k * h * (1.0 - h);
 }
 
 // The soft-plus pre-compressor, per channel, in the operator's own units. Same
