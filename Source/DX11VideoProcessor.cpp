@@ -2121,6 +2121,18 @@ static float PredictGt7Encoded(float srcNits, float refWhiteNits, float peakNits
 	return powf(fmaxf(out / ceilingNits, 0.0f), 1.0f / 2.2f);   // the shader's encode
 }
 
+// Where GT7's shoulder lands on the ceiling, as a multiple of it — the CPU mirror of
+// the algebra in gt7_tonemap.hlsl (solve shoulder(x) = peak for x/peak). 1.47 at
+// alpha 0.25, 1.87 at 0.10, 2.67 at 0.02. This is the most exposure the curve can
+// carry before highlights flatten, so it is the only honest upper bound on refWhite.
+static float Gt7Reach(float alpha)
+{
+	const float LS = 0.444f;                       // GT7_LINEAR_SECTION
+	const float a  = (alpha > 0.001f && alpha < 0.999f) ? alpha : 0.25f;
+	const float k  = (LS - 1.0f) / (a - 1.0f);
+	return LS + k * logf(k / (LS + k - 1.0f));
+}
+
 void CDX11VideoProcessor::SetMLParams()
 {
 	float gamma   = 1.0f;
@@ -5986,9 +5998,18 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					if (srcAvg > 1.0f) {
 						float want = powf(m_fRefWhiteTarget, 2.2f) * (float)m_iSDRDisplayNits
 						             * m_fCurvePeakNits / (2.2f * srcAvg);
-						// Bounded: a black leader or a single dark scene must not be able
-						// to re-expose the whole title, and a blaze must not crush it.
-						want = std::clamp(want, 60.0f, 240.0f);
+						// HARD CEILING FROM THE SHOULDER, not an arbitrary number.
+						// refWhite IS the shoulder workload (2.2*refWhite/sdrNits), and the
+						// shoulder only reaches Gt7Reach(alpha) x the ceiling before the
+						// soft clamp flattens everything above. A solver free to demand
+						// 240 on a dark scene therefore guarantees blown highlights --
+						// observed, on Everest, as refW=240 and pure-white peaks. The
+						// ceiling is whatever the current reach can actually carry.
+						const float maxRef = Gt7Reach(m_fHdrGt7Alpha) * (float)m_iSDRDisplayNits / 2.2f;
+						want = fminf(want, maxRef);
+						// And a floor/ceiling for the pathological cases (black leader,
+						// bogus metadata) that no formula should be allowed to answer.
+						want = std::clamp(want, 40.0f, 240.0f);
 						if (m_fRefWhiteAuto > 0.0f) {
 							want = std::clamp(want, 0.75f * m_fRefWhiteAuto, 1.333f * m_fRefWhiteAuto);
 						}

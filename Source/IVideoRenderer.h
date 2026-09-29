@@ -479,7 +479,11 @@ struct Settings_t {
 	// holds inside a scene; slew-limited per cut; clamped. GT7 / GT7 Adapt only —
 	// Hable normalises differently and must not inherit it. When off, fHdrRefWhiteNits
 	// is used exactly as before. APPENDED (binary boundary).
-	bool  bHdrAutoRefWhite  = true;
+	// OFF by default. The solver is bounded by the shoulder reach now, but its input
+	// (the cut-locked scene mean) can still lock onto a dark opening frame and set a
+	// whole title's exposure from it — the same defect that limits GT7 Adapt. Opt in
+	// once the anchor is trustworthy; until then the manual dial is the honest tool.
+	bool  bHdrAutoRefWhite  = false;
 	float fHdrRefWhiteTarget = 0.42f;
 
 	Settings_t() {
@@ -606,7 +610,7 @@ struct Settings_t {
 		fHdrGt7Desat                    = 0.0f;
 		fGamutCap                       = 1.0f;
 		fHdrGt7Dbg                      = 0.0f;
-		bHdrAutoRefWhite                = true;
+		bHdrAutoRefWhite                = false;
 		fHdrRefWhiteTarget              = 0.42f;
 	}
 };
