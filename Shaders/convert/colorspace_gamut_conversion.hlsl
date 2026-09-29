@@ -162,9 +162,27 @@ float3 Colorspace_Gamut_Compress_2020_to_709(const float3 rgb, const float cap)
     // travels toward.
     const float Y = saturate(dot(mapped, float3(0.2126, 0.7152, 0.0722)));
 
+    // LIGHTNESS-DEPENDENT CAPACITY TARGET.
+    //
+    // A single constant cap is wrong in both directions, and one table of measurements
+    // says so: madVR's SKY sits at fill 0.48..0.63 while its DARK tent fabric sits at
+    // 0.87..0.91. A deep navy is legitimately near the edge of the 709 triangle; a
+    // bright sky blue is not. madVR's desaturation is therefore lightness-dependent,
+    // and a flat cap does the right thing to the sky and the destructive thing to the
+    // tent — chroma pulled to 0.58 where madVR keeps 0.91, and gradient energy halved,
+    // which is exactly the lost fold structure in the fabric.
+    //
+    // So the cap relaxes toward 0.95 as lightness falls. The transition band is fitted
+    // to madVR's own measured points, not chosen:
+    //     tent mid    Y=0.015 -> cap_eff 0.95   (madVR 0.906)
+    //     tent upper  Y=0.059 -> cap_eff 0.86   (madVR 0.871)
+    //     sky         Y>=0.15 -> cap_eff cap    (madVR 0.48..0.63)
+    const float relax  = 1.0 - smoothstep(0.02, 0.15, Y);
+    const float capEff = lerp(max(cap, 1e-3f), 0.95, relax);
+
     const float S = min(min(GamutEdgeScale(mapped.r, Y), GamutEdgeScale(mapped.g, Y)),
                         GamutEdgeScale(mapped.b, Y));
-    const float k = min(1.0f, max(cap, 1e-3f) * S);
+    const float k = min(1.0f, capEff * S);
 
     return saturate(Y + k * (mapped - Y));
 }
