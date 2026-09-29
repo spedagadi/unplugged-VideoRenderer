@@ -110,6 +110,24 @@ float3 Colorspace_Gamut_Conversion_2020_to_709(const float3 rgb)
 // k = 1 keeps the colour; k = 0 is fully neutral. For a channel outside [0,1] the
 // limit is where that channel lands exactly on the boundary, and the binding channel
 // is the one that needs the smallest k.
+// The capacity target as a function of luminance.
+//
+// Fitted to madVR's measured fill-vs-luminance on the Everest frames, five regions:
+//     Y 0.015 -> 0.91    Y 0.06 -> 0.87    Y 0.14 -> 0.75
+//     Y 0.30  -> 0.40    Y 0.40 -> 0.29
+// A linear ramp from 0.95 at black to `cap` at Y = 0.40 reproduces that within ~0.05
+// at every measured point.
+//
+// The earlier shape was a STEP (smoothstep over Y 0.02..0.15), which put the entire
+// bright half of the range at one flat value. Measured consequence: the deep sky at
+// Y=0.15 was pulled to 0.58 where madVR sits at 0.75 -- UNDER-saturated, red now
+// higher than madVR's -- while the mid sky at Y=0.42 still needed 0.40. One constant
+// cannot be both, and a step cannot be a slope.
+float GamutCapAtY(const float Y, const float cap)
+{
+    return lerp(0.95, max(cap, 1e-3f), saturate(Y / 0.40));
+}
+
 // How far a channel can be pushed along the ray from this pixel's neutral point
 // before it hits its own bound. Returns the parameter t at which
 //     Y + t*(c - Y)  ==  0   (if c < Y)   or   1   (if c > Y).
@@ -143,17 +161,41 @@ float GamutEdgeScale(const float c, const float Y)
 // there instead of at the boundary.
 //
 //     fill = 1/S        (1.0 = on the edge, 0.5 = half of capacity used)
-//     k    = min(1, cap * S)
+//     k    = min(1, capEff * S)      with capEff = GamutCapAtY(Y, cap)
 //
 // cap = 1.0 reproduces pure boundary behaviour (nothing in-gamut is touched at all).
 // Lowering it compresses the volume inward: pale colours (large S) stay untouched
-// because cap*S is still >= 1, while colours near the edge — the sky — get pulled
-// in proportion to how close they are. madVR's measured 0.5-0.6 is what its look
-// actually corresponds to, so that is the natural starting point.
+// because capEff*S is still >= 1, while colours near the edge get pulled in
+// proportion to how close they are. The cap itself falls with luminance, because
+// madVR's measured fills do — see GamutCapAtY.
 //
 // Moving along the ray to the pixel's OWN neutral point preserves hue exactly and
-// removes only saturation. It cannot overflow: k <= cap*S <= S keeps every channel
+// removes only saturation. It cannot overflow: k <= capEff*S <= S keeps every channel
 // inside the bound it was measured against.
+//
+// ---------------------------------------------------------------------------
+// The capacity pull WITHOUT any primaries conversion, for a colour that is ALREADY
+// in the destination gamut's space.
+//
+// This is the half of the mapping that survives being moved downstream. The 2020->709
+// matrix is only meaningful on a colour still expressed in 2020 primaries; applying it
+// to a colour that is already 709 treats it as 2020 and shrinks the gamut a SECOND
+// time, which is what washed an entire frame out when the mapping moved after the
+// chroma pass. What the constraint actually needs is only the edge scale and the move
+// toward the pixel's own neutral point, and both of those are defined on whatever
+// primaries the colour is currently in.
+float3 Colorspace_Gamut_Constrain(const float3 rgb, const float cap)
+{
+    const float Y = saturate(dot(rgb, float3(0.2126, 0.7152, 0.0722)));
+    const float capEff = GamutCapAtY(Y, cap);
+
+    const float S = min(min(GamutEdgeScale(rgb.r, Y), GamutEdgeScale(rgb.g, Y)),
+                        GamutEdgeScale(rgb.b, Y));
+    const float k = min(1.0f, capEff * S);
+
+    return saturate(Y + k * (rgb - Y));
+}
+
 float3 Colorspace_Gamut_Compress_2020_to_709(const float3 rgb, const float cap)
 {
     const float3 mapped = Colorspace_Gamut_Conversion_2020_to_709(rgb);
@@ -177,8 +219,7 @@ float3 Colorspace_Gamut_Compress_2020_to_709(const float3 rgb, const float cap)
     //     tent mid    Y=0.015 -> cap_eff 0.95   (madVR 0.906)
     //     tent upper  Y=0.059 -> cap_eff 0.86   (madVR 0.871)
     //     sky         Y>=0.15 -> cap_eff cap    (madVR 0.48..0.63)
-    const float relax  = 1.0 - smoothstep(0.02, 0.15, Y);
-    const float capEff = lerp(max(cap, 1e-3f), 0.95, relax);
+    const float capEff = GamutCapAtY(Y, cap);
 
     const float S = min(min(GamutEdgeScale(mapped.r, Y), GamutEdgeScale(mapped.g, Y)),
                         GamutEdgeScale(mapped.b, Y));
