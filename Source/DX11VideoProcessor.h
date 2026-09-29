@@ -547,6 +547,11 @@ private:
 	// GT7 debug view: 0 off, 1 chromaScale, 2 fade ratio, 3 knee crossing,
 	// 4 ceiling crossing. Renders that quantity as greyscale instead of the picture.
 	float m_fHdrGt7Dbg       = 0.0f;
+	// Auto exposure (see Settings_t::bHdrAutoRefWhite).
+	bool  m_bAutoRefWhite    = true;
+	float m_fRefWhiteTarget  = 0.42f;
+	float m_fRefWhiteAuto    = 0.0f;   // solved per scene, 0 = not yet
+	float m_fEffRefWhite     = 0.0f;   // what the gain actually divides by
 	// How much of the shoulder's luminance compression is passed on to chroma.
 	// 0 = none (previous picture), 1 = chroma compresses as hard as luminance.
 	// cbuffer[26].

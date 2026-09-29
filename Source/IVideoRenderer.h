@@ -463,6 +463,25 @@ struct Settings_t {
 	// picture. Diagnostic only; 0 is the normal picture. APPENDED (binary boundary).
 	float fHdrGt7Dbg = 0.0f;
 
+	// AUTO EXPOSURE. refWhite has been a per-title hand dial: Everest wants ~80, a
+	// dark indoor master wants ~200, and nothing in the metadata says which (this
+	// title's MaxFALL of 944 on an indoor drama is bogus; the maxFALL-derived formula
+	// predicts 20 where 200 is right). What DOES separate them is the measured scene
+	// average: bright outdoor master vs dark indoor one.
+	//
+	// With the gain at 2.2*refWhite/peak, the source level that lands on display white
+	// is sdrNits*peak/(2.2*refWhite), so solving for "the scene average lands at
+	// fHdrRefWhiteTarget of white" gives
+	//     refWhite = T^2.2 * sdrNits * peak / (2.2 * sceneAvg)
+	// which reproduces both hand-tuned titles from their measured averages.
+	//
+	// Driven by the cut-locked scene average (m_PeakAvgPq), so it moves at cuts and
+	// holds inside a scene; slew-limited per cut; clamped. GT7 / GT7 Adapt only —
+	// Hable normalises differently and must not inherit it. When off, fHdrRefWhiteNits
+	// is used exactly as before. APPENDED (binary boundary).
+	bool  bHdrAutoRefWhite  = true;
+	float fHdrRefWhiteTarget = 0.42f;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -587,6 +606,8 @@ struct Settings_t {
 		fHdrGt7Desat                    = 0.0f;
 		fGamutCap                       = 1.0f;
 		fHdrGt7Dbg                      = 0.0f;
+		bHdrAutoRefWhite                = true;
+		fHdrRefWhiteTarget              = 0.42f;
 	}
 };
 

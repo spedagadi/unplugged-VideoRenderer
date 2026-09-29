@@ -1535,8 +1535,16 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		cbuffer[16] = m_fSoftKneeRatio;      // 1.0 = identity above the knee
 		cbuffer[17] = m_fSoftKneeWidth;      // softplus transition width
 		cbuffer[18] = m_fHdrHighlightNeutral;   // highlight neutral roll, 0..1 (0 = off)
-		// cbuffer[19]: the Hable curve's 1.0 in nits (decoupled reference white).
-		cbuffer[19] = m_fHdrRefWhiteNits;
+		// cbuffer[19]: the curve's 1.0 in nits (decoupled reference white). With auto
+		// exposure on and a GT7-family curve selected, this is the SOLVED value, not
+		// the dial: the dial becomes the override. Hable keeps the dial, because its
+		// normalisation is different and inheriting a per-scene exposure would make it
+		// breathe.
+		m_fEffRefWhite = (m_bAutoRefWhite && m_fRefWhiteAuto > 0.0f &&
+		                  (m_iHdrLocalToneMappingType == TONE_CURVE_GT7 ||
+		                   m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT))
+		               ? m_fRefWhiteAuto : m_fHdrRefWhiteNits;
+		cbuffer[19] = m_fEffRefWhite;
 		// [20] the nonlinear chroma compensation exponent (1.0 = none).
 		cbuffer[20] = m_fHdrChromaExp;
 
@@ -1582,7 +1590,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 			m_fHdrHighlightNeutral, m_fHdrChromaExp,
 			discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_GT7_ADAPT),
 			m_fHdrGt7Blend, m_fHdrGt7Adapt,
-			m_fHdrRefWhiteNits, m_HableScenePeakNits);
+			m_fEffRefWhite, m_HableScenePeakNits);
 		m_pDeviceContext->UpdateSubresource(m_pCorrectionConstants, 0, nullptr, &cbuffer, 0, 0);
 		// Arm the read-back: the next few correction draws report the buffer they
 		// ACTUALLY had bound at b0 and its float values. [CBPROBE] absent after this
@@ -2200,7 +2208,7 @@ void CDX11VideoProcessor::SetMLParams()
 			     m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT) &&
 			    m_iSDRDisplayNits > 0 && m_fCurvePeakNits > 10.0f) {
 				const float srcAvgNits = exptm::PqToLinearNits(m_MLFeatures[1]);
-				const float cur = PredictGt7Encoded(srcAvgNits, m_fHdrRefWhiteNits,
+				const float cur = PredictGt7Encoded(srcAvgNits, m_fEffRefWhite,
 				                                    m_fCurvePeakNits, (float)m_iSDRDisplayNits,
 				                                    m_fHdrGt7Alpha);
 				if (cur > 0.001f && cur < 0.999f) {
@@ -5800,6 +5808,9 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					m_PeakMaxPq = maxPq;
 					m_SceneLocked = false;
 					m_SceneFrames = 0;
+					// A fresh anchor means a fresh title or session: the exposure
+					// ratchet must not carry across it.
+					m_fRefWhiteAuto = 0.0f;
 					m_ZoneSeen = false;
 					m_ZoneChangeFrac = 0.0f;
 					for (int i = 0; i < 25; ++i) m_PrevZoneMax[i] = 0.0f;
@@ -5933,6 +5944,36 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// scene's opening level — the cost of absolute stillness.
 
 				m_HableScenePeakNits = exptm::PqToLinearNits(m_PeakMaxPq);
+
+				// AUTO EXPOSURE. Solved here because m_PeakAvgPq snaps at cuts, settles
+				// briefly and then LOCKS — exactly the cadence at which an exposure
+				// change is tolerable. Per-frame it would be auto-gain; per-title it
+				// would need a hand dial, which is what this replaces.
+				//
+				// gain = 2.2*refWhite/peak, and below the shoulder the curve is
+				// identity, so the delivered average is gain*srcAvg/sdrNits in linear.
+				// Solving "delivered average encodes to T" for refWhite gives the form
+				// below. Validated before writing it: T=0.42 predicts ~200 for a 33-nit
+				// indoor scene average (the title that needed 200 by hand) and ~66 for a
+				// 100-nit outdoor one (Everest, tuned to 80 by hand).
+				if (m_bAutoRefWhite && m_fCurvePeakNits > 10.0f && m_iSDRDisplayNits > 0) {
+					const float srcAvg = exptm::PqToLinearNits(m_PeakAvgPq);
+					if (srcAvg > 1.0f) {
+						float want = powf(m_fRefWhiteTarget, 2.2f) * (float)m_iSDRDisplayNits
+						             * m_fCurvePeakNits / (2.2f * srcAvg);
+						// Bounded: a black leader or a single dark scene must not be able
+						// to re-expose the whole title, and a blaze must not crush it.
+						want = std::clamp(want, 60.0f, 240.0f);
+						if (m_fRefWhiteAuto > 0.0f) {
+							want = std::clamp(want, 0.75f * m_fRefWhiteAuto, 1.333f * m_fRefWhiteAuto);
+						}
+						if (fabsf(want - m_fRefWhiteAuto) > 0.5f) {
+							m_fRefWhiteAuto = want;
+							SetShaderLuminanceParams();
+						}
+					}
+				}
+
 				const float chg = m_HableScenePeakNits - m_HableScenePeakApplied;
 				if (m_HableScenePeakApplied < 0.0f || chg > 1.0f || chg < -1.0f) {
 					m_HableScenePeakApplied = m_HableScenePeakNits;
@@ -7827,6 +7868,16 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	}
 	if (config.fHdrGt7Dbg != m_fHdrGt7Dbg) {
 		m_fHdrGt7Dbg = std::clamp(config.fHdrGt7Dbg, 0.0f, 4.0f);
+		changeLuminanceParams = true;
+	}
+	// Auto exposure. Changing either input invalidates the solved value, so drop it
+	// and let the anchor block re-solve on the next frame rather than slewing from a
+	// number that was solved under different rules.
+	if (config.bHdrAutoRefWhite != m_bAutoRefWhite ||
+	    config.fHdrRefWhiteTarget != m_fRefWhiteTarget) {
+		m_bAutoRefWhite = config.bHdrAutoRefWhite;
+		m_fRefWhiteTarget = std::clamp(config.fHdrRefWhiteTarget, 0.20f, 0.70f);
+		m_fRefWhiteAuto = 0.0f;
 		changeLuminanceParams = true;
 	}
 
