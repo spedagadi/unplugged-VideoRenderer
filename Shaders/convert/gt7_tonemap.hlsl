@@ -178,12 +178,25 @@ float3 GT7ToneMap(float3 rgbNits, float ceilingNits, float grayPointNits,
     // along the lighting contour, worsening with blend because blend weights the
     // faded reconstruction. Keying to the content peak puts the fade back where its
     // comment says it belongs: the top of the range.
-    const float targetI = LinearToST2084(float4(fadeRefNits, 0.0, 0.0, 0.0), 10000.0).x;
+    // (The reference is used directly, in nits, by fadeRatio below; there is no
+    //  longer a PQ-coded targetI, because that encoding was what stretched the
+    //  window across the whole of lit skin.)
 
     // chromaCurve(x, a, b) = 1 - smoothStep(x, a, b): chroma survives untouched until
-    // 0.98 of the ceiling's I and is gone by 1.16, so the top of the range lands on
-    // neutral white instead of carrying the source's colour into the clip.
-    const float chromaScale = 1.0f - smoothstep(fadeStart, fadeEnd, ucs.x / max(targetI, 1e-6));
+    // fadeStart of the reference and is gone by fadeEnd, so the top of the range lands
+    // on neutral white instead of carrying the source's colour into the clip.
+    //
+    // THE RATIO IS IN LINEAR NITS, NOT PQ CODES. This was the seam. In PQ codes the
+    // window is enormous: with the reference at 231 nits (PQ 0.585), 0.98 is PQ 0.573
+    // = ~205 nits and 1.16 is PQ 0.679 = ~600 nits -- a 205..600 nits band, which is
+    // precisely where lit skin sits. The debug view showed it directly: chromaScale
+    // at 0 (black) across the entire lit half of a face, chroma fully removed, with
+    // the smoothstep's lower edge reading as a hard seam along the lighting contour.
+    // In linear nits, 0.98 means 98% of the content peak, and skin at ~55% of the
+    // peak is untouched, which is what the comment always described.
+    const float iLin = ST2084ToLinear(float4(ucs.x, 0.0, 0.0, 0.0), 10000.0).x;
+    const float fadeRatio = iLin / max(fadeRefNits, 1e-6f);
+    const float chromaScale = 1.0f - smoothstep(fadeStart, fadeEnd, fadeRatio);
 
     // Luminance from the skewed color, chroma from the ORIGINAL, scaled.
     const float3 scaledNits = ictcp_to_linear(float3(skewedUcs.x, ucs.y * chromaScale, ucs.z * chromaScale));
@@ -201,7 +214,7 @@ float3 GT7ToneMap(float3 rgbNits, float ceilingNits, float grayPointNits,
     const float inLum  = dot(rgbNits, float3(0.2126, 0.7152, 0.0722));
     const float outLum = dot(blended, float3(0.2126, 0.7152, 0.0722));
     dbg = float4(chromaScale,
-                 ucs.x / max(targetI, 1e-6),
+                 fadeRatio,
                  inLum  > kneeNits    ? 1.0 : 0.0,
                  outLum > ceilingNits ? 1.0 : 0.0);
 
