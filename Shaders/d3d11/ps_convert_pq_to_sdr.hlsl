@@ -92,6 +92,11 @@ cbuffer PS_PARAMETERS : register(b0)
     // 0 = none (previous behaviour), 1 = chroma compresses exactly as hard as
     // luminance. cbuffer[26].
     float gt7Desat;
+    // Gamut capacity target for the BT.2020 -> BT.709 mapping: colours are landed at
+    // this fraction of their distance to the gamut edge rather than on the edge.
+    // 1.0 = boundary behaviour (nothing in-gamut touched), ~0.55 matches madVR's
+    // measured sky. 0 = treated as 1.0. cbuffer[27].
+    float gamutCap;
 };
 
 #include "../convert/conv_matrix.hlsl"
@@ -233,7 +238,7 @@ float4 main(PS_INPUT input) : SV_Target
     //
     //     color = ST2084ToLinear(color, LuminanceScale);
     //     color.rgb = ToneMappingHable(color.rgb);
-    //     color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb);
+    //     color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
     //     color = pow(color, 1.0 / 2.2);
     //
     // Kept so a regression can be isolated by switching a row instead of
@@ -258,7 +263,8 @@ float4 main(PS_INPUT input) : SV_Target
         color.rgb = ToneMappingHable(color.rgb);
 
         if (outputGamut < 0.5) {
-            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb);
+            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb,
+                                                              (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
     }
     // ---------------------------------------------------------------------
@@ -413,7 +419,8 @@ float4 main(PS_INPUT input) : SV_Target
         color.rgb = mapped / max(sdrNits, 1e-3);
 
         if (outputGamut < 0.5) {
-            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb);
+            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb,
+                                                              (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
     }
     else if (toneLutEnable > 0.5) {
@@ -424,7 +431,8 @@ float4 main(PS_INPUT input) : SV_Target
         color.rgb = ToneMapExperimental(color.rgb);
 
         if (outputGamut < 0.5) {
-            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb);
+            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb,
+                                                              (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
     }
     else {
@@ -695,7 +703,8 @@ float4 main(PS_INPUT input) : SV_Target
         // Runs on the display-relative values the curve just produced: the gamut
         // matrices are only valid in linear light, and the offset is already out.
         if (outputGamut < 0.5) {
-            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb);
+            color.rgb = Colorspace_Gamut_Compress_2020_to_709(color.rgb,
+                                                              (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
     }
 

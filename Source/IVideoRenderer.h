@@ -440,6 +440,23 @@ struct Settings_t {
 	// 0 = off, i.e. byte-identical to the previous picture. APPENDED (binary boundary).
 	float fHdrGt7Desat = 0.0f;
 
+	// BT.709 gamut MAPPING capacity target.
+	//
+	// The measured problem this addresses: our sky rendered at R=0, G=64, B=119 with a
+	// gamut fill of exactly 1.00 — pinned ON the edge of the 709 triangle — while
+	// madVR's sat at fill 0.48..0.60 with red present. A colour with no red is
+	// maximally saturated at its lightness, so "inside the gamut" was never the safe
+	// state; the edge is inside the gamut, and the edge is where over-saturation
+	// lives. A clamp cannot see it, because zero is not below zero.
+	//
+	// So colours are landed at this fraction of their own distance to the boundary
+	// rather than on it. Pale colours have a large distance and are untouched at any
+	// setting; only colours crowded against the edge get pulled in, proportionally.
+	//
+	// 1.0 = boundary behaviour (no compression at all inside the gamut). ~0.55 is what
+	// madVR's measured sky corresponds to. APPENDED (binary boundary).
+	float fGamutCap = 1.0f;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -562,6 +579,7 @@ struct Settings_t {
 		fMLTargetMid                    = 0.0f;
 		fHdrGt7Alpha                    = 0.25f;
 		fHdrGt7Desat                    = 0.0f;
+		fGamutCap                       = 1.0f;
 	}
 };
 

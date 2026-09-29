@@ -1556,6 +1556,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// stays 28 floats / 112 bytes — no alignment risk.
 		cbuffer[25] = m_fHdrGt7Alpha;
 		cbuffer[26] = m_fHdrGt7Desat;   // luminance-linked chroma compression
+		cbuffer[27] = m_fGamutCap;      // 709 capacity target for the gamut mapping
 	}
 
 	if (m_pCorrectionConstants) {
@@ -7807,6 +7808,12 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	// not an enable test.
 	if (config.fHdrGt7Desat != m_fHdrGt7Desat) {
 		m_fHdrGt7Desat = std::clamp(config.fHdrGt7Desat, 0.0f, 1.0f);
+		changeLuminanceParams = true;
+	}
+	// Capacity target. 0 would mean "collapse everything to grey", so the floor is
+	// well above it; 1 is the neutral boundary behaviour.
+	if (config.fGamutCap != m_fGamutCap) {
+		m_fGamutCap = std::clamp(config.fGamutCap, 0.20f, 1.0f);
 		changeLuminanceParams = true;
 	}
 

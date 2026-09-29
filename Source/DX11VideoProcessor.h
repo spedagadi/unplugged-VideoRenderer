@@ -542,6 +542,11 @@ private:
 	// 0 = none (previous picture), 1 = chroma compresses as hard as luminance.
 	// cbuffer[26].
 	float m_fHdrGt7Desat     = 0.0f;
+	// BT.709 capacity target used by the gamut MAPPING: colours are landed at this
+	// fraction of their distance to the gamut edge instead of on the edge itself.
+	// 1 = boundary behaviour (nothing in gamut is touched), ~0.55 = what madVR's sky
+	// measures at. cbuffer[27].
+	float m_fGamutCap        = 1.0f;
 	float m_HableScenePeakApplied = -1.0f;  // value last pushed to the cbuffer
 
 	// The gamma top-up actually added on top of the model's prediction this frame

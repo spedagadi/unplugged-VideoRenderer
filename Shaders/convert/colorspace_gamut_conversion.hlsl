@@ -110,54 +110,61 @@ float3 Colorspace_Gamut_Conversion_2020_to_709(const float3 rgb)
 // k = 1 keeps the colour; k = 0 is fully neutral. For a channel outside [0,1] the
 // limit is where that channel lands exactly on the boundary, and the binding channel
 // is the one that needs the smallest k.
-// The largest saturation scale k in [0,1] that keeps one channel inside [0,1] once
-// the colour is moved toward the neutral point Y: c'(k) = Y + k*(c - Y).
-// A plain function, not a lambda — these shaders compile with fxc for ps_5_0, which
-// has no lambda support.
-float GamutChannelLimitK(const float c, const float Y)
+// How far a channel can be pushed along the ray from this pixel's neutral point
+// before it hits its own bound. Returns the parameter t at which
+//     Y + t*(c - Y)  ==  0   (if c < Y)   or   1   (if c > Y).
+// t > 1 means the channel still has ROOM (it is inside the triangle); t < 1 means
+// it is already OUTSIDE. Unlike a clamp test this is a continuous measure, which is
+// the whole point — see Colorspace_Gamut_Compress_2020_to_709.
+float GamutEdgeScale(const float c, const float Y)
 {
-    if (c < 0.0f) {
-        const float d = Y - c;                                   // > 0 when c < 0 <= Y
-        return (d > 1e-6f) ? saturate(Y / d) : 0.0f;
+    if (c < Y) {
+        const float d = Y - c;
+        return (d > 1e-6f) ? (Y / d) : 1e6;         // hits black at t = Y/(Y-c)
     }
-    if (c > 1.0f) {
-        const float d = c - Y;
-        return (d > 1e-6f) ? saturate((1.0f - Y) / d) : 0.0f;
+    const float d = c - Y;
+    if (d < 1e-6f) {
+        return 1e6;                                  // achromatic: no bound
     }
-    return 1.0f;
+    return (1.0f - Y) / d;                           // hits white at t = (1-Y)/(c-Y)
 }
 
-float3 Colorspace_Gamut_Compress_2020_to_709(const float3 rgb)
+// 2020 -> 709 as gamut MAPPING with a capacity target, not as a clamp.
+//
+// The measured failure this replaces: our sky came out at R=0, G=64, B=119 with a
+// gamut fill of exactly 1.00 — pinned ON the 709 edge — while madVR's sat at fill
+// 0.48..0.60 with red present at 25..40. A colour with no red is maximally
+// saturated for its lightness, so "in gamut" was never the safe state I assumed it
+// was: the edge is inside "in gamut", and the edge is exactly where over-saturation
+// lives. A clamp-style test cannot see it, because red at 0.0 is not below 0.
+//
+// So: take the smallest edge scale over the three channels (S), which says where
+// this colour's own ray leaves the triangle, and land it at a FRACTION of the way
+// there instead of at the boundary.
+//
+//     fill = 1/S        (1.0 = on the edge, 0.5 = half of capacity used)
+//     k    = min(1, cap * S)
+//
+// cap = 1.0 reproduces pure boundary behaviour (nothing in-gamut is touched at all).
+// Lowering it compresses the volume inward: pale colours (large S) stay untouched
+// because cap*S is still >= 1, while colours near the edge — the sky — get pulled
+// in proportion to how close they are. madVR's measured 0.5-0.6 is what its look
+// actually corresponds to, so that is the natural starting point.
+//
+// Moving along the ray to the pixel's OWN neutral point preserves hue exactly and
+// removes only saturation. It cannot overflow: k <= cap*S <= S keeps every channel
+// inside the bound it was measured against.
+float3 Colorspace_Gamut_Compress_2020_to_709(const float3 rgb, const float cap)
 {
     const float3 mapped = Colorspace_Gamut_Conversion_2020_to_709(rgb);
 
-    // The primaries conversion is luminance-preserving, so this is the neutral point
-    // the compression travels toward.
+    // Luminance-preserving conversion, so this is the neutral point the compression
+    // travels toward.
     const float Y = saturate(dot(mapped, float3(0.2126, 0.7152, 0.0722)));
 
-    float k = min(min(GamutChannelLimitK(mapped.r, Y), GamutChannelLimitK(mapped.g, Y)),
-                  GamutChannelLimitK(mapped.b, Y));
-
-    // Land INSIDE the boundary, not on it. This is the part that matters.
-    //
-    // k as computed above is the LARGEST scale that keeps every channel in [0,1] —
-    // i.e. it parks the colour precisely on the edge of the 709 triangle. But that
-    // edge is the locus of MAXIMUM saturation, so a deep sky blue pulled onto it
-    // comes out with red at exactly 0 and its saturation entirely intact: the
-    // correction is mathematically correct and visually a no-op. Measured: the sky
-    // stayed cobalt next to madVR's muted teal.
-    //
-    // Real gamut MAPPING compresses the volume inward. Squaring does that with one
-    // multiply and has exactly the right shape: k = 1 (in gamut) is untouched, so
-    // nothing a display can show is altered at all; only colours that had to move
-    // are pulled further in, and the harder they had to move the harder they are
-    // pulled. Any value below the boundary is still in gamut, so this cannot
-    // reintroduce the overflow it is correcting.
-    //
-    // The exponent is the strength. 2.0 is a starting point; raise it for a more
-    // aggressive roll-off (madVR-like), 1.0 recovers the boundary-clamping behaviour
-    // this replaced.
-    k = k * k;
+    const float S = min(min(GamutEdgeScale(mapped.r, Y), GamutEdgeScale(mapped.g, Y)),
+                        GamutEdgeScale(mapped.b, Y));
+    const float k = min(1.0f, max(cap, 1e-3f) * S);
 
     return saturate(Y + k * (mapped - Y));
 }
