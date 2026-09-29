@@ -5815,6 +5815,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					// ratchet must not carry across it.
 					m_fRefWhiteAuto = 0.0f;
 					m_MeanNitsSmooth = m_MLMeanNitsRaw;
+					m_MeanNitsMax = 0.0f;
 					m_ZoneSeen = false;
 					m_ZoneChangeFrac = 0.0f;
 					for (int i = 0; i < 25; ++i) m_PrevZoneMax[i] = 0.0f;
@@ -5966,12 +5967,22 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// below. Validated before writing it: T=0.42 predicts ~200 for a 33-nit
 				// indoor scene average (the title that needed 200 by hand) and ~66 for a
 				// 100-nit outdoor one (Everest, tuned to 80 by hand).
-				// m_MeanNitsSmooth, NOT PqToLinearNits(m_PeakAvgPq): the mean of PQ
-				// codes decodes to a fraction of a nit, so the solver built on it never
-				// passed its own >1 nit guard and silently did nothing. The extractor
-				// now averages in nits over the content rows.
+				// m_MeanNits*, NOT PqToLinearNits(m_PeakAvgPq): the mean of PQ codes
+				// decodes to a fraction of a nit, so the solver built on it never passed
+				// its own >1 nit guard and silently did nothing. The extractor now
+				// averages in nits over the content rows.
 				if (m_bAutoRefWhite && m_fCurvePeakNits > 10.0f && m_iSDRDisplayNits > 0) {
-					const float srcAvg = m_MeanNitsSmooth;
+					// The TITLE's brightest scene, not the current one. Solving per scene
+					// made Everest's dark interiors raise the exposure — and refWhite is
+					// also the shoulder workload, so those scenes lost their highlights.
+					// Hand tuning never did that: 80 for Everest and 200 for a dark indoor
+					// master are per-TITLE choices, made on each title's brightest
+					// material. A running max reproduces exactly that, is monotone within
+					// a title, and cannot pump at cuts.
+					if (m_MeanNitsSmooth > m_MeanNitsMax) {
+						m_MeanNitsMax = m_MeanNitsSmooth;
+					}
+					const float srcAvg = m_MeanNitsMax;
 					if (srcAvg > 1.0f) {
 						float want = powf(m_fRefWhiteTarget, 2.2f) * (float)m_iSDRDisplayNits
 						             * m_fCurvePeakNits / (2.2f * srcAvg);

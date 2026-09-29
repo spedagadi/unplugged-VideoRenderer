@@ -506,6 +506,10 @@ private:
 	// used for exposure at all.
 	float m_MLMeanNitsRaw = 0.0f;
 	float m_MeanNitsSmooth = -1.0f;
+	// Running max of the smoothed scene mean over the title: the exposure is solved
+	// from the brightest scene, which is how the per-title hand value was always
+	// chosen. Reset with the anchor on a new title.
+	float m_MeanNitsMax = 0.0f;
 	// Scene-lock state (snap/settle/lock with asymmetric drift — see the block at
 	// UpdatePeak). The anchor is locked within a scene so the Hable normaliser
 	// cannot pump; it only drifts downward (slow brighten) once locked.
