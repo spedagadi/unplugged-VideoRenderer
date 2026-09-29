@@ -151,7 +151,8 @@ void GT7InitCurve(float peakNits, float alpha, out float kA, out float kB, out f
 //   fadeStart/End  -> the chromaCurve window, in units of the ceiling's ICtCp I,
 //                     below which chroma is handed through untouched.
 float3 GT7ToneMap(float3 rgbNits, float ceilingNits, float grayPointNits,
-                  float blendRatio, float fadeStart, float fadeEnd, float alpha)
+                  float blendRatio, float fadeStart, float fadeEnd, float alpha,
+                  float fadeRefNits)
 {
     float kA, kB, kC, kneeNits;
     GT7InitCurve(ceilingNits, alpha, kA, kB, kC, kneeNits);
@@ -167,7 +168,17 @@ float3 GT7ToneMap(float3 rgbNits, float ceilingNits, float grayPointNits,
     // framebufferLuminanceTargetUcs_ in the reference. For a grey the LMS sums are
     // exactly the input (each row of rgb2lms sums to 1), so I of (c,c,c) is simply
     // the PQ code of c — one pow, no fourth round trip.
-    const float targetI = LinearToST2084(float4(ceilingNits, 0.0, 0.0, 0.0), 10000.0).x;
+    //
+    // `fadeRefNits`, NOT ceilingNits. The reference is a game renderer whose ceiling
+    // IS the content peak, so keying the fade to the ceiling puts it at the top of the
+    // range. The adapted form puts the content peak at kGT7RangeFit * refWhite, i.e.
+    // 1.5-3x the ceiling, so a ceiling-keyed window lands on ORDINARY LIT SKIN: a
+    // forehead at ~500 source nits sits at ratio ~1.07, inside 0.98..1.16, loses its
+    // chroma and goes pale while the shadow side of the face keeps its own — a seam
+    // along the lighting contour, worsening with blend because blend weights the
+    // faded reconstruction. Keying to the content peak puts the fade back where its
+    // comment says it belongs: the top of the range.
+    const float targetI = LinearToST2084(float4(fadeRefNits, 0.0, 0.0, 0.0), 10000.0).x;
 
     // chromaCurve(x, a, b) = 1 - smoothStep(x, a, b): chroma survives untouched until
     // 0.98 of the ceiling's I and is gone by 1.16, so the top of the range lands on

@@ -399,7 +399,11 @@ float4 main(PS_INPUT input) : SV_Target
                                    clamp(gt7Blend, 0.0f, 1.0f),
                                    (gt7FadeEnd > gt7FadeStart) ? gt7FadeStart : GT7_FADE_START,
                                    (gt7FadeEnd > gt7FadeStart) ? gt7FadeEnd   : GT7_FADE_END,
-                                   (gt7Alpha > 0.001f) ? gt7Alpha : GT7_ALPHA);
+                                   (gt7Alpha > 0.001f) ? gt7Alpha : GT7_ALPHA,
+                                   // The fade window is keyed to the CONTENT peak, not
+                                   // the ceiling: see gt7_tonemap.hlsl. This is the same
+                                   // quantity the gain lands on the curve.
+                                   kGT7RangeFit * refNits);
 
         // LUMINANCE-LINKED DESATURATION.
         //
