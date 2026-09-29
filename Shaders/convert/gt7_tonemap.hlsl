@@ -152,7 +152,7 @@ void GT7InitCurve(float peakNits, float alpha, out float kA, out float kB, out f
 //                     below which chroma is handed through untouched.
 float3 GT7ToneMap(float3 rgbNits, float ceilingNits, float grayPointNits,
                   float blendRatio, float fadeStart, float fadeEnd, float alpha,
-                  float fadeRefNits)
+                  float fadeRefNits, out float4 dbg)
 {
     float kA, kB, kC, kneeNits;
     GT7InitCurve(ceilingNits, alpha, kA, kB, kC, kneeNits);
@@ -189,6 +189,21 @@ float3 GT7ToneMap(float3 rgbNits, float ceilingNits, float grayPointNits,
     const float3 scaledNits = ictcp_to_linear(float3(skewedUcs.x, ucs.y * chromaScale, ucs.z * chromaScale));
 
     const float3 blended = lerp(skewedNits, scaledNits, blendRatio);
+
+    // Debug taps: the four quantities in this operator that can produce a spatial
+    // EDGE on an otherwise smooth gradient. Two are continuous (a banding/Mach-band
+    // source), two are binary thresholds (a hard contour source). Rendered as
+    // greyscale by the caller; see fHdrGt7Dbg.
+    //   .x chromaScale          the fade's actual output
+    //   .y fade ratio           ucs.x / targetI, against fadeStart..fadeEnd
+    //   .z knee crossing        where the toe/identity branch hands to the shoulder
+    //   .w ceiling crossing     where the pre-clamp value exceeds the ceiling
+    const float inLum  = dot(rgbNits, float3(0.2126, 0.7152, 0.0722));
+    const float outLum = dot(blended, float3(0.2126, 0.7152, 0.0722));
+    dbg = float4(chromaScale,
+                 ucs.x / max(targetI, 1e-6),
+                 inLum  > kneeNits    ? 1.0 : 0.0,
+                 outLum > ceilingNits ? 1.0 : 0.0);
 
     // SOFT ceiling, not min(). The reference clamps hard at framebufferLuminanceTarget_,
     // which is fine for a game whose content peak sits near the ceiling. The adapted

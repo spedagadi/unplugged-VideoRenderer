@@ -105,6 +105,14 @@ cbuffer PS_PARAMETERS : register(b0)
     float _padG0;
     float _padG1;
     float _padG2;
+    // GT7 debug view: 0 = off, 1 = chromaScale, 2 = fade ratio, 3 = knee crossing,
+    // 4 = ceiling crossing. Renders the chosen quantity as greyscale INSTEAD of the
+    // picture, so a spatial seam in any of them is visible directly rather than
+    // inferred. cbuffer[32]; buffer is 36 floats / 144 bytes.
+    float gt7Dbg;
+    float _padD0;
+    float _padD1;
+    float _padD2;
 };
 
 #include "../convert/conv_matrix.hlsl"
@@ -395,6 +403,7 @@ float4 main(PS_INPUT input) : SV_Target
         // grayPoint anchored RELATIVE to the ceiling (GT7_GRAYPOINT_FRACTION x
         // sdrNits), not the reference's absolute 53.8 nits — rationale in
         // gt7_tonemap.hlsl; measured 2026-09-26, deep-shadow lift only.
+        float4 gt7dbg;
         float3 mapped = GT7ToneMap(adapted, sdrNits, GT7_GRAYPOINT_FRACTION * sdrNits,
                                    clamp(gt7Blend, 0.0f, 1.0f),
                                    (gt7FadeEnd > gt7FadeStart) ? gt7FadeStart : GT7_FADE_START,
@@ -403,7 +412,19 @@ float4 main(PS_INPUT input) : SV_Target
                                    // The fade window is keyed to the CONTENT peak, not
                                    // the ceiling: see gt7_tonemap.hlsl. This is the same
                                    // quantity the gain lands on the curve.
-                                   kGT7RangeFit * refNits);
+                                   kGT7RangeFit * refNits,
+                                   gt7dbg);
+
+        // Debug view: replace the picture with one of the operator's internal
+        // quantities so a spatial seam shows up as an edge in a greyscale image
+        // instead of having to be inferred from the finished frame.
+        if (gt7Dbg > 0.5) {
+            const float v = (gt7Dbg < 1.5) ? gt7dbg.x
+                          : (gt7Dbg < 2.5) ? gt7dbg.y
+                          : (gt7Dbg < 3.5) ? gt7dbg.z
+                          :                  gt7dbg.w;
+            mapped = saturate(v) * sdrNits;
+        }
 
         // LUMINANCE-LINKED DESATURATION.
         //

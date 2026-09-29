@@ -1444,7 +1444,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// picture whenever the buffer grew to 21 floats). The array has grown 24 -> 28
 		// -> 32 floats (96 -> 112 -> 128 bytes), each time landing exactly on a 16-byte
 		// multiple as the old comment prescribed — never on 25/26/27 or 29/30/31.
-		FLOAT cbuffer[32] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
+		FLOAT cbuffer[36] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
 	                     (float)m_iOutputGamut,
 	                     ToneLutActive() ? 1.0f : 0.0f,
 	                     m_ToneLutKey.pqMin, m_ToneLutKey.pqMax,
@@ -1563,6 +1563,9 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// place. Applying it in both would double-compress. 28..31 keeps the buffer at
 		// 32 floats / 128 bytes, the next 16-byte multiple.
 		cbuffer[28] = (m_bMLActive && m_pPSMLChroma) ? 0.0f : 1.0f;
+		// [32] GT7 debug view (0 = off). 32..35 keeps the buffer at 36 floats / 144
+		// bytes, the next 16-byte multiple.
+		cbuffer[32] = m_fHdrGt7Dbg;
 	}
 
 	if (m_pCorrectionConstants) {
@@ -7820,6 +7823,10 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	// well above it; 1 is the neutral boundary behaviour.
 	if (config.fGamutCap != m_fGamutCap) {
 		m_fGamutCap = std::clamp(config.fGamutCap, 0.20f, 1.0f);
+		changeLuminanceParams = true;
+	}
+	if (config.fHdrGt7Dbg != m_fHdrGt7Dbg) {
+		m_fHdrGt7Dbg = std::clamp(config.fHdrGt7Dbg, 0.0f, 4.0f);
 		changeLuminanceParams = true;
 	}
 

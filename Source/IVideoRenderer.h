@@ -457,6 +457,12 @@ struct Settings_t {
 	// madVR's measured sky corresponds to. APPENDED (binary boundary).
 	float fGamutCap = 1.0f;
 
+	// GT7 debug view, for finding spatial seams by eye instead of by inference:
+	// 0 = off, 1 = chromaScale, 2 = fade ratio, 3 = knee crossing, 4 = ceiling
+	// crossing. Renders the chosen internal quantity as greyscale in place of the
+	// picture. Diagnostic only; 0 is the normal picture. APPENDED (binary boundary).
+	float fHdrGt7Dbg = 0.0f;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -580,6 +586,7 @@ struct Settings_t {
 		fHdrGt7Alpha                    = 0.25f;
 		fHdrGt7Desat                    = 0.0f;
 		fGamutCap                       = 1.0f;
+		fHdrGt7Dbg                      = 0.0f;
 	}
 };
 

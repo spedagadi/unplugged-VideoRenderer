@@ -544,6 +544,9 @@ private:
 	// (1.47x at 0.25, 1.87x at 0.10). This is what limits how much exposure
 	// fHdrRefWhiteNits can buy before the highlights clamp. cbuffer[25].
 	float m_fHdrGt7Alpha     = 0.25f;
+	// GT7 debug view: 0 off, 1 chromaScale, 2 fade ratio, 3 knee crossing,
+	// 4 ceiling crossing. Renders that quantity as greyscale instead of the picture.
+	float m_fHdrGt7Dbg       = 0.0f;
 	// How much of the shoulder's luminance compression is passed on to chroma.
 	// 0 = none (previous picture), 1 = chroma compresses as hard as luminance.
 	// cbuffer[26].
