@@ -2456,7 +2456,7 @@ void CDX11VideoProcessor::SetMLParams()
 	// in-content gate ever fails. 0 = the previous picture exactly.
 	params.MLShadowPedestal = fminf(0.08f, fmaxf(0.0f, m_fMLShadowPedestal));
 	params.MLGamutCap = m_fGamutCap;
-	params._padGT2 = 0.0f;
+	params.MLGamutMap709 = (m_iOutputGamut == 0) ? 1.0f : 0.0f;
 
 	// Person skin protection (stage 4): LUT-only-inside-people gate. Strength 0
 	// -> shaders branch to the plain legacy LUT/MC path (bit-identical).

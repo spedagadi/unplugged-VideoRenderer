@@ -277,7 +277,10 @@ private:
 		// change chroma, so the constraint has to be applied there rather than in the
 		// correction shader, where the chroma boost undoes it.
 		float MLGamutCap;
-		float _padGT2;
+		// 1 when the output gamut is BT.709, i.e. when the capacity constraint has a
+		// triangle to constrain to. The chroma pass gates on this; without it the
+		// mapping ran on BT.2020 output too and washed the frame out there as well.
+		float MLGamutMap709;
 	};
 	static_assert(sizeof(MLParams_t) == 352, "MLParams_t cbuffer size drift");
 	MLParams_t m_lastMLParams = {};

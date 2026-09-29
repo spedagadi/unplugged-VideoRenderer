@@ -47,11 +47,7 @@ cbuffer MLParams : register(b0)
 	float MLSkinLUTCB1;
 	float MLChromaGate;
 	float MLHuntGate;
-	// BT.709 gamut capacity target. Takes a reserved slot on purpose: this pass is the
-	// LAST stage that can change chroma, so the capacity constraint has to be applied
-	// here, after the boost below -- not in the correction shader, where the boost
-	// undoes it. 1.0 = no mapping.
-	float MLGamutCap;
+	float _reserved0;
 	float _reserved1;
 	float _reserved2;
 	float _reserved3;
@@ -95,6 +91,15 @@ cbuffer MLParams : register(b0)
 	float MLSkinPreserve;  // 0..1 luma re-anchor toward source skin tone (unused in chroma; gamma t4)
 	float MLSkinPad0;
 	float MLSkinPad1;
+	// GT tail. These MUST be declared in this order: MLParams_t is one shared layout
+	// and the offsets are absolute. An earlier edit put MLGamutCap at _reserved0,
+	// which is a different byte entirely — the pass then read the shadow-debug flag
+	// (0) as the capacity target, and cap 0 means "collapse to neutral", which washed
+	// out a whole frame on both gamut settings.
+	float MLGammaTopUp;
+	float MLShadowPedestal;
+	float MLGamutCap;      // BT.709 capacity target; 1.0 = no mapping
+	float MLGamutMap709;   // 1 = output gamut is BT.709, so the mapping applies here
 };
 
 static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
@@ -111,10 +116,17 @@ static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
 // PQ output is skipped: the 2020->709 conversion only exists on the SDR path.
 float4 GamutConstrain(float4 c)
 {
-	if (MLGamutCap > 0.999 || IsPQ > 0.5)
+	// Gated on the OUTPUT gamut, not just the cap: with BT.2020 selected there is no
+	// 709 triangle to constrain to, and running the constraint anyway is what made
+	// both gamut settings look identically washed out.
+	if (MLGamutMap709 < 0.5 || MLGamutCap > 0.999 || IsPQ > 0.5)
 		return c;
+	// Constrain, NOT convert: this colour is already in 709 primaries (the correction
+	// shader did the 2020->709 matrix upstream), so running that matrix again here
+	// treats a 709 colour as 2020 and shrinks the gamut twice — which is exactly what
+	// washed a whole frame out the first time this moved.
 	const float3 lin = pow(max(c.rgb, 0.0), 2.2);
-	c.rgb = pow(saturate(Colorspace_Gamut_Compress_2020_to_709(lin, MLGamutCap)), 1.0 / 2.2);
+	c.rgb = pow(saturate(Colorspace_Gamut_Constrain(lin, MLGamutCap)), 1.0 / 2.2);
 	return c;
 }
 
