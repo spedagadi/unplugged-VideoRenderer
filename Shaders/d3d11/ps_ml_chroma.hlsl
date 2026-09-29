@@ -4,6 +4,7 @@
 // When MLChromaGate is off the pass outputs its input unchanged.
 #include "../convert/st2084.hlsl"
 #include "../convert/ictcp.hlsl"
+#include "../convert/colorspace_gamut_conversion.hlsl"
 
 Texture2D tex : register(t0);
 SamplerState samp : register(s0);
@@ -46,7 +47,11 @@ cbuffer MLParams : register(b0)
 	float MLSkinLUTCB1;
 	float MLChromaGate;
 	float MLHuntGate;
-	float _reserved0;
+	// BT.709 gamut capacity target. Takes a reserved slot on purpose: this pass is the
+	// LAST stage that can change chroma, so the capacity constraint has to be applied
+	// here, after the boost below -- not in the correction shader, where the boost
+	// undoes it. 1.0 = no mapping.
+	float MLGamutCap;
 	float _reserved1;
 	float _reserved2;
 	float _reserved3;
@@ -94,12 +99,31 @@ cbuffer MLParams : register(b0)
 
 static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
 
+// The gamut constraint, applied to this pass's ENCODED output.
+//
+// This pass is the last stage in the chain that can change chroma: the boost below
+// multiplies Ct/Cp by up to 1.5x. A capacity limit applied upstream of it — which is
+// where it lived until today — gets undone by exactly that boost, which is why the
+// sky ignored the cap while near-white snow (nothing to restore) obeyed it. The
+// constraint has to see the colour the display actually receives.
+//
+// The mapping itself works in linear primaries, so decode and re-encode around it.
+// PQ output is skipped: the 2020->709 conversion only exists on the SDR path.
+float4 GamutConstrain(float4 c)
+{
+	if (MLGamutCap > 0.999 || IsPQ > 0.5)
+		return c;
+	const float3 lin = pow(max(c.rgb, 0.0), 2.2);
+	c.rgb = pow(saturate(Colorspace_Gamut_Compress_2020_to_709(lin, MLGamutCap)), 1.0 / 2.2);
+	return c;
+}
+
 float4 main(PS_INPUT input) : SV_Target
 {
 	float4 color = tex.Sample(samp, input.Tex);
 
 	if (MLChromaGate < 0.5)
-		return color;
+		return GamutConstrain(color);
 
 	// Convert to linear nits → ICtCp
 	float3 lin;
@@ -170,5 +194,5 @@ float4 main(PS_INPUT input) : SV_Target
 		color.rgb = pow(saturate(rgb_out / SDR_PEAK_NITS), 1.0 / 2.2);
 	}
 
-	return color;
+	return GamutConstrain(color);
 }

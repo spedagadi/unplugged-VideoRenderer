@@ -273,7 +273,10 @@ private:
 		// declares this far, so no other shader's offsets move. 0 = off, and off is
 		// byte-identical to the previous picture.
 		float MLShadowPedestal;
-		float _padGT1;
+		// Gamut capacity target, consumed by ps_ml_chroma — the LAST stage that can
+		// change chroma, so the constraint has to be applied there rather than in the
+		// correction shader, where the chroma boost undoes it.
+		float MLGamutCap;
 		float _padGT2;
 	};
 	static_assert(sizeof(MLParams_t) == 352, "MLParams_t cbuffer size drift");

@@ -1441,10 +1441,10 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// [24]     the GT7 Adapt scene-peak weight (selection 10).
 		// cbuffer ByteWidth MUST stay a multiple of 16 bytes (84 vs 96 is the
 		// difference between a valid and a FAILED CreateBuffer — observed as a black
-		// picture whenever the buffer grew to 21 floats). 24 floats = 96 bytes; slot
-		// 24 was the first free pad slot, and taking it grew the array to 28 = 112
-		// bytes, exactly as the old comment prescribed — never 25/26/27.
-		FLOAT cbuffer[28] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
+		// picture whenever the buffer grew to 21 floats). The array has grown 24 -> 28
+		// -> 32 floats (96 -> 112 -> 128 bytes), each time landing exactly on a 16-byte
+		// multiple as the old comment prescribed — never on 25/26/27 or 29/30/31.
+		FLOAT cbuffer[32] = { 10000.0f / m_iSDRDisplayNits, m_fHdrDisplayMinNits,
 	                     (float)m_iOutputGamut,
 	                     ToneLutActive() ? 1.0f : 0.0f,
 	                     m_ToneLutKey.pqMin, m_ToneLutKey.pqMax,
@@ -1557,6 +1557,12 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		cbuffer[25] = m_fHdrGt7Alpha;
 		cbuffer[26] = m_fHdrGt7Desat;   // luminance-linked chroma compression
 		cbuffer[27] = m_fGamutCap;      // 709 capacity target for the gamut mapping
+		// [28] who applies the mapping. The chroma pass is the last stage that can
+		// change chroma, so when it runs the constraint belongs there; when the grade
+		// is down, nothing downstream touches chroma and this shader is the right
+		// place. Applying it in both would double-compress. 28..31 keeps the buffer at
+		// 32 floats / 128 bytes, the next 16-byte multiple.
+		cbuffer[28] = (m_bMLActive && m_pPSMLChroma) ? 0.0f : 1.0f;
 	}
 
 	if (m_pCorrectionConstants) {
@@ -2449,7 +2455,7 @@ void CDX11VideoProcessor::SetMLParams()
 	// shadows is also large enough to grey out the letterbox matte if the shader's
 	// in-content gate ever fails. 0 = the previous picture exactly.
 	params.MLShadowPedestal = fminf(0.08f, fmaxf(0.0f, m_fMLShadowPedestal));
-	params._padGT1 = 0.0f;
+	params.MLGamutCap = m_fGamutCap;
 	params._padGT2 = 0.0f;
 
 	// Person skin protection (stage 4): LUT-only-inside-people gate. Strength 0
