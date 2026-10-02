@@ -2591,7 +2591,13 @@ void CDX11VideoProcessor::SetMLParams()
 		const float sdrN = (float)m_iSDRDisplayNits;
 		// features[3..8] = p25 p50 p75 p90 p95 p99, in source PQ.
 		const int idx[3] = { 3, 4, 7 };
-		const float peakNits = fmaxf(exptm::PqToLinearNits(m_MLFeatures[0]), 1e-3f);
+		// p99.5, NOT maxscl. maxscl is a MAX: one lamp, one specular, one grain spike
+		// sets it, and because the law normalises every band by it, a bright object
+		// entering frame dropped every target and dimmed the whole picture. A
+		// percentile is a statistic; a max is an anecdote. (The codebase learned this
+		// once already for the Hable normaliser.)
+		const float peakPq = (m_MLPeakPq995 > 0.0f) ? m_MLPeakPq995 : m_MLFeatures[0];
+		const float peakNits = fmaxf(exptm::PqToLinearNits(peakPq), 1e-3f);
 		float wA[3], wT[3];
 		for (int i = 0; i < 3; i++) {
 			const float nits = exptm::PqToLinearNits(m_MLFeatures[idx[i]]);
@@ -2611,7 +2617,32 @@ void CDX11VideoProcessor::SetMLParams()
 			// House white then scales the whole thing as the overall level.
 			const float r = fminf(1.0f, nits / peakNits);
 			const float level = fminf(2.0f, fmaxf(0.5f, 203.0f / fmaxf(m_fCtlWhiteNits, 10.0f)));
-			wT[i] = fminf(1.0f, level * powf(r, 0.75f));
+			// LIFT ONLY. The law's highlight target sat BELOW what the curve already
+			// delivers on bright scenes, so the controller spent its whole authority
+			// darkening them (R pinned at -0.3 on every bright frame, and bright
+			// scenes reading less luminous with the controller on than off). The
+			// grade's job here is to undo crush, not to re-grade highlights; clipping
+			// stays the job of the curve's soft ceiling and the gamut cap.
+			wT[i] = fmaxf(fminf(1.0f, level * powf(r, 0.75f)), wA[i]);
+		}
+
+		// Temporal stability. The solve runs on smoothed anchors and its outputs are
+		// smoothed too: per-frame solves on 256x144 percentiles breathe with grain and
+		// with moving snow, and that read as pumping (S flipping 0.5<->1.0 between
+		// adjacent frames in the CTL log). Snap on a large relative jump -- a cut --
+		// and IIR otherwise.
+		for (int i = 0; i < 3; i++) {
+			auto track = [](float& held, float now) {
+				if (held < 0.0f || fabsf(now - held) > 0.5f * held + 0.02f) {
+					held = now;
+				} else {
+					held += 0.10f * (now - held);
+				}
+			};
+			track(m_ctlWA[i], wA[i]);
+			track(m_ctlWT[i], wT[i]);
+			wA[i] = m_ctlWA[i];
+			wT[i] = m_ctlWT[i];
 		}
 
 		// The highlight knee is derived from gamma, and gamma is what we are solving
@@ -2624,13 +2655,17 @@ void CDX11VideoProcessor::SetMLParams()
 
 		// Smooth, but snap on a large move: that is a cut, and a cut should arrive in
 		// one frame rather than trail the picture.
+		// Output smoothing, deliberately slower than the input smoothing: the actuators
+		// are visible as a whole-image change, so a half-second time constant reads as
+		// a settle after a cut rather than as breathing. The snap thresholds are wide
+		// enough that grain cannot trip them but a cut still arrives in one frame.
 		auto settle = [](float& held, float now, float jump) {
 			if (fabsf(now - held) > jump) { held = now; }
-			else { held += 0.20f * (now - held); }
+			else { held += 0.10f * (now - held); }
 		};
-		settle(m_ctlS, ctlS, 0.10f);
-		settle(m_ctlG, ctlG, 0.25f);
-		settle(m_ctlR, ctlR, 0.10f);
+		settle(m_ctlS, ctlS, 0.25f);
+		settle(m_ctlG, ctlG, 0.50f);
+		settle(m_ctlR, ctlR, 0.25f);
 		ctlS = m_ctlS; ctlG = m_ctlG; ctlR = m_ctlR;
 
 		// The solver's own bookkeeping, because three consecutive iterations were
@@ -6115,6 +6150,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					m_fRefWhiteAuto = 0.0f;
 					m_MeanNitsSmooth = m_MLMeanNitsRaw;
 					m_MeanNitsMax = 0.0f;
+					for (int ci = 0; ci < 3; ci++) { m_ctlWA[ci] = -1.0f; m_ctlWT[ci] = -1.0f; }
 					m_ZoneSeen = false;
 					m_ZoneChangeFrac = 0.0f;
 					for (int i = 0; i < 25; ++i) m_PrevZoneMax[i] = 0.0f;
@@ -8212,6 +8248,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		// point for the other. (SetMLParams runs every frame while the grade is up,
 		// so no change-flag is needed here.)
 		m_ctlS = 1.0f; m_ctlG = 1.0f; m_ctlR = 0.0f;
+		for (int i = 0; i < 3; i++) { m_ctlWA[i] = -1.0f; m_ctlWT[i] = -1.0f; }
 	}
 	// Auto exposure. Changing either input invalidates the solved value, so drop it
 	// and let the anchor block re-solve on the next frame rather than slewing from a
