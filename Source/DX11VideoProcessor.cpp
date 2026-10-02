@@ -2094,11 +2094,18 @@ static inline float smoothstepf2(float e0, float e1, float x)
 // lift a pixel that is already at zero).
 //   w  = linear fraction of white delivered by the tone curve
 //   x  = w / wPeak            (I_norm: the grade's own domain)
-//   1. pedestal:  w += P * t^2,        t = 1 - saturate(x / kneeShadow)
-//   2. gamma:     x  = lerp(x, x^(1/G), fade(x) * (1 - hi_g(x)))
-//   3. rolloff:   x += R * t^2 * (1-x), t = (x - kneeHi) / (1 - kneeHi)
+//   0. toe slope: x  = knee * (x/knee)^S          (S<1 expands shadows, 0 and knee fixed)
+//   1. gamma:     x  = lerp(x, x^(1/G), fade(x) * (1 - hi_g(x)))
+//   2. rolloff:   x += R * t^2 * (1-x), t = (x - kneeHi) / (1 - kneeHi)
 // Returns the delivered linear fraction of white for one source anchor.
-static float GradeChainDelivered(float w, float wPeak, float P, float G, float R,
+//
+// The shadow actuator is the SLOPE, not a pedestal: an additive offset lifts black to
+// grey and veils the picture (measured by eye as "a grey layer on top" of a dark tent
+// interior), because it adds the same amount to a pixel at 0 and to one at 0.01 and so
+// cannot reveal detail that sits near the floor. A power below the knee keeps 0 at 0
+// and the knee fixed while expanding everything between in log — the code span dark
+// detail occupies moves up out of the invisible floor with its contrast intact.
+static float GradeChainDelivered(float w, float wPeak, float S, float G, float R,
                                  float kneeShadow, float guard, float kneeHi)
 {
 	if (wPeak <= 1e-6f) {
@@ -2106,9 +2113,9 @@ static float GradeChainDelivered(float w, float wPeak, float P, float G, float R
 	}
 	float x = w / wPeak;
 
-	const float tSh = 1.0f - satf(x / fmaxf(kneeShadow, 0.01f));
-	w += P * tSh * tSh;
-	x = w / wPeak;
+	if (S < 0.999f && x > 0.0f && x < kneeShadow) {
+		x = kneeShadow * powf(x / kneeShadow, S);
+	}
 
 	if (G != 1.0f && x > 0.001f && x < 0.999f) {
 		const float fade = smoothstepf2(0.08f, 0.45f, x);
@@ -2138,31 +2145,34 @@ static float GradeChainDelivered(float w, float wPeak, float P, float G, float R
 // for the pedestal it is also returning.
 static void SolveGrade(const float wAnchor[3], float wPeak, const float wTarget[3],
                        float kneeShadow, float guard, float kneeHi,
-                       float& outP, float& outG, float& outR)
+                       float& outS, float& outG, float& outR)
 {
-	float P = outP, G = outG, R = outR;
+	float S = outS, G = outG, R = outR;
 
-	auto delivered = [&](int a, float p, float g, float r) {
-		return GradeChainDelivered(wAnchor[a], wPeak, p, g, r, kneeShadow, guard, kneeHi);
+	auto delivered = [&](int a, float s, float g, float r) {
+		return GradeChainDelivered(wAnchor[a], wPeak, s, g, r, kneeShadow, guard, kneeHi);
 	};
 
 	for (int iter = 0; iter < 6; iter++) {
-		// (param, anchor, step, lo, hi) — shadow->p25, gamma->p50, rolloff->p95
+		// (param, anchor, step, lo, hi) — shadow slope->p25, gamma->p50, rolloff->p95.
+		// The slope's range stops at 1.0 (identity): it may expand shadows, never
+		// crush them, because crushing is what the source or the curve already did
+		// and the grade's job here is to undo it.
 		struct Axis { float* p; int a; float step; float lo; float hi; };
 		Axis axes[3] = {
-			{ &P, 0, 0.005f, -0.04f, 0.08f },
-			{ &G, 1, 0.05f,  0.60f,  1.60f },
-			{ &R, 2, 0.02f,  -0.30f, 0.40f },
+			{ &S, 0, 0.02f,  0.50f, 1.00f },
+			{ &G, 1, 0.05f,  0.60f, 1.60f },
+			{ &R, 2, 0.02f, -0.30f, 0.40f },
 		};
 		for (auto& ax : axes) {
-			const float f0 = delivered(ax.a, P, G, R) - wTarget[ax.a];
+			const float f0 = delivered(ax.a, S, G, R) - wTarget[ax.a];
 			const float saved = *ax.p;
 			const float bumped = fminf(fmaxf(saved + ax.step, ax.lo), ax.hi);
 			if (bumped == saved) {
 				continue;
 			}
 			*ax.p = bumped;
-			const float f1 = delivered(ax.a, P, G, R) - wTarget[ax.a];
+			const float f1 = delivered(ax.a, S, G, R) - wTarget[ax.a];
 			*ax.p = saved;
 			const float d = (f1 - f0) / (bumped - saved);
 			if (fabsf(d) > 1e-6f) {
@@ -2171,7 +2181,7 @@ static void SolveGrade(const float wAnchor[3], float wPeak, const float wTarget[
 		}
 	}
 
-	outP = P; outG = G; outR = R;
+	outS = S; outG = G; outR = R;
 }
 
 // CPU mirror of the GT7 path in ps_convert_pq_to_sdr.hlsl / convert/gt7_tonemap.hlsl:
@@ -2489,7 +2499,7 @@ void CDX11VideoProcessor::SetMLParams()
 	// the inputs are this frame's source percentiles, so it tracks scenes with no
 	// settle window and no per-title ritual; temporal smoothing below is noise
 	// control, not convergence.
-	float ctlP = 0.0f, ctlG = 1.0f, ctlR = 0.0f;
+	float ctlS = 1.0f, ctlG = 1.0f, ctlR = 0.0f;
 	const bool ctl = m_bMLController && m_bMLFeaturesReady &&
 	                 (m_iHdrLocalToneMappingType == TONE_CURVE_GT7 ||
 	                  m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT) &&
@@ -2509,23 +2519,22 @@ void CDX11VideoProcessor::SetMLParams()
 
 		// The highlight knee is derived from gamma, and gamma is what we are solving
 		// for: one extra pass with the solved value keeps the two consistent.
-		ctlP = m_ctlP; ctlG = m_ctlG; ctlR = m_ctlR;
+		ctlS = m_ctlS; ctlG = m_ctlG; ctlR = m_ctlR;
 		for (int pass = 0; pass < 2; pass++) {
 			const float kneeHi = fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(ctlG, 0.5f)) * 0.20f));
-			SolveGrade(wA, wPeak, wT, 0.25f, guard, kneeHi, ctlP, ctlG, ctlR);
+			SolveGrade(wA, wPeak, wT, 0.25f, guard, kneeHi, ctlS, ctlG, ctlR);
 		}
 
 		// Smooth, but snap on a large move: that is a cut, and a cut should arrive in
 		// one frame rather than trail the picture.
 		auto settle = [](float& held, float now, float jump) {
-			if (held == 0.0f && now != 0.0f && fabsf(now - held) > jump) { held = now; return; }
 			if (fabsf(now - held) > jump) { held = now; }
 			else { held += 0.20f * (now - held); }
 		};
-		settle(m_ctlP, ctlP, 0.02f);
+		settle(m_ctlS, ctlS, 0.10f);
 		settle(m_ctlG, ctlG, 0.25f);
 		settle(m_ctlR, ctlR, 0.10f);
-		ctlP = m_ctlP; ctlG = m_ctlG; ctlR = m_ctlR;
+		ctlS = m_ctlS; ctlG = m_ctlG; ctlR = m_ctlR;
 	}
 
 	MLParams_t params = {
@@ -2631,11 +2640,16 @@ void CDX11VideoProcessor::SetMLParams()
 	// it is a fraction of I_norm, and a value large enough to matter for crushed
 	// shadows is also large enough to grey out the letterbox matte if the shader's
 	// in-content gate ever fails. 0 = the previous picture exactly.
-	// Two-sided: Dolby's own offsets at 85 nits are negative on 55-62% of frames
-	// (the colorist CRUSHES blacks at SDR levels), which a [0, 0.08] actuator cannot
-	// express. The controller solves signed; the manual dial stays one-sided.
-	params.MLShadowPedestal = ctl ? std::clamp(ctlP, -0.04f, 0.08f)
+	// The controller does NOT use the pedestal: an additive offset lifts black to grey
+	// and veils the picture instead of revealing detail (measured by eye). It solves
+	// the toe SLOPE instead, and leaves the pedestal at zero. The manual dial stays
+	// available when the controller is off, one-sided as before.
+	params.MLShadowPedestal = ctl ? 0.0f
 	                              : std::clamp(m_fMLShadowPedestal, 0.0f, 0.08f);
+	params.MLShadowSlope = ctl ? std::clamp(ctlS, 0.50f, 1.00f) : 1.0f;
+	params._padS0 = 0.0f;
+	params._padS1 = 0.0f;
+	params._padS2 = 0.0f;
 	params.MLGamutCap = m_fGamutCap;
 	params.MLGamutMap709 = (m_iOutputGamut == 0) ? 1.0f : 0.0f;
 
@@ -8076,7 +8090,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		// Drop the warm start: values solved under one mode are not a good starting
 		// point for the other. (SetMLParams runs every frame while the grade is up,
 		// so no change-flag is needed here.)
-		m_ctlP = 0.0f; m_ctlG = 1.0f; m_ctlR = 0.0f;
+		m_ctlS = 1.0f; m_ctlG = 1.0f; m_ctlR = 0.0f;
 	}
 	// Auto exposure. Changing either input invalidates the solved value, so drop it
 	// and let the anchor block re-solve on the next frame rather than slewing from a

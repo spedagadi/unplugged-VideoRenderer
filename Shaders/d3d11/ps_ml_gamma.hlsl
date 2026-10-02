@@ -101,8 +101,15 @@ cbuffer MLParams : register(b0)
 	// padding slot at the tail, which only this shader declares, so the shared
 	// MLParams_t grows by nothing and every existing offset is unchanged.
 	float MLShadowPedestal;
-	float _padGT1;
-	float _padGT2;
+	float MLGamutCap;
+	float MLGamutMap709;
+	// Shadow TOE SLOPE — the actuator that reveals shadow detail (stage 0 below).
+	// 1.0 = off. Appended tail with its own padding so the 16-byte cbuffer rule holds
+	// and no other ps_ml_* mirror shifts.
+	float MLShadowSlope;
+	float _padS0;
+	float _padS1;
+	float _padS2;
 };
 
 static const float3 luma_w = float3(0.2126, 0.7152, 0.0722);
@@ -123,6 +130,24 @@ float srcLumAt(float2 uv)
 // MLSkyStrength (0 when sky features are off → exactly the global path).
 float applyToneCurve(float x, float sky, float skinW)
 {
+	// 0. Shadow TOE SLOPE — the actuator that REVEALS shadow detail.
+	//
+	// A pedestal (additive, stage 1b in the reconstruction) lifts black to grey and
+	// veils the picture: it adds the same amount to a pixel at 0 and to a pixel at
+	// 0.01, so detail that was crushed stays crushed and everything below the knee
+	// carries a milky floor. Seen on a dark tent interior as "a grey layer on top".
+	//
+	// A power below the knee does the opposite. 0 stays 0, the knee stays exactly put,
+	// and everything between is expanded in log: the code span that dark detail
+	// occupies moves up out of the display's invisible floor while its internal
+	// contrast — the detail itself — is preserved. That is revealing shadows rather
+	// than painting over them.
+	//
+	// 1.0 = identity, i.e. the previous picture exactly.
+	if (MLShadowSlope < 0.999 && x > 0.0 && x < MLShadowKnee) {
+		x = MLShadowKnee * pow(x / MLShadowKnee, MLShadowSlope);
+	}
+
 	// 1. Shadow toe: DV L2 offset pedestal lift — raises dark end toward knee
 	//
 	// MISLABELLED, and knowingly left alone: this is a GAIN (the lift is

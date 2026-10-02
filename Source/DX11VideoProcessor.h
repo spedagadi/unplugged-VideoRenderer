@@ -281,8 +281,18 @@ private:
 		// triangle to constrain to. The chroma pass gates on this; without it the
 		// mapping ran on BT.2020 output too and washed the frame out there as well.
 		float MLGamutMap709;
+		// Shadow TOE SLOPE: a power below the shadow knee, 1.0 = identity. The
+		// actuator that reveals shadow detail; the additive pedestal only greys it.
+		// Appended with padding to keep the cbuffer a multiple of 16 bytes.
+		float MLShadowSlope;
+		float _padS0;
+		float _padS1;
+		float _padS2;
 	};
-	static_assert(sizeof(MLParams_t) == 352, "MLParams_t cbuffer size drift");
+	// 368 bytes = 92 floats = 23 float4 groups. Grew 352 -> 368 when MLShadowSlope and
+	// its three pads were appended. Every ps_ml_* mirror must stay a PREFIX of this
+	// layout: ending earlier is fine, ending later is not.
+	static_assert(sizeof(MLParams_t) == 368, "MLParams_t cbuffer size drift");
 	MLParams_t m_lastMLParams = {};
 	CComPtr<ID3D11Buffer> m_pMLParams;
 	CComPtr<ID3D11PixelShader> m_pPSMLGamma;
@@ -558,8 +568,9 @@ private:
 	// 4 ceiling crossing. Renders that quantity as greyscale instead of the picture.
 	float m_fHdrGt7Dbg       = 0.0f;
 	// Joint band controller (see Settings_t::bMLController). Solved values, smoothed.
+	// S = shadow toe slope (1 = off), G = gamma, R = highlight rolloff.
 	bool  m_bMLController = false;
-	float m_ctlP = 0.0f, m_ctlG = 1.0f, m_ctlR = 0.0f;
+	float m_ctlS = 1.0f, m_ctlG = 1.0f, m_ctlR = 0.0f;
 	float m_fTgtShadow = 0.39f, m_fTgtMid = 0.54f, m_fTgtHighlight = 0.89f;
 	// Auto exposure (see Settings_t::bHdrAutoRefWhite).
 	bool  m_bAutoRefWhite    = true;
