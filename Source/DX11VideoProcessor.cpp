@@ -2150,51 +2150,104 @@ static void SolveGrade(const float wAnchor[3], const float wTarget[3],
                        float kneeShadow, float guard, float kneeHi, float sdrNits,
                        float& outS, float& outG, float& outR)
 {
-	float S = outS, G = outG, R = outR;
+	// Gauss-Newton on the full 3x3 Jacobian, damped, with a trust region.
+	//
+	// Two earlier versions assigned each actuator to one band (slope->p25,
+	// gamma->p50, rolloff->p95) and took a secant step per axis. Both failed
+	// silently, and the CTL log is what showed how: on a dark scene every anchor
+	// sits below x=0.08 in the grade's PQ-normalised space, where the gamma stage's
+	// fade gate is exactly zero, while the rolloff only acts above x~0.7. So the mid
+	// band's error was invisible to gamma, the shadow band's target was ~0 so slope
+	// saw no error, every secant derivative came back zero, and the solver returned
+	// IDENTITY against residuals of 20x (wA 0.0002 vs wT 0.0042). Axis assignment is
+	// whack-a-mole on a chain whose stages switch on and off with level; the Jacobian
+	// asks, per iteration, which actuator CAN move which band, and uses whatever can.
+	const float lo[3] = { 0.50f, 0.60f, -0.30f };
+	const float hi[3] = { 1.00f, 1.60f,  0.40f };
+	const float eps[3] = { 0.02f, 0.05f, 0.02f };
+	float p[3] = { outS, outG, outR };
 
-	auto delivered = [&](int a, float s, float g, float r) {
-		return GradeChainDelivered(wAnchor[a], s, g, r, kneeShadow, guard, kneeHi, sdrNits);
+	auto delivered = [&](int a, const float q[3]) {
+		return GradeChainDelivered(wAnchor[a], q[0], q[1], q[2], kneeShadow, guard, kneeHi, sdrNits);
 	};
 
-	for (int iter = 0; iter < 6; iter++) {
-		// (param, anchor, step, lo, hi) — shadow slope->p25, gamma->p50, rolloff->p95.
-		// The slope's range stops at 1.0 (identity): it may expand shadows, never
-		// crush them, because crushing is what the source or the curve already did
-		// and the grade's job here is to undo it.
-		struct Axis { float* p; int a; float step; float lo; float hi; };
-		Axis axes[3] = {
-			{ &S, 0, 0.02f,  0.50f, 1.00f },
-			{ &G, 1, 0.05f,  0.60f, 1.60f },
-			{ &R, 2, 0.02f, -0.30f, 0.40f },
-		};
-		for (auto& ax : axes) {
-			const float f0 = delivered(ax.a, S, G, R) - wTarget[ax.a];
-			const float saved = *ax.p;
-			// Probe in a direction that has ROOM. The slope axis starts at its upper
-			// bound (1.0 = identity), so an upward probe clamps back onto the saved
-			// value, the secant sees a zero derivative and skips the axis forever --
-			// the solver then returns identity and the grade is a passthrough. That
-			// was exactly the reported symptom.
-			const float dir = (saved + ax.step <= ax.hi) ? ax.step : -ax.step;
-			const float bumped = fminf(fmaxf(saved + dir, ax.lo), ax.hi);
-			if (bumped == saved) {
+	for (int iter = 0; iter < 8; iter++) {
+		float f[3], J[3][3];
+		for (int a = 0; a < 3; a++) {
+			f[a] = delivered(a, p) - wTarget[a];
+		}
+		for (int j = 0; j < 3; j++) {
+			float q[3] = { p[0], p[1], p[2] };
+			const float bumped = fminf(fmaxf(q[j] + eps[j], lo[j]), hi[j]);
+			const float step = bumped - q[j];
+			if (fabsf(step) < 1e-9f) {
+				J[0][j] = J[1][j] = J[2][j] = 0.0f;
 				continue;
 			}
-			*ax.p = bumped;
-			const float f1 = delivered(ax.a, S, G, R) - wTarget[ax.a];
-			*ax.p = saved;
-			const float d = (f1 - f0) / (bumped - saved);
-			if (fabsf(d) > 1e-9f) {
-				// Half-step: full Newton oscillates between the bounds on this system
-				// (observed: G pinned at 1.6 while S sat at identity), and a damped
-				// iteration converges instead of ping-ponging. Six iterations of half
-				// steps is plenty for three monotone axes.
-				*ax.p = fminf(fmaxf(saved - 0.5f * f0 / d, ax.lo), ax.hi);
+			q[j] = bumped;
+			for (int a = 0; a < 3; a++) {
+				J[a][j] = (delivered(a, q) - wTarget[a] - f[a]) / step;
 			}
+		}
+
+		// Normal equations with Levenberg damping: (J'J + lI) d = -J'f.
+		float A[3][3], b[3];
+		for (int i = 0; i < 3; i++) {
+			b[i] = 0.0f;
+			for (int j = 0; j < 3; j++) {
+				A[i][j] = 0.0f;
+				for (int a = 0; a < 3; a++) {
+					A[i][j] += J[a][i] * J[a][j];
+				}
+			}
+			for (int a = 0; a < 3; a++) {
+				b[i] -= J[a][i] * f[a];
+			}
+		}
+		const float scale = fmaxf(fmaxf(fabsf(A[0][0]), fabsf(A[1][1])), fabsf(A[2][2]));
+		for (int i = 0; i < 3; i++) {
+			A[i][i] += 1e-4f * fmaxf(scale, 1e-8f);
+		}
+
+		// 3x3 solve, Gauss-Jordan with partial pivoting.
+		float d[3] = { 0.0f, 0.0f, 0.0f };
+		float M[3][4];
+		for (int i = 0; i < 3; i++) {
+			M[i][0] = A[i][0]; M[i][1] = A[i][1]; M[i][2] = A[i][2]; M[i][3] = b[i];
+		}
+		bool ok = true;
+		for (int c = 0; c < 3 && ok; c++) {
+			int piv = c;
+			for (int r = c + 1; r < 3; r++) {
+				if (fabsf(M[r][c]) > fabsf(M[piv][c])) piv = r;
+			}
+			if (fabsf(M[piv][c]) < 1e-12f) { ok = false; break; }
+			for (int j = c; j < 4; j++) { std::swap(M[c][j], M[piv][j]); }
+			for (int r = 0; r < 3; r++) {
+				if (r == c) continue;
+				const float fct = M[r][c] / M[c][c];
+				for (int j = c; j < 4; j++) M[r][j] -= fct * M[c][j];
+			}
+		}
+		if (!ok) {
+			break;                       // singular: hold the current point
+		}
+		for (int i = 0; i < 3; i++) {
+			d[i] = M[i][3] / M[i][i];
+		}
+
+		float maxStep = 0.0f;
+		for (int j = 0; j < 3; j++) {
+			const float step = fminf(fmaxf(d[j], -0.5f), 0.5f);
+			p[j] = fminf(fmaxf(p[j] + step, lo[j]), hi[j]);
+			maxStep = fmaxf(maxStep, fabsf(step));
+		}
+		if (maxStep < 1e-4f) {
+			break;
 		}
 	}
 
-	outS = S; outG = G; outR = R;
+	outS = p[0]; outG = p[1]; outR = p[2];
 }
 
 // CPU mirror of the GT7 path in ps_convert_pq_to_sdr.hlsl / convert/gt7_tonemap.hlsl:
