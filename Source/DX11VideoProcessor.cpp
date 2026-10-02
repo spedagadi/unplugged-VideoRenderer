@@ -2207,18 +2207,41 @@ static void SolveGrade(const float wAnchor[3], const float wTarget[3],
 			}
 		}
 
-		// Normal equations with Levenberg damping: (J'J + lI) d = -J'f.
+		// Freeze axes the anchors cannot see. On a dark scene every anchor sits below
+		// the rolloff knee, so R's Jacobian column is zero and the axis is
+		// unconstrained -- observed live drifting to +0.4 and staying there, lifting
+		// highlights nobody asked for while G was spent correcting p95 instead of the
+		// mid. An actuator with no observable effect must hold neutral, not wander.
+		const float neutral[3] = { 1.0f, 1.0f, 0.0f };
+		bool fixed[3] = { false, false, false };
+		for (int j = 0; j < 3; j++) {
+			const float colNorm = fabsf(J[0][j]) + fabsf(J[1][j]) + fabsf(J[2][j]);
+			if (colNorm < 1e-5f) {
+				fixed[j] = true;
+				p[j] = neutral[j];
+			}
+		}
+
+		// Band weights. The highlight band is already protected by the curve's soft
+		// ceiling and the gamut capacity map; letting it compete equally with shadow
+		// and mid for a shared gamma made the solver trade the face for the sky on
+		// dark scenes (measured: face luma halved). Shadow and mid lead.
+		const float W[3] = { 1.0f, 1.0f, 0.30f };
+
+		// Weighted normal equations with Levenberg damping: (J'WJ + lI) d = -J'Wf.
 		float A[3][3], b[3];
 		for (int i = 0; i < 3; i++) {
 			b[i] = 0.0f;
 			for (int j = 0; j < 3; j++) {
 				A[i][j] = 0.0f;
+				if (fixed[i] || fixed[j]) continue;
 				for (int a = 0; a < 3; a++) {
-					A[i][j] += J[a][i] * J[a][j];
+					A[i][j] += W[a] * J[a][i] * J[a][j];
 				}
 			}
+			if (fixed[i]) continue;
 			for (int a = 0; a < 3; a++) {
-				b[i] -= J[a][i] * f[a];
+				b[i] -= W[a] * J[a][i] * f[a];
 			}
 		}
 		const float scale = fmaxf(fmaxf(fabsf(A[0][0]), fabsf(A[1][1])), fabsf(A[2][2]));
