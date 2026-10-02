@@ -2509,6 +2509,17 @@ void CDX11VideoProcessor::SetMLParams()
 	// settle window and no per-title ritual; temporal smoothing below is noise
 	// control, not convergence.
 	float ctlS = 1.0f, ctlG = 1.0f, ctlR = 0.0f;
+	// Gate bookkeeping, OUTSIDE the gate: a line inside `if (ctl)` cannot explain its
+	// own absence. Four conditions, and three consecutive sessions in which the
+	// controller appeared to do nothing.
+	if (m_bMLDebug && m_pMLDebugFile && (m_MLDebugFrame % 30 == 0)) {
+		fwprintf(m_pMLDebugFile,
+			L"CTLSTATE on=%d feat=%d curve=%d peak=%.0f sdr=%d effRefW=%.1f\n",
+			m_bMLController ? 1 : 0, m_bMLFeaturesReady ? 1 : 0,
+			m_iHdrLocalToneMappingType, (double)m_fCurvePeakNits,
+			m_iSDRDisplayNits, (double)m_fEffRefWhite);
+		fflush(m_pMLDebugFile);
+	}
 	const bool ctl = m_bMLController && m_bMLFeaturesReady &&
 	                 (m_iHdrLocalToneMappingType == TONE_CURVE_GT7 ||
 	                  m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT) &&
