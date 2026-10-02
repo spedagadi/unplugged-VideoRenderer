@@ -2110,8 +2110,15 @@ static inline float smoothstepf2(float e0, float e1, float x)
 // cannot reveal detail that sits near the floor. A power below the knee keeps 0 at 0
 // and the knee fixed while expanding everything between in log — the code span dark
 // detail occupies moves up out of the invisible floor with its contrast intact.
+// baseG/baseR are the model grade's own gamma and rolloff. The controller solves for
+// CORRECTIONS on top of them, not replacements: on a dark scene every anchor sits
+// inside the gamma stage's fade-gate blind zone, so a solver that replaces gamma
+// returns ~1.0 there and silently deletes the lift the model was providing (face
+// luma halved, measured). Parameterising the solve as base + correction keeps the
+// model's judgement as the prior and makes the controller the closed loop on top.
 static float GradeChainDelivered(float w, float S, float G, float R,
-                                 float kneeShadow, float guard, float kneeHi, float sdrNits)
+                                 float kneeShadow, float guard, float kneeHi, float sdrNits,
+                                 float baseG, float baseR)
 {
 	const float kIPeak = 0.5893f;                 // SDR_I_PEAK_PQ, ictcp.hlsl
 	float x = exptm::LinearNitsToPq(w * sdrNits) / kIPeak;
@@ -2120,16 +2127,18 @@ static float GradeChainDelivered(float w, float S, float G, float R,
 		x = kneeShadow * powf(x / kneeShadow, S);
 	}
 
-	if (G != 1.0f && x > 0.001f && x < 0.999f) {
+	const float gEff = baseG + (G - 1.0f);
+	const float rEff = baseR + R;
+	if (gEff != 1.0f && x > 0.001f && x < 0.999f) {
 		const float fade = smoothstepf2(0.08f, 0.45f, x);
 		const float hi_g = smoothstepf2(guard, 0.98f, x);
-		x = lerpf(x, powf(x, 1.0f / G), fade * (1.0f - hi_g));
+		x = lerpf(x, powf(x, 1.0f / gEff), fade * (1.0f - hi_g));
 	}
 
-	if (fabsf(R) > 0.005f && x > kneeHi && x < 0.995f) {
+	if (fabsf(rEff) > 0.005f && x > kneeHi && x < 0.995f) {
 		const float span = fmaxf(1.0f - kneeHi, 0.01f);
 		const float t = (x - kneeHi) / span;
-		x = satf(x + R * t * t * (1.0f - x));
+		x = satf(x + rEff * t * t * (1.0f - x));
 	}
 
 	return exptm::PqToLinearNits(x * kIPeak) / sdrNits;
@@ -2148,6 +2157,7 @@ static float GradeChainDelivered(float w, float S, float G, float R,
 // for the pedestal it is also returning.
 static void SolveGrade(const float wAnchor[3], const float wTarget[3],
                        float kneeShadow, float guard, float kneeHi, float sdrNits,
+                       float baseG, float baseR,
                        float& outS, float& outG, float& outR)
 {
 	// Gauss-Newton on the full 3x3 Jacobian, damped, with a trust region.
@@ -2168,7 +2178,8 @@ static void SolveGrade(const float wAnchor[3], const float wTarget[3],
 	float p[3] = { outS, outG, outR };
 
 	auto delivered = [&](int a, const float q[3]) {
-		return GradeChainDelivered(wAnchor[a], q[0], q[1], q[2], kneeShadow, guard, kneeHi, sdrNits);
+		return GradeChainDelivered(wAnchor[a], q[0], q[1], q[2], kneeShadow, guard, kneeHi,
+		                           sdrNits, baseG, baseR);
 	};
 
 	for (int iter = 0; iter < 8; iter++) {
@@ -2648,9 +2659,10 @@ void CDX11VideoProcessor::SetMLParams()
 		// The highlight knee is derived from gamma, and gamma is what we are solving
 		// for: one extra pass with the solved value keeps the two consistent.
 		ctlS = m_ctlS; ctlG = m_ctlG; ctlR = m_ctlR;
+		const float baseG = gamma + gammaTopUp;   // what the shader would apply without us
 		for (int pass = 0; pass < 2; pass++) {
-			const float kneeHi = fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(ctlG, 0.5f)) * 0.20f));
-			SolveGrade(wA, wT, 0.25f, guard, kneeHi, sdrN, ctlS, ctlG, ctlR);
+			const float kneeHi = fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(baseG + ctlG - 1.0f, 0.5f)) * 0.20f));
+			SolveGrade(wA, wT, 0.25f, guard, kneeHi, sdrN, baseG, rolloff, ctlS, ctlG, ctlR);
 		}
 
 		// Smooth, but snap on a large move: that is a cut, and a cut should arrive in
@@ -2682,20 +2694,24 @@ void CDX11VideoProcessor::SetMLParams()
 				(double)wA[0], (double)wA[1], (double)wA[2],
 				(double)wT[0], (double)wT[1], (double)wT[2],
 				(double)ctlS, (double)ctlG, (double)ctlR,
-				(double)GradeChainDelivered(wA[0], ctlS, ctlG, ctlR, 0.25f, guard, kneeHi, sdrN),
-				(double)GradeChainDelivered(wA[1], ctlS, ctlG, ctlR, 0.25f, guard, kneeHi, sdrN),
-				(double)GradeChainDelivered(wA[2], ctlS, ctlG, ctlR, 0.25f, guard, kneeHi, sdrN),
+				(double)GradeChainDelivered(wA[0], ctlS, ctlG, ctlR, 0.25f, guard, kneeHi, sdrN, baseG, rolloff),
+				(double)GradeChainDelivered(wA[1], ctlS, ctlG, ctlR, 0.25f, guard, kneeHi, sdrN, baseG, rolloff),
+				(double)GradeChainDelivered(wA[2], ctlS, ctlG, ctlR, 0.25f, guard, kneeHi, sdrN, baseG, rolloff),
 				(double)m_fEffRefWhite, (double)m_fCurvePeakNits, m_iSDRDisplayNits);
 			fflush(m_pMLDebugFile);
 		}
 	}
 
 	MLParams_t params = {
-		ctl ? ctlG : gamma,
+		// base + correction: the model's judgement is the prior, the solve is the
+		// closed loop on top. Replacing the model gamma outright deleted its lift on
+		// dark scenes, where every anchor sits in the gamma stage's blind zone and the
+		// solver therefore returns ~1.0 (face luma halved, measured).
+		ctl ? std::clamp(gamma + gammaTopUp + (ctlG - 1.0f), 0.50f, 1.80f) : gamma,
 		ctl ? 0.0f : shadow,        // controller owns the shadow band; legacy toe stands down
 		0.25f,                                            // shadow knee
 		shadowStrength,                                   // DoG detail multiplier
-		ctl ? ctlR : rolloff,
+		ctl ? std::clamp(rolloff + ctlR, -0.30f, 0.40f) : rolloff,
 		fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(gamma, 0.5f)) * 0.20f)), // highlight knee
 		guard,
 		hunt,                                             // hunt compensation
