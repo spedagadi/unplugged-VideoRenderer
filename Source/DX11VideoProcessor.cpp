@@ -2170,7 +2170,13 @@ static void SolveGrade(const float wAnchor[3], const float wTarget[3],
 		for (auto& ax : axes) {
 			const float f0 = delivered(ax.a, S, G, R) - wTarget[ax.a];
 			const float saved = *ax.p;
-			const float bumped = fminf(fmaxf(saved + ax.step, ax.lo), ax.hi);
+			// Probe in a direction that has ROOM. The slope axis starts at its upper
+			// bound (1.0 = identity), so an upward probe clamps back onto the saved
+			// value, the secant sees a zero derivative and skips the axis forever --
+			// the solver then returns identity and the grade is a passthrough. That
+			// was exactly the reported symptom.
+			const float dir = (saved + ax.step <= ax.hi) ? ax.step : -ax.step;
+			const float bumped = fminf(fmaxf(saved + dir, ax.lo), ax.hi);
 			if (bumped == saved) {
 				continue;
 			}
