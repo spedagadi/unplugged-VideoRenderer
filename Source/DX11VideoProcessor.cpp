@@ -2178,7 +2178,13 @@ static void SolveGrade(const float wAnchor[3], const float wTarget[3],
 		}
 		for (int j = 0; j < 3; j++) {
 			float q[3] = { p[0], p[1], p[2] };
-			const float bumped = fminf(fmaxf(q[j] + eps[j], lo[j]), hi[j]);
+			// Probe in a direction that has ROOM. At a bound, a forward probe clamps
+			// back onto the current value, the step is zero, the Jacobian column is
+			// zero, and that actuator becomes invisible to the solve -- observed live
+			// as S frozen at 1.000 while G and R pinned at their bounds trying to do
+			// slope's job. Same bug as the secant version, one level deeper.
+			const float dir = (q[j] + eps[j] <= hi[j]) ? eps[j] : -eps[j];
+			const float bumped = fminf(fmaxf(q[j] + dir, lo[j]), hi[j]);
 			const float step = bumped - q[j];
 			if (fabsf(step) < 1e-9f) {
 				J[0][j] = J[1][j] = J[2][j] = 0.0f;
