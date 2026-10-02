@@ -2184,8 +2184,12 @@ static void SolveGrade(const float wAnchor[3], const float wTarget[3],
 			const float f1 = delivered(ax.a, S, G, R) - wTarget[ax.a];
 			*ax.p = saved;
 			const float d = (f1 - f0) / (bumped - saved);
-			if (fabsf(d) > 1e-6f) {
-				*ax.p = fminf(fmaxf(saved - f0 / d, ax.lo), ax.hi);
+			if (fabsf(d) > 1e-9f) {
+				// Half-step: full Newton oscillates between the bounds on this system
+				// (observed: G pinned at 1.6 while S sat at identity), and a damped
+				// iteration converges instead of ping-ponging. Six iterations of half
+				// steps is plenty for three monotone axes.
+				*ax.p = fminf(fmaxf(saved - 0.5f * f0 / d, ax.lo), ax.hi);
 			}
 		}
 	}
@@ -2528,18 +2532,27 @@ void CDX11VideoProcessor::SetMLParams()
 		const float sdrN = (float)m_iSDRDisplayNits;
 		// features[3..8] = p25 p50 p75 p90 p95 p99, in source PQ.
 		const int idx[3] = { 3, 4, 7 };
+		const float peakNits = fmaxf(exptm::PqToLinearNits(m_MLFeatures[0]), 1e-3f);
 		float wA[3], wT[3];
 		for (int i = 0; i < 3; i++) {
 			const float nits = exptm::PqToLinearNits(m_MLFeatures[idx[i]]);
 			wA[i] = PredictGt7RelLinear(nits, m_fEffRefWhite, m_fCurvePeakNits, sdrN, m_fHdrGt7Alpha);
-			// SCENE-REFERRED target, not a constant. A constant delivered mid is
-			// auto-gain by construction: it turns a night scene into noon, because it
-			// says where the mid should land without asking how bright the scene is.
-			// This law says instead: a source at W nits approaches display white, and
-			// everything else follows monotonically — so 10 nits lands in the same
-			// place whatever else is in the frame. Night stays night; the controller's
-			// job narrows to making OUR delivery match the law, band by band.
-			wT[i] = 1.0f - expf(-nits / fmaxf(m_fCtlWhiteNits, 10.0f));
+			// RELATIVE to the scene's own range, not absolute nits and not a constant.
+			//
+			// An absolute law (1 - exp(-nits/W)) told a 0.25-nit source to deliver
+			// 0.13 nits on a 127-nit display -- invisible. That is scene-referred in the
+			// wrong sense: right for a display that can show the source's dynamic
+			// range, wrong for compressing 1000 nits into 127. A constant delivered
+			// level is the opposite error (auto-gain: night into noon).
+			//
+			// r = the anchor's position within THIS scene's range, and the house curve
+			// r^k says where that relative position should land as a fraction of white.
+			// k < 1 lifts shadows in proportion to the scene's own contrast, so a night
+			// scene stays a night scene but its detail sits above the invisible floor.
+			// House white then scales the whole thing as the overall level.
+			const float r = fminf(1.0f, nits / peakNits);
+			const float level = fminf(2.0f, fmaxf(0.5f, 203.0f / fmaxf(m_fCtlWhiteNits, 10.0f)));
+			wT[i] = fminf(1.0f, level * powf(r, 0.75f));
 		}
 
 		// The highlight knee is derived from gamma, and gamma is what we are solving
