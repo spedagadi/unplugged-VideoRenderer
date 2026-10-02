@@ -2078,6 +2078,102 @@ void CDX11VideoProcessor::UpdateMLActive()
 	UpdatePostScaleTexures();
 }
 
+// CPU-side equivalents of the HLSL intrinsics the mirrored chain uses. Named to match
+// the shader so the two implementations read side by side and stay in step.
+static inline float satf(float v) { return fminf(1.0f, fmaxf(0.0f, v)); }
+static inline float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+static inline float smoothstepf2(float e0, float e1, float x)
+{
+	const float t = satf((x - e0) / fmaxf(e1 - e0, 1e-6f));
+	return t * t * (3.0f - 2.0f * t);
+}
+
+// The grade chain in I_norm space, mirrored from ps_ml_gamma.hlsl applyToneCurve with
+// sky = 0 (the global path) and the legacy multiplicative toe removed (the controller
+// owns the shadow band through the additive pedestal instead, because a gain cannot
+// lift a pixel that is already at zero).
+//   w  = linear fraction of white delivered by the tone curve
+//   x  = w / wPeak            (I_norm: the grade's own domain)
+//   1. pedestal:  w += P * t^2,        t = 1 - saturate(x / kneeShadow)
+//   2. gamma:     x  = lerp(x, x^(1/G), fade(x) * (1 - hi_g(x)))
+//   3. rolloff:   x += R * t^2 * (1-x), t = (x - kneeHi) / (1 - kneeHi)
+// Returns the delivered linear fraction of white for one source anchor.
+static float GradeChainDelivered(float w, float wPeak, float P, float G, float R,
+                                 float kneeShadow, float guard, float kneeHi)
+{
+	if (wPeak <= 1e-6f) {
+		return w;
+	}
+	float x = w / wPeak;
+
+	const float tSh = 1.0f - satf(x / fmaxf(kneeShadow, 0.01f));
+	w += P * tSh * tSh;
+	x = w / wPeak;
+
+	if (G != 1.0f && x > 0.001f && x < 0.999f) {
+		const float fade = smoothstepf2(0.08f, 0.45f, x);
+		const float hi_g = smoothstepf2(guard, 0.98f, x);
+		x = lerpf(x, powf(x, 1.0f / G), fade * (1.0f - hi_g));
+	}
+
+	if (fabsf(R) > 0.005f && x > kneeHi && x < 0.995f) {
+		const float span = fmaxf(1.0f - kneeHi, 0.01f);
+		const float t = (x - kneeHi) / span;
+		x = satf(x + R * t * t * (1.0f - x));
+	}
+
+	return x * wPeak;
+}
+
+// Joint solve: three band targets (delivered linear fractions of white) in, the three
+// actuator values out. Coordinate-descent Newton on the analytic chain — each actuator
+// is monotone in its own band, so per-anchor secant steps converge in a handful of
+// iterations.
+//
+// This is the point of the controller. The three grade stages compose sequentially in
+// the shader, but every model behind them was trained as if it acted ALONE on the
+// source. Stacking three solo-trained corrections is not the sum of their intents:
+// a power applied after an additive lift rescales that lift, and neither knows.
+// Solving the composition jointly means the gamma the solver returns already accounts
+// for the pedestal it is also returning.
+static void SolveGrade(const float wAnchor[3], float wPeak, const float wTarget[3],
+                       float kneeShadow, float guard, float kneeHi,
+                       float& outP, float& outG, float& outR)
+{
+	float P = outP, G = outG, R = outR;
+
+	auto delivered = [&](int a, float p, float g, float r) {
+		return GradeChainDelivered(wAnchor[a], wPeak, p, g, r, kneeShadow, guard, kneeHi);
+	};
+
+	for (int iter = 0; iter < 6; iter++) {
+		// (param, anchor, step, lo, hi) — shadow->p25, gamma->p50, rolloff->p95
+		struct Axis { float* p; int a; float step; float lo; float hi; };
+		Axis axes[3] = {
+			{ &P, 0, 0.005f, -0.04f, 0.08f },
+			{ &G, 1, 0.05f,  0.60f,  1.60f },
+			{ &R, 2, 0.02f,  -0.30f, 0.40f },
+		};
+		for (auto& ax : axes) {
+			const float f0 = delivered(ax.a, P, G, R) - wTarget[ax.a];
+			const float saved = *ax.p;
+			const float bumped = fminf(fmaxf(saved + ax.step, ax.lo), ax.hi);
+			if (bumped == saved) {
+				continue;
+			}
+			*ax.p = bumped;
+			const float f1 = delivered(ax.a, P, G, R) - wTarget[ax.a];
+			*ax.p = saved;
+			const float d = (f1 - f0) / (bumped - saved);
+			if (fabsf(d) > 1e-6f) {
+				*ax.p = fminf(fmaxf(saved - f0 / d, ax.lo), ax.hi);
+			}
+		}
+	}
+
+	outP = P; outG = G; outR = R;
+}
+
 // CPU mirror of the GT7 path in ps_convert_pq_to_sdr.hlsl / convert/gt7_tonemap.hlsl:
 // for one SOURCE luminance in nits, return the ENCODED (gamma-2.2, 0..1) value the
 // correction pass will hand to the grade. This is what lets the grade know what the
@@ -2087,8 +2183,8 @@ void CDX11VideoProcessor::UpdateMLActive()
 // The constants MUST stay in step with the shader. If GT7_ALPHA, GT7_LINEAR_SECTION
 // or kGT7RangeFit changes there, this stops predicting and the mid-tone target goes
 // quietly wrong, so they are named here rather than folded into one expression.
-static float PredictGt7Encoded(float srcNits, float refWhiteNits, float peakNits, float ceilingNits,
-                               float alpha)
+static float PredictGt7RelLinear(float srcNits, float refWhiteNits, float peakNits, float ceilingNits,
+                                 float alpha)
 {
 	if (srcNits <= 0.0f || peakNits <= 0.0f || ceilingNits <= 0.0f) {
 		return 0.0f;
@@ -2118,7 +2214,14 @@ static float PredictGt7Encoded(float srcNits, float refWhiteNits, float peakNits
 		              // identity — which is why this prediction is simple.
 	}
 	out = fminf(out, ceilingNits);                     // min(blended, ceiling), as GT does
-	return powf(fmaxf(out / ceilingNits, 0.0f), 1.0f / 2.2f);   // the shader's encode
+	return fmaxf(out / ceilingNits, 0.0f);             // linear fraction of white
+}
+
+// The same prediction, encoded (gamma 2.2) — what the panel/PNG comparisons use.
+static float PredictGt7Encoded(float srcNits, float refWhiteNits, float peakNits, float ceilingNits,
+                               float alpha)
+{
+	return powf(PredictGt7RelLinear(srcNits, refWhiteNits, peakNits, ceilingNits, alpha), 1.0f / 2.2f);
 }
 
 // Where GT7's shoulder lands on the ceiling, as a multiple of it — the CPU mirror of
@@ -2380,12 +2483,57 @@ void CDX11VideoProcessor::SetMLParams()
 	CFaceDetect::FaceBox faceBoxes[4] = {};
 	float faceTrackIds[4] = {};
 
+	// ---- JOINT BAND CONTROLLER ---------------------------------------------
+	// Solve pedestal/gamma/rolloff together so the delivered p25/p50/p95 land on the
+	// house targets, inverting the grade's closed-form chain. Per frame while armed:
+	// the inputs are this frame's source percentiles, so it tracks scenes with no
+	// settle window and no per-title ritual; temporal smoothing below is noise
+	// control, not convergence.
+	float ctlP = 0.0f, ctlG = 1.0f, ctlR = 0.0f;
+	const bool ctl = m_bMLController && m_bMLFeaturesReady &&
+	                 (m_iHdrLocalToneMappingType == TONE_CURVE_GT7 ||
+	                  m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT) &&
+	                 m_iSDRDisplayNits > 0 && m_fCurvePeakNits > 10.0f;
+	if (ctl) {
+		const float sdrN = (float)m_iSDRDisplayNits;
+		// features[3..8] = p25 p50 p75 p90 p95 p99, in source PQ.
+		const int idx[3] = { 3, 4, 7 };
+		float wA[3];
+		for (int i = 0; i < 3; i++) {
+			wA[i] = PredictGt7RelLinear(exptm::PqToLinearNits(m_MLFeatures[idx[i]]),
+			                            m_fEffRefWhite, m_fCurvePeakNits, sdrN, m_fHdrGt7Alpha);
+		}
+		const float wPeak = PredictGt7RelLinear(exptm::PqToLinearNits(m_MLFeatures[0]),
+		                                        m_fEffRefWhite, m_fCurvePeakNits, sdrN, m_fHdrGt7Alpha);
+		const float wT[3] = { powf(m_fTgtShadow, 2.2f), powf(m_fTgtMid, 2.2f), powf(m_fTgtHighlight, 2.2f) };
+
+		// The highlight knee is derived from gamma, and gamma is what we are solving
+		// for: one extra pass with the solved value keeps the two consistent.
+		ctlP = m_ctlP; ctlG = m_ctlG; ctlR = m_ctlR;
+		for (int pass = 0; pass < 2; pass++) {
+			const float kneeHi = fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(ctlG, 0.5f)) * 0.20f));
+			SolveGrade(wA, wPeak, wT, 0.25f, guard, kneeHi, ctlP, ctlG, ctlR);
+		}
+
+		// Smooth, but snap on a large move: that is a cut, and a cut should arrive in
+		// one frame rather than trail the picture.
+		auto settle = [](float& held, float now, float jump) {
+			if (held == 0.0f && now != 0.0f && fabsf(now - held) > jump) { held = now; return; }
+			if (fabsf(now - held) > jump) { held = now; }
+			else { held += 0.20f * (now - held); }
+		};
+		settle(m_ctlP, ctlP, 0.02f);
+		settle(m_ctlG, ctlG, 0.25f);
+		settle(m_ctlR, ctlR, 0.10f);
+		ctlP = m_ctlP; ctlG = m_ctlG; ctlR = m_ctlR;
+	}
+
 	MLParams_t params = {
-		gamma,
-		shadow,
+		ctl ? ctlG : gamma,
+		ctl ? 0.0f : shadow,        // controller owns the shadow band; legacy toe stands down
 		0.25f,                                            // shadow knee
 		shadowStrength,                                   // DoG detail multiplier
-		rolloff,
+		ctl ? ctlR : rolloff,
 		fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(gamma, 0.5f)) * 0.20f)), // highlight knee
 		guard,
 		hunt,                                             // hunt compensation
@@ -2475,12 +2623,19 @@ void CDX11VideoProcessor::SetMLParams()
 	// Gamma top-up (see fMLGammaTopUp): carried SEPARATELY from MLGamma so the
 	// gamma pass can gate it by the trained skin LUT. Stays 0 when the model did
 	// not predict, which is also the "no top-up" default.
-	params.MLGammaTopUp = gammaTopUp;
+	// The controller solves gamma itself; a top-up on top would double-act on the
+	// same band. Zeroed here rather than at the solve site because `ctl` is not in
+	// scope there.
+	params.MLGammaTopUp = ctl ? 0.0f : gammaTopUp;
 	// Shadow pedestal — the offset the toe's gain cannot be. Bounded to 8% of white:
 	// it is a fraction of I_norm, and a value large enough to matter for crushed
 	// shadows is also large enough to grey out the letterbox matte if the shader's
 	// in-content gate ever fails. 0 = the previous picture exactly.
-	params.MLShadowPedestal = fminf(0.08f, fmaxf(0.0f, m_fMLShadowPedestal));
+	// Two-sided: Dolby's own offsets at 85 nits are negative on 55-62% of frames
+	// (the colorist CRUSHES blacks at SDR levels), which a [0, 0.08] actuator cannot
+	// express. The controller solves signed; the manual dial stays one-sided.
+	params.MLShadowPedestal = ctl ? std::clamp(ctlP, -0.04f, 0.08f)
+	                              : std::clamp(m_fMLShadowPedestal, 0.0f, 0.08f);
 	params.MLGamutCap = m_fGamutCap;
 	params.MLGamutMap709 = (m_iOutputGamut == 0) ? 1.0f : 0.0f;
 
@@ -7915,6 +8070,13 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	if (config.fHdrGt7Dbg != m_fHdrGt7Dbg) {
 		m_fHdrGt7Dbg = std::clamp(config.fHdrGt7Dbg, 0.0f, 4.0f);
 		changeLuminanceParams = true;
+	}
+	if (config.bMLController != m_bMLController) {
+		m_bMLController = config.bMLController;
+		// Drop the warm start: values solved under one mode are not a good starting
+		// point for the other. (SetMLParams runs every frame while the grade is up,
+		// so no change-flag is needed here.)
+		m_ctlP = 0.0f; m_ctlG = 1.0f; m_ctlR = 0.0f;
 	}
 	// Auto exposure. Changing either input invalidates the solved value, so drop it
 	// and let the anchor block re-solve on the next frame rather than slewing from a

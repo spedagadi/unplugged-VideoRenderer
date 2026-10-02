@@ -557,6 +557,10 @@ private:
 	// GT7 debug view: 0 off, 1 chromaScale, 2 fade ratio, 3 knee crossing,
 	// 4 ceiling crossing. Renders that quantity as greyscale instead of the picture.
 	float m_fHdrGt7Dbg       = 0.0f;
+	// Joint band controller (see Settings_t::bMLController). Solved values, smoothed.
+	bool  m_bMLController = false;
+	float m_ctlP = 0.0f, m_ctlG = 1.0f, m_ctlR = 0.0f;
+	float m_fTgtShadow = 0.39f, m_fTgtMid = 0.54f, m_fTgtHighlight = 0.89f;
 	// Auto exposure (see Settings_t::bHdrAutoRefWhite).
 	bool  m_bAutoRefWhite    = true;
 	float m_fRefWhiteTarget  = 0.42f;

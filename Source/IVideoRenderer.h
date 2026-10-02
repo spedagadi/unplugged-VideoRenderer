@@ -486,6 +486,23 @@ struct Settings_t {
 	bool  bHdrAutoRefWhite  = false;
 	float fHdrRefWhiteTarget = 0.42f;
 
+	// JOINT BAND CONTROLLER. Solves the three grade actuators (shadow pedestal,
+	// gamma, highlight rolloff) TOGETHER so that the delivered p25/p50/p95 land on
+	// house targets, inverting the grade's own closed-form chain.
+	//
+	// This replaces stacking three independently-trained corrections, which was the
+	// grade's deepest defect: each model was trained as if it acted alone on the
+	// source, but in the shader they compose sequentially, so a power applied after
+	// an additive lift rescales that lift and neither knows. The solver accounts for
+	// the composition exactly.
+	//
+	// false (default) = today's behaviour, models and dials as they are.
+	// true  = the controller owns pedestal/gamma/rolloff; the legacy multiplicative
+	//         toe and the manual top-up stand down, because the controller's forward
+	//         model does not include them and stacking them would double-act.
+	// APPENDED (binary boundary).
+	bool bMLController = false;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -612,6 +629,7 @@ struct Settings_t {
 		fHdrGt7Dbg                      = 0.0f;
 		bHdrAutoRefWhite                = false;
 		fHdrRefWhiteTarget              = 0.42f;
+		bMLController                   = false;
 	}
 };
 
