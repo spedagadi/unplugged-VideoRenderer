@@ -2093,7 +2093,12 @@ static inline float smoothstepf2(float e0, float e1, float x)
 // owns the shadow band through the additive pedestal instead, because a gain cannot
 // lift a pixel that is already at zero).
 //   w  = linear fraction of white delivered by the tone curve
-//   x  = w / wPeak            (I_norm: the grade's own domain)
+//   x  = PQ(I) / 0.5893       (I_norm: the grade's ACTUAL domain — a normalised PQ
+//                              code, NOT a linear fraction. ps_ml_gamma divides
+//                              ictcp.x by SDR_I_PEAK_PQ = 0.5893, the PQ code of 203
+//                              nits. Mirroring this in linear space made the solver
+//                              invert a curve the shader does not implement, and it
+//                              DARKENED a dark scene instead of lifting it.)
 //   0. toe slope: x  = knee * (x/knee)^S          (S<1 expands shadows, 0 and knee fixed)
 //   1. gamma:     x  = lerp(x, x^(1/G), fade(x) * (1 - hi_g(x)))
 //   2. rolloff:   x += R * t^2 * (1-x), t = (x - kneeHi) / (1 - kneeHi)
@@ -2105,13 +2110,11 @@ static inline float smoothstepf2(float e0, float e1, float x)
 // cannot reveal detail that sits near the floor. A power below the knee keeps 0 at 0
 // and the knee fixed while expanding everything between in log — the code span dark
 // detail occupies moves up out of the invisible floor with its contrast intact.
-static float GradeChainDelivered(float w, float wPeak, float S, float G, float R,
-                                 float kneeShadow, float guard, float kneeHi)
+static float GradeChainDelivered(float w, float S, float G, float R,
+                                 float kneeShadow, float guard, float kneeHi, float sdrNits)
 {
-	if (wPeak <= 1e-6f) {
-		return w;
-	}
-	float x = w / wPeak;
+	const float kIPeak = 0.5893f;                 // SDR_I_PEAK_PQ, ictcp.hlsl
+	float x = exptm::LinearNitsToPq(w * sdrNits) / kIPeak;
 
 	if (S < 0.999f && x > 0.0f && x < kneeShadow) {
 		x = kneeShadow * powf(x / kneeShadow, S);
@@ -2129,7 +2132,7 @@ static float GradeChainDelivered(float w, float wPeak, float S, float G, float R
 		x = satf(x + R * t * t * (1.0f - x));
 	}
 
-	return x * wPeak;
+	return exptm::PqToLinearNits(x * kIPeak) / sdrNits;
 }
 
 // Joint solve: three band targets (delivered linear fractions of white) in, the three
@@ -2143,14 +2146,14 @@ static float GradeChainDelivered(float w, float wPeak, float S, float G, float R
 // a power applied after an additive lift rescales that lift, and neither knows.
 // Solving the composition jointly means the gamma the solver returns already accounts
 // for the pedestal it is also returning.
-static void SolveGrade(const float wAnchor[3], float wPeak, const float wTarget[3],
-                       float kneeShadow, float guard, float kneeHi,
+static void SolveGrade(const float wAnchor[3], const float wTarget[3],
+                       float kneeShadow, float guard, float kneeHi, float sdrNits,
                        float& outS, float& outG, float& outR)
 {
 	float S = outS, G = outG, R = outR;
 
 	auto delivered = [&](int a, float s, float g, float r) {
-		return GradeChainDelivered(wAnchor[a], wPeak, s, g, r, kneeShadow, guard, kneeHi);
+		return GradeChainDelivered(wAnchor[a], s, g, r, kneeShadow, guard, kneeHi, sdrNits);
 	};
 
 	for (int iter = 0; iter < 6; iter++) {
@@ -2513,8 +2516,6 @@ void CDX11VideoProcessor::SetMLParams()
 			wA[i] = PredictGt7RelLinear(exptm::PqToLinearNits(m_MLFeatures[idx[i]]),
 			                            m_fEffRefWhite, m_fCurvePeakNits, sdrN, m_fHdrGt7Alpha);
 		}
-		const float wPeak = PredictGt7RelLinear(exptm::PqToLinearNits(m_MLFeatures[0]),
-		                                        m_fEffRefWhite, m_fCurvePeakNits, sdrN, m_fHdrGt7Alpha);
 		const float wT[3] = { powf(m_fTgtShadow, 2.2f), powf(m_fTgtMid, 2.2f), powf(m_fTgtHighlight, 2.2f) };
 
 		// The highlight knee is derived from gamma, and gamma is what we are solving
@@ -2522,7 +2523,7 @@ void CDX11VideoProcessor::SetMLParams()
 		ctlS = m_ctlS; ctlG = m_ctlG; ctlR = m_ctlR;
 		for (int pass = 0; pass < 2; pass++) {
 			const float kneeHi = fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(ctlG, 0.5f)) * 0.20f));
-			SolveGrade(wA, wPeak, wT, 0.25f, guard, kneeHi, ctlS, ctlG, ctlR);
+			SolveGrade(wA, wT, 0.25f, guard, kneeHi, sdrN, ctlS, ctlG, ctlR);
 		}
 
 		// Smooth, but snap on a large move: that is a cut, and a cut should arrive in
