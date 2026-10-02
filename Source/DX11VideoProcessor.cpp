@@ -2511,12 +2511,19 @@ void CDX11VideoProcessor::SetMLParams()
 		const float sdrN = (float)m_iSDRDisplayNits;
 		// features[3..8] = p25 p50 p75 p90 p95 p99, in source PQ.
 		const int idx[3] = { 3, 4, 7 };
-		float wA[3];
+		float wA[3], wT[3];
 		for (int i = 0; i < 3; i++) {
-			wA[i] = PredictGt7RelLinear(exptm::PqToLinearNits(m_MLFeatures[idx[i]]),
-			                            m_fEffRefWhite, m_fCurvePeakNits, sdrN, m_fHdrGt7Alpha);
+			const float nits = exptm::PqToLinearNits(m_MLFeatures[idx[i]]);
+			wA[i] = PredictGt7RelLinear(nits, m_fEffRefWhite, m_fCurvePeakNits, sdrN, m_fHdrGt7Alpha);
+			// SCENE-REFERRED target, not a constant. A constant delivered mid is
+			// auto-gain by construction: it turns a night scene into noon, because it
+			// says where the mid should land without asking how bright the scene is.
+			// This law says instead: a source at W nits approaches display white, and
+			// everything else follows monotonically — so 10 nits lands in the same
+			// place whatever else is in the frame. Night stays night; the controller's
+			// job narrows to making OUR delivery match the law, band by band.
+			wT[i] = 1.0f - expf(-nits / fmaxf(m_fCtlWhiteNits, 10.0f));
 		}
-		const float wT[3] = { powf(m_fTgtShadow, 2.2f), powf(m_fTgtMid, 2.2f), powf(m_fTgtHighlight, 2.2f) };
 
 		// The highlight knee is derived from gamma, and gamma is what we are solving
 		// for: one extra pass with the solved value keeps the two consistent.
@@ -8085,6 +8092,9 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	if (config.fHdrGt7Dbg != m_fHdrGt7Dbg) {
 		m_fHdrGt7Dbg = std::clamp(config.fHdrGt7Dbg, 0.0f, 4.0f);
 		changeLuminanceParams = true;
+	}
+	if (config.fCtlWhiteNits != m_fCtlWhiteNits) {
+		m_fCtlWhiteNits = std::clamp(config.fCtlWhiteNits, 100.0f, 400.0f);
 	}
 	if (config.bMLController != m_bMLController) {
 		m_bMLController = config.bMLController;

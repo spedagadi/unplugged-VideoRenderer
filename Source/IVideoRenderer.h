@@ -503,6 +503,14 @@ struct Settings_t {
 	// APPENDED (binary boundary).
 	bool bMLController = false;
 
+	// House white for the band controller's scene-referred target law: the source
+	// nits that approach display white. The targets are 1 - exp(-srcNits/W) per band,
+	// so a source luminance always lands in the same place regardless of the rest of
+	// the frame — night stays night, which a constant delivered-mid target cannot do
+	// (that is auto-gain). 203 = the HDR mastering convention; ~335 was the cloud-safe
+	// taste measured on Everest/Furiosa. APPENDED (binary boundary).
+	float fCtlWhiteNits = 203.0f;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -630,6 +638,7 @@ struct Settings_t {
 		bHdrAutoRefWhite                = false;
 		fHdrRefWhiteTarget              = 0.42f;
 		bMLController                   = false;
+		fCtlWhiteNits                   = 203.0f;
 	}
 };
 

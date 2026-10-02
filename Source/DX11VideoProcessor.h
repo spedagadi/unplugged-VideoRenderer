@@ -571,7 +571,10 @@ private:
 	// S = shadow toe slope (1 = off), G = gamma, R = highlight rolloff.
 	bool  m_bMLController = false;
 	float m_ctlS = 1.0f, m_ctlG = 1.0f, m_ctlR = 0.0f;
-	float m_fTgtShadow = 0.39f, m_fTgtMid = 0.54f, m_fTgtHighlight = 0.89f;
+	// House white for the controller's scene-referred target law: the source nits
+	// that approach display white. 203 = the HDR mastering convention; higher keeps
+	// more highlight headroom (the cloud-safe taste measured ~335).
+	float m_fCtlWhiteNits = 203.0f;
 	// Auto exposure (see Settings_t::bHdrAutoRefWhite).
 	bool  m_bAutoRefWhite    = true;
 	float m_fRefWhiteTarget  = 0.42f;
