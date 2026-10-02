@@ -2549,6 +2549,27 @@ void CDX11VideoProcessor::SetMLParams()
 		settle(m_ctlG, ctlG, 0.25f);
 		settle(m_ctlR, ctlR, 0.10f);
 		ctlS = m_ctlS; ctlG = m_ctlG; ctlR = m_ctlR;
+
+		// The solver's own bookkeeping, because three consecutive iterations were
+		// diagnosed from symptoms and each diagnosis was wrong. This prints the
+		// anchors, the targets, the solved actuators and what the mirror says those
+		// actuators deliver -- so "the controller does nothing" becomes a line that
+		// says WHICH of the four stages (measure, target, solve, apply) is lying.
+		if (m_bMLDebug && m_pMLDebugFile && (m_MLDebugFrame % 30 == 0)) {
+			const float kneeHi = fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(ctlG, 0.5f)) * 0.20f));
+			fwprintf(m_pMLDebugFile,
+				L"CTL frame=%llu wA=%.4f/%.4f/%.4f wT=%.4f/%.4f/%.4f S=%.3f G=%.3f R=%.3f "
+				L"dA=%.4f/%.4f/%.4f refW=%.1f peak=%.0f sdr=%d\n",
+				(unsigned long long)m_MLDebugFrame,
+				(double)wA[0], (double)wA[1], (double)wA[2],
+				(double)wT[0], (double)wT[1], (double)wT[2],
+				(double)ctlS, (double)ctlG, (double)ctlR,
+				(double)GradeChainDelivered(wA[0], ctlS, ctlG, ctlR, 0.25f, guard, kneeHi, sdrN),
+				(double)GradeChainDelivered(wA[1], ctlS, ctlG, ctlR, 0.25f, guard, kneeHi, sdrN),
+				(double)GradeChainDelivered(wA[2], ctlS, ctlG, ctlR, 0.25f, guard, kneeHi, sdrN),
+				(double)m_fEffRefWhite, (double)m_fCurvePeakNits, m_iSDRDisplayNits);
+			fflush(m_pMLDebugFile);
+		}
 	}
 
 	MLParams_t params = {
