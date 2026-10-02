@@ -2678,6 +2678,14 @@ void CDX11VideoProcessor::SetMLParams()
 			wA[i] = m_ctlWA[i];
 			wT[i] = m_ctlWT[i];
 		}
+		// The lift-only invariant must hold AFTER smoothing: the two IIRs converge at
+		// different rates, and a smoothed target dipping below the smoothed anchor is
+		// exactly the darkening the clamp exists to prevent. Observed live: wT 0.1878
+		// against wA 0.1973 on a dark frame, with G driven to its LOWER bound (0.600)
+		// to comply with a target below what the curve already delivers.
+		for (int i = 0; i < 3; i++) {
+			wT[i] = fmaxf(wT[i], wA[i]);
+		}
 
 		// The highlight knee is derived from gamma, and gamma is what we are solving
 		// for: one extra pass with the solved value keeps the two consistent.
