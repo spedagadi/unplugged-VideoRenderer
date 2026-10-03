@@ -525,6 +525,46 @@ private:
 	// cannot pump; it only drifts downward (slow brighten) once locked.
 	bool m_SceneLocked = false;
 	int  m_SceneFrames = 0;
+	// The cut decision, published for the consumers that run EARLIER in the frame
+	// than the anchor block (SetMLParams is called before the features are
+	// extracted, so it reads the previous frame's decision — which is the frame the
+	// controller's features came from too, so the two agree). Every temporal filter
+	// in the exposure path smooths for a reason — grain, drifting snow, a lamp
+	// swinging through frame — and a hard cut is none of those. Anything that
+	// smooths must snap on this instead.
+	bool m_bSceneCut = false;
+	// ---- SCENE EXPOSURE MEMORY -----------------------------------------
+	// Exposure is a property of a SCENE, and a scene is an ensemble of shots. A
+	// matched reverse angle replaces the frame and moves every statistic without
+	// changing the light — so adapting per cut strobes at the cutting rate. The
+	// envelope is a VETO on adaptation, never a filter on the applied value: an
+	// accepted change still snaps in one frame, so the memory costs no latency.
+	//
+	// Band is deliberately wide (one stop either side of the ensemble median). The
+	// user's own clip measures shot means of 2.4 / 6.5 / 9.8 / 17.6 / 28.5 / 32.9 /
+	// 43.0 / 120.1 nits across consecutive cuts — that is not matched coverage, it
+	// is a montage spanning real lighting changes, and it MUST keep adapting. A veto
+	// tuned tighter than that would suppress genuine changes and read as the picture
+	// refusing to adapt, which is the failure being fixed, not a fix for it.
+	enum { kShotHist = 8 };
+	float m_ShotMeanNits[kShotHist] = {};   // converged demand of recent shots
+	int   m_ShotHistIdx = 0;
+	int   m_ShotHistN   = 0;
+	float m_fSceneMeanRef = 0.0f;           // the exposure reference in force
+	// A cut arriving before the previous shot reached its lock means that shot was
+	// never measured to convergence. Rapid cutting is itself evidence of matched
+	// coverage, so such shots are folded into one scene and represented by the
+	// MEDIAN of the cluster — never by whichever angle happens to be on screen.
+	float m_ClusterMean[kShotHist] = {};
+	int   m_nCluster = 0;
+	// Scene-locked band statistics — the band controller's inputs. They move exactly
+	// when the anchor is allowed to move and not at all while it is locked, so a
+	// locked shot cannot pump: there is no moving input left to chase. Until this
+	// existed the controller solved on RAW per-frame percentiles while the anchor was
+	// frozen — the one free-running statistic in the grade, and therefore the pump.
+	float m_BandPq[3] = { -1.0f, -1.0f, -1.0f };   // p25, p50, p99
+	float m_BandPeakPq = -1.0f;                     // p99.5
+	bool  m_bSceneSame = false;                     // last cut held (logged verdict)
 	// Spike test (2026-09-22): a cut is a DISCONTINUITY — the frame's delta
 	// dominates its recent 4-frame baseline, so occlusion and camera reframes
 	// (a ramp) cannot trip it, however far p99.5 wanders. (The slow re-anchor

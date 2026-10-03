@@ -1749,7 +1749,12 @@ void CDX11VideoProcessor::UpdateToneLut()
 	const float featMax = m_MLFeatures[0];
 	const float featAvg = m_MLFeatures[1];
 
-	const bool sceneJumped = m_MLToneMaxSmooth < 0.0f ||
+	// The published cut flag first, the maxscl jump as a backstop. The old test alone
+	// was 0.15 in PQ CODES — about two stops where film peaks live — so an ordinary
+	// cut never tripped it and the spline's pivot glided to the new scene over ~10
+	// frames. Read one frame late here (this runs before the anchor block restates the
+	// flag), which costs a single frame of a half-second ramp: nothing.
+	const bool sceneJumped = m_MLToneMaxSmooth < 0.0f || m_bSceneCut ||
 	                         fabsf(featMax - m_MLToneMaxSmooth) > 0.15f;
 	if (sceneJumped) {
 		m_MLToneMaxSmooth = featMax;
@@ -2352,6 +2357,28 @@ static float Gt7Reach(float alpha)
 	return LS + k * logf(k / (LS + k - 1.0f));
 }
 
+// Median of a small window, by insertion sort into a local copy. kShotHist is 8, so
+// this is a handful of compares per cut — never per pixel, never per frame.
+//
+// A median and not a mean BECAUSE of what a shot ensemble contains: a montage of
+// matched coverage will include the odd insert or lens flare that is nothing like
+// the rest of the scene, and a mean lets that outlier move the scene's level. The
+// median of eight shots cannot be moved by one of them.
+static float MedianOf(const float* v, int n)
+{
+	if (n <= 0) return 0.0f;
+	float t[16];
+	const int m = (n > 16) ? 16 : n;
+	for (int i = 0; i < m; ++i) t[i] = v[i];
+	for (int i = 1; i < m; ++i) {
+		const float x = t[i];
+		int j = i - 1;
+		while (j >= 0 && t[j] > x) { t[j + 1] = t[j]; --j; }
+		t[j + 1] = x;
+	}
+	return (m & 1) ? t[m >> 1] : 0.5f * (t[m / 2 - 1] + t[m / 2]);
+}
+
 void CDX11VideoProcessor::SetMLParams()
 {
 	float gamma   = 1.0f;
@@ -2360,12 +2387,39 @@ void CDX11VideoProcessor::SetMLParams()
 	float l1max   = 0.5f;
 	float gammaTopUp = 0.0f;   // user offset, passed to the shader SEPARATELY (see below)
 
+	// ONE CUT SIGNAL FOR EVERY SMOOTHER IN THIS FUNCTION.
+	//
+	// Owned by the anchor block in Render(), which runs AFTER this function in the
+	// same call — so what is read on frame N+1 is the decision made on frame N, whose
+	// features are exactly the ones still sitting in m_MLFeatures. Cut and
+	// measurement belong to the same frame; the one-frame latency is the render
+	// pipeline's, not this flag's.
+	//
+	// Read, NOT cleared. The anchor block owns this flag and restates it — false, then
+	// true on a cut — on every extraction, so it is a LEVEL ("the scene we are holding
+	// was a cut"), not a pulse, and every reader sees the same answer. It used to be
+	// cleared here, and that made the read in UpdateToneLut() structurally dead: that
+	// runs AFTER this function in the same Render() call, so it would only ever see the
+	// value this line had just erased. A flag with two readers cannot be consumed by
+	// one of them.
+	//
+	// Every temporal filter below has a snap exemption of its own, and every one of
+	// them is keyed to a statistic that does not move the way its author assumed.
+	// The 0.15-maxscl test under this comment is 0.15 in PQ CODES — about TWO STOPS
+	// where film peaks actually live (0.50..0.65 is 92 nits..391). A cut that moves
+	// the scene a stop and a half measures 0.10 and does not trip it, so the gamma
+	// filter eased to the new scene at 10%/frame: a 0.4 s time constant, ~1.2 s to be
+	// 90% there. On screen the cut lands, the picture is dim, and the exposure walks
+	// up under it. A cut is a frame being REPLACED — it is the one event none of the
+	// smoothing rules below was written to survive.
+	const bool cutNow = m_bSceneCut;
+
 	// Micro-contrast texture gate: IIR-filter the raw texture energy, snapping
 	// on the same scene-jump anchor as the gamma filter (features[0] = maxscl).
 	// Placed BEFORE the gamma branch so m_MLPrevL1Max still holds last frame.
 	if (m_bMLFeaturesReady) {
 		const float f0now = m_MLFeatures[0];
-		if (m_MLPrevL1Max < 0.0f || fabsf(f0now - m_MLPrevL1Max) > 0.15f) {
+		if (m_MLPrevL1Max < 0.0f || cutNow || fabsf(f0now - m_MLPrevL1Max) > 0.15f) {
 			m_MLTextureSmooth = m_MLRawTexture;
 		} else {
 			m_MLTextureSmooth = 0.10f * m_MLRawTexture + 0.90f * m_MLTextureSmooth;
@@ -2386,7 +2440,7 @@ void CDX11VideoProcessor::SetMLParams()
 			pred = fminf(1.5f, fmaxf(0.5f, pred));
 
 			const float l1now = m_MLFeatures[0];
-			if (m_MLPrevL1Max < 0.0f || fabsf(l1now - m_MLPrevL1Max) > 0.15f) {
+			if (m_MLPrevL1Max < 0.0f || cutNow || fabsf(l1now - m_MLPrevL1Max) > 0.15f) {
 				m_MLIIRGamma = pred;
 			} else {
 				m_MLIIRGamma = 0.10f * pred + 0.90f * m_MLIIRGamma;
@@ -2622,19 +2676,51 @@ void CDX11VideoProcessor::SetMLParams()
 	                  m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT) &&
 	                 m_iSDRDisplayNits > 0 && m_fCurvePeakNits > 10.0f;
 	if (ctl) {
+		// A CUT IS NOT DRIFT. Everything below smooths, and every one of those
+		// smoothing rules was written against a real pumping artifact — but the
+		// percentiles the controller solves on (features[3/4/7] and the p99.5) are
+		// RAW PER-FRAME readings; nothing about them is locked to the scene. So at a
+		// camera cut the controller is asked for a different correction and walks to
+		// it at 10%/frame: a 0.4 s time constant, ~2 s to converge. On screen that is
+		// the picture landing DIM at the cut and brightening under it — the exposure
+		// arriving late, in a shot boundary's face, every single cut. The anchor block
+		// already knows a cut happened; the fix is to let it say so here.
+		// (cutNow, NOT m_bSceneCut — the flag was consumed and cleared at the top of
+		// this function; reading the member here would silently always be false.)
+		const bool cutSnap = cutNow;
 		const float sdrN = (float)m_iSDRDisplayNits;
+		// SCENE-LOCKED BANDS, not the raw per-frame percentiles.
+		//
+		// This is the pump. The controller solved on features[3/4/7] and the live
+		// p99.5 — statistics that move every frame with the CONTENT of the shot: a
+		// coat entering frame, snow drifting, a slow pan across a lit wall. The peak
+		// anchor beside them was correctly frozen, so the grade had one locked half and
+		// one free-running half, and the free-running one was the half that sets
+		// brightness. Nothing about that is fixable by tuning the smoothing: the input
+		// itself is the wrong quantity to chase, because a global percentile cannot tell
+		// "the light changed" from "something moved in the light".
+		//
+		// m_BandPq moves exactly when the scene state machine allows the anchor to move,
+		// and not at all while a scene is held — so a held shot has no moving input left
+		// to pump on. Falls back to the live percentiles only until the bands have a
+		// first reading, so the controller cannot be starved at startup.
 		// features[3..8] = p25 p50 p75 p90 p95 p99, in source PQ.
 		const int idx[3] = { 3, 4, 7 };
+		float bandPq[3];
+		for (int i = 0; i < 3; i++) {
+			bandPq[i] = (m_BandPq[i] > 0.0f) ? m_BandPq[i] : m_MLFeatures[idx[i]];
+		}
 		// p99.5, NOT maxscl. maxscl is a MAX: one lamp, one specular, one grain spike
 		// sets it, and because the law normalises every band by it, a bright object
 		// entering frame dropped every target and dimmed the whole picture. A
 		// percentile is a statistic; a max is an anecdote. (The codebase learned this
 		// once already for the Hable normaliser.)
-		const float peakPq = (m_MLPeakPq995 > 0.0f) ? m_MLPeakPq995 : m_MLFeatures[0];
+		const float peakPq = (m_BandPeakPq > 0.0f) ? m_BandPeakPq
+		                   : ((m_MLPeakPq995 > 0.0f) ? m_MLPeakPq995 : m_MLFeatures[0]);
 		const float peakNits = fmaxf(exptm::PqToLinearNits(peakPq), 1e-3f);
 		float wA[3], wT[3];
 		for (int i = 0; i < 3; i++) {
-			const float nits = exptm::PqToLinearNits(m_MLFeatures[idx[i]]);
+			const float nits = exptm::PqToLinearNits(bandPq[i]);
 			wA[i] = PredictGt7RelLinear(nits, m_fEffRefWhite, m_fCurvePeakNits, sdrN, m_fHdrGt7Alpha);
 			// RELATIVE to the scene's own range, not absolute nits and not a constant.
 			//
@@ -2666,15 +2752,15 @@ void CDX11VideoProcessor::SetMLParams()
 		// adjacent frames in the CTL log). Snap on a large relative jump -- a cut --
 		// and IIR otherwise.
 		for (int i = 0; i < 3; i++) {
-			auto track = [](float& held, float now) {
-				if (held < 0.0f || fabsf(now - held) > 0.5f * held + 0.02f) {
+			auto track = [](float& held, float now, bool cut) {
+				if (held < 0.0f || cut || fabsf(now - held) > 0.5f * held + 0.02f) {
 					held = now;
 				} else {
 					held += 0.10f * (now - held);
 				}
 			};
-			track(m_ctlWA[i], wA[i]);
-			track(m_ctlWT[i], wT[i]);
+			track(m_ctlWA[i], wA[i], cutSnap);
+			track(m_ctlWT[i], wT[i], cutSnap);
 			wA[i] = m_ctlWA[i];
 			wT[i] = m_ctlWT[i];
 		}
@@ -2702,13 +2788,18 @@ void CDX11VideoProcessor::SetMLParams()
 		// are visible as a whole-image change, so a half-second time constant reads as
 		// a settle after a cut rather than as breathing. The snap thresholds are wide
 		// enough that grain cannot trip them but a cut still arrives in one frame.
-		auto settle = [](float& held, float now, float jump) {
-			if (fabsf(now - held) > jump) { held = now; }
+		// Snapping the inputs alone is only half of it: the solved actuator can move
+		// by less than the jump thresholds (S 1.00 -> 1.20 clears nothing) and then
+		// crawls for ten frames, which is the same late exposure with a shorter tail.
+		// On a cut the frame is replaced wholesale, so a one-frame actuator step is
+		// masked by the cut itself — there is nothing here to hide.
+		auto settle = [](float& held, float now, float jump, bool cut) {
+			if (cut || fabsf(now - held) > jump) { held = now; }
 			else { held += 0.10f * (now - held); }
 		};
-		settle(m_ctlS, ctlS, 0.25f);
-		settle(m_ctlG, ctlG, 0.50f);
-		settle(m_ctlR, ctlR, 0.25f);
+		settle(m_ctlS, ctlS, 0.25f, cutSnap);
+		settle(m_ctlG, ctlG, 0.50f, cutSnap);
+		settle(m_ctlR, ctlR, 0.25f, cutSnap);
 		ctlS = m_ctlS; ctlG = m_ctlG; ctlR = m_ctlR;
 
 		// The solver's own bookkeeping, because three consecutive iterations were
@@ -2716,12 +2807,16 @@ void CDX11VideoProcessor::SetMLParams()
 		// anchors, the targets, the solved actuators and what the mirror says those
 		// actuators deliver -- so "the controller does nothing" becomes a line that
 		// says WHICH of the four stages (measure, target, solve, apply) is lying.
-		if (m_bMLDebug && m_pMLDebugFile && (m_MLDebugFrame % 30 == 0)) {
+		// Every 6 frames, not 30: at 24 fps a 30-frame cadence samples a one-second
+		// ramp ONCE, which cannot distinguish "snapped" from "crept" — and that is the
+		// exact question under test. 6 frames is 4 lines/sec, and this line only exists
+		// while the frame log is on.
+		if (m_bMLDebug && m_pMLDebugFile && (m_MLDebugFrame % 6 == 0)) {
 			const float kneeHi = fmaxf(0.65f, fminf(0.85f, 0.90f - (1.0f / fmaxf(ctlG, 0.5f)) * 0.20f));
 			fwprintf(m_pMLDebugFile,
-				L"CTL frame=%llu wA=%.4f/%.4f/%.4f wT=%.4f/%.4f/%.4f S=%.3f G=%.3f R=%.3f "
+				L"CTL frame=%llu cut=%d wA=%.4f/%.4f/%.4f wT=%.4f/%.4f/%.4f S=%.3f G=%.3f R=%.3f "
 				L"dA=%.4f/%.4f/%.4f refW=%.1f peak=%.0f sdr=%d\n",
-				(unsigned long long)m_MLDebugFrame,
+				(unsigned long long)m_MLDebugFrame, (int)cutSnap,
 				(double)wA[0], (double)wA[1], (double)wA[2],
 				(double)wT[0], (double)wT[1], (double)wT[2],
 				(double)ctlS, (double)ctlG, (double)ctlR,
@@ -6185,6 +6280,11 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			// and skipped outright — the filter simply holds.
 			const float maxNits = exptm::PqToLinearNits(maxPq);
 			if (maxNits > 10.0f && maxNits < 4000.0f) {
+				// Published every frame, not only on a cut: SetMLParams consumes it and
+				// clears it, and a flag that is only ever SET would leave the smoothers
+				// frozen-open on the frame after the cut.
+				m_bSceneCut = false;
+
 				if (m_PeakAvgPq == 0.0f) {
 					// No state yet — take the first reading outright
 					// (libplacebo: "if (!obj->peak.avg_pq)"), as a fresh scene.
@@ -6192,12 +6292,25 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					m_PeakMaxPq = maxPq;
 					m_SceneLocked = false;
 					m_SceneFrames = 0;
+					m_bSceneCut = true;     // and let the grade land on it in one frame
 					// A fresh anchor means a fresh title or session: the exposure
 					// ratchet must not carry across it.
 					m_fRefWhiteAuto = 0.0f;
 					m_MeanNitsSmooth = m_MLMeanNitsRaw;
 					m_MeanNitsMax = 0.0f;
-					for (int ci = 0; ci < 3; ci++) { m_ctlWA[ci] = -1.0f; m_ctlWT[ci] = -1.0f; }
+					// A fresh anchor is a fresh scene AND a fresh title: the exposure
+					// memory must not carry across it, or the next film inherits the last
+					// one's ensemble median.
+					m_fSceneMeanRef = m_MLMeanNitsRaw;
+					m_ShotHistIdx = 0;
+					m_ShotHistN = 0;
+					m_nCluster = 0;
+					m_bSceneSame = false;
+					m_BandPeakPq = maxPq;
+					for (int ci = 0; ci < 3; ci++) {
+						m_ctlWA[ci] = -1.0f; m_ctlWT[ci] = -1.0f;
+						m_BandPq[ci] = m_MLFeatures[(ci == 2) ? 7 : 3 + ci];   // p25 p50 p99
+					}
 					m_ZoneSeen = false;
 					m_ZoneChangeFrac = 0.0f;
 					for (int i = 0; i < 25; ++i) m_PrevZoneMax[i] = 0.0f;
@@ -6281,10 +6394,32 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// because the peak-only level test snapped on every ramp.
 				const float delta = m_MLActiveFrac *
 					fabsf(maxPq - m_PeakMaxPq);
-				m_DeltaHistory[m_DeltaIdx++] = delta;
-				m_DeltaIdx &= 3;
+
+				// BASELINE FIRST, from the PREVIOUS frames only, then insert this one.
+				//
+				// The order this sat in — insert, then read the max of a window that now
+				// contains `delta` itself — made the spike test read
+				//     delta > 3 * max(delta, recent)
+				// which is `delta > 3*delta`, false for any positive delta. The spike test
+				// could therefore NEVER fire. Measured 2026-10-02 on the user's own clip:
+				// 7638 frames had two or more gates passing, and `base` was 0 on EVERY
+				// one — the real cut at frame 102 (zones 0.76, mean shifted 0.357->0.215,
+				// peak +0.10 PQ) was rejected by base=0. sceneCut fired ZERO times in 5.5
+				// minutes.
+				//
+				// The consequence is worse than a missed snap. With no cut ever announced,
+				// the anchor LOCKED on a stale peak (held=0.5023 while raw sat at 0.56+),
+				// so `delta` was ~0.06 on EVERY frame — the baseline is now honestly ~0.06,
+				// and a cut's step ON TOP of that offset is only ~1.7x the baseline, not 3x.
+				// The stale anchor locks itself in: it persists precisely because the gate
+				// that would refresh it is the one the self-reference killed. Fix the order
+				// and the first cold-start cut refreshes the anchor, the baseline returns to
+				// the true within-shot scatter (~0.003 PQ), and every later cut stands out
+				// at ~10x baseline with room to spare.
 				float deltaBase = 0.0f;
 				for (int i = 0; i < 4; ++i) deltaBase = std::max(deltaBase, m_DeltaHistory[i]);
+				m_DeltaHistory[m_DeltaIdx++] = delta;
+				m_DeltaIdx &= 3;
 
 				// Zonal coherence — the SPATIAL half of the cut test. A cut is
 				// globally simultaneous: most of the 5x5 zone maxes move together.
@@ -6304,16 +6439,112 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				m_ZoneSeen = true;
 
 				const float meanD = fabsf(avgPq - m_PeakAvgPq);
-				const bool sceneCut = (delta > kThreshHigh * kLog10Pq) &&
-				                      (delta > 3.0f * deltaBase + 1e-5f) &&
-				                      (m_ZoneChangeFrac > 0.50f) &&
-				                      (meanD > kSceneMeanBand);
+				const bool gSpike = delta > kThreshHigh * kLog10Pq;
+				const bool gBase  = delta > 3.0f * deltaBase + 1e-5f;
+				const bool gZone  = m_ZoneChangeFrac > 0.50f;
+				const bool gMean  = meanD > kSceneMeanBand;
+				const bool sceneCut = gSpike && gBase && gZone && gMean;
+
+				// CUTCAND — the instrument this whole bug needs, and the one the
+				// HABLE_PEAK line below cannot be: it only fires when the applied peak
+				// actually MOVED, so a cut the detector MISSES emits no line at all. The
+				// failure is invisible by construction, and "still not fixed" with no log
+				// is a guess about which of four gates closed. So: emit any frame that a
+				// majority of the gates thought was a cut, with all four verdicts. A
+				// missed cut then shows up as a line saying WHICH test rejected it.
+				//
+				// Costs ~one line per scene change (a real frame has to move three of
+				// four independent statistics to get here), so it is safe to leave on
+				// while a clip is played straight through.
+				if (m_bMLDebug && m_pMLDebugFile && (gSpike + gBase + gZone + gMean) >= 2) {
+					fwprintf(m_pMLDebugFile,
+						L"CUTCAND frame=%llu cut=%d spike=%d base=%d zone=%d mean=%d "
+						L"delta=%.4f base4=%.4f zones=%.2f meanD=%.4f raw=%.4f avg=%.4f held=%.4f "
+						L"| grade S=%.3f G=%.3f R=%.3f gIIR=%.3f refW=%.1f mnit=%.1f lk=%d\n",
+						(unsigned long long)m_MLDebugFrame, (int)sceneCut,
+						(int)gSpike, (int)gBase, (int)gZone, (int)gMean,
+						(double)delta, (double)deltaBase, (double)m_ZoneChangeFrac,
+						(double)meanD, (double)maxPq, (double)avgPq, (double)m_PeakMaxPq,
+						(double)m_ctlS, (double)m_ctlG, (double)m_ctlR, (double)m_MLIIRGamma,
+						(double)m_fEffRefWhite, (double)m_MeanNitsSmooth, (int)m_SceneLocked);
+					fflush(m_pMLDebugFile);
+				}
+
+				// Raise the flag for SetMLParams (see cutNow there). Cleared at the top
+				// of this block, so it is one frame wide; OR'd here rather than assigned
+				// because the "no state yet" branch above also raises it, and by the time
+				// control reaches here the anchor has already been set to this frame's
+				// reading, so `sceneCut` itself recomputes to false.
+				const float bandRaw[3] = { m_MLFeatures[3], m_MLFeatures[4], m_MLFeatures[7] };
+				bool justLocked = false;
+
+				// THE SCENE DECISION. `demand` is a shot's mean-nits; the reference is what
+				// the exposure solve is allowed to divide by. Two rules, both aimed at the
+				// same failure — adapting once per cut is adapting once per LINE OF
+				// DIALOGUE, and a matched reverse angle changes every statistic without
+				// changing the light.
+				//
+				//   demand inside the ensemble's band -> another angle on the same light.
+				//       Adopt the MEDIAN of the ensemble, not this angle's value: a set of
+				//       matched shots has a stable median, so the reference cannot strobe
+				//       at the cutting rate no matter which way the current angle reads.
+				//   demand outside it -> new light. Snap to it, SAME FRAME.
+				//
+				// The veto only ever declines to MOVE; it never delays a move it approves.
+				// That is the difference between this and the IIR smoothing it replaces, and
+				// it is why a genuine scene change still lands in one frame.
+				auto decideScene = [&](float demand) {
+					const float med = MedianOf(m_ShotMeanNits, m_ShotHistN);
+					const bool same = (m_ShotHistN >= 2) &&
+					                  (demand > med * 0.5f) && (demand < med * 2.0f);
+					m_bSceneSame = same;
+					if (same) {
+						m_fSceneMeanRef = med;
+					} else {
+						m_fSceneMeanRef = demand;
+						m_nCluster = 0;          // a real change ends any cluster
+					}
+				};
 
 				if (sceneCut) {
+					m_bSceneCut = true;
 					// SNAP — a real scene change arrives in ONE frame.
+					//
+					// The CURVE PEAK always follows the cut, whatever the scene decision
+					// says. It is the highlight-safety quantity and it is per-shot by
+					// nature: hold it across a cut to a brighter angle and that angle's own
+					// highlights are normalised against a level they overshoot, which clips
+					// them. A pump is ugly; destroyed speculars are worse.
 					m_PeakAvgPq = avgPq;
 					m_PeakMaxPq = maxPq;
 					m_MeanNitsSmooth = m_MLMeanNitsRaw;
+
+					// A cut that lands BEFORE the previous shot reached its lock means that
+					// shot was never measured to convergence — which, at dialogue pacing,
+					// means the previous "scene" is still being measured. Rapid cutting is
+					// itself the evidence: a DOP does not re-light between angles 0.7 s
+					// apart. Fold the shots into one cluster and let its median speak.
+					if (!m_SceneLocked && m_nCluster < CDX11VideoProcessor::kShotHist) {
+						m_ClusterMean[m_nCluster++] = m_MLMeanNitsRaw;
+					}
+					if (m_nCluster >= 2) {
+						m_fSceneMeanRef = MedianOf(m_ClusterMean, m_nCluster);
+						m_bSceneSame = true;
+					} else {
+						decideScene(m_MLMeanNitsRaw);   // provisional: refined at lock
+					}
+
+					// The bands follow the SCENE, not the cut — see m_BandPq. This is the
+					// single change that removes the pump: while the scene holds, the
+					// controller's inputs do not move, so its solve cannot move, so the
+					// grade cannot breathe with the content of a locked shot.
+					if (m_bSceneSame) {
+						for (int i = 0; i < 3; ++i) m_BandPq[i] = m_BandPq[i] < 0.0f ? bandRaw[i] : m_BandPq[i];
+					} else {
+						for (int i = 0; i < 3; ++i) m_BandPq[i] = bandRaw[i];
+						m_BandPeakPq = maxPq;
+					}
+
 					m_SceneLocked = false;
 					m_SceneFrames = 0;
 					for (int i = 0; i < 4; ++i) m_DeltaHistory[i] = 0.0f;
@@ -6329,12 +6560,54 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					} else {
 						m_MeanNitsSmooth += settleCoeff * (m_MLMeanNitsRaw - m_MeanNitsSmooth);
 					}
-					if (m_SceneFrames >= kSceneSettleFrames) m_SceneLocked = true;
+					// Bands converge with the anchor, but only while the scene is allowed
+					// to move — a held scene's bands stay held through the settle too.
+					if (!m_bSceneSame) {
+						for (int i = 0; i < 3; ++i) {
+							if (m_BandPq[i] < 0.0f) m_BandPq[i] = bandRaw[i];
+							else m_BandPq[i] += settleCoeff * (bandRaw[i] - m_BandPq[i]);
+						}
+						if (m_BandPeakPq < 0.0f) m_BandPeakPq = maxPq;
+						else m_BandPeakPq += settleCoeff * (maxPq - m_BandPeakPq);
+					}
+					if (m_SceneFrames >= kSceneSettleFrames) {
+						m_SceneLocked = true;
+						justLocked = true;
+						// LOCK is where a shot's demand becomes trustworthy — measured over
+						// the whole settle, not on the single (often transitional) frame the
+						// cut landed on. Record it, and refine the provisional decision the
+						// cut made from that one frame. Locking onto frame one is how a
+						// wipe or a flare poisons a scene for its entire duration.
+						m_ShotMeanNits[m_ShotHistIdx] = m_MeanNitsSmooth;
+						m_ShotHistIdx = (m_ShotHistIdx + 1) % (int)kShotHist;
+						if (m_ShotHistN < (int)kShotHist) ++m_ShotHistN;
+						decideScene(m_MeanNitsSmooth);
+						m_nCluster = 0;
+					}
 				}
-				// LOCKED — nothing else moves the anchor. A detected cut is the only
-				// way back to motion; a long graded change (a dolly into light, a
-				// room brightening over minutes) is intentionally held at the
-				// scene's opening level — the cost of absolute stillness.
+				// LOCKED — nothing else moves the anchor, the mean, or the bands. A
+				// detected cut is the only way back to motion. That is also the honest
+				// limit of this design: a long take whose lighting changes WITHOUT a cut
+				// (a lamp switched on, a dolly into sunlight) is held at the scene's
+				// established level until something cuts. The sustained-drift path that
+				// would catch it is the next piece, not this one.
+
+				// SCENE — the verdict, not the measurement. Whether the veto engaged is the
+				// only way to tell "the scene held, correctly" from "the exposure is stuck",
+				// and the two look identical on screen. Printed on a cut and on the lock
+				// that follows it, so a dialogue exchange reads as a handful of lines and a
+				// strobe reads as exactly that.
+				if (m_bMLDebug && m_pMLDebugFile && (sceneCut || justLocked)) {
+					fwprintf(m_pMLDebugFile,
+						L"SCENE frame=%llu ev=%s same=%d shot=%.1f ref=%.1f med=%.1f hist=%d "
+						L"clus=%d peakNits=%.0f band=%d/%d/%d\n",
+						(unsigned long long)m_MLDebugFrame, sceneCut ? "cut" : "lock",
+						(int)m_bSceneSame, (double)m_MLMeanNitsRaw, (double)m_fSceneMeanRef,
+						(double)MedianOf(m_ShotMeanNits, m_ShotHistN), m_ShotHistN, m_nCluster,
+						(double)exptm::PqToLinearNits(m_PeakMaxPq),
+						m_BandPq[0] > 0.0f, m_BandPq[1] > 0.0f, m_BandPq[2] > 0.0f);
+					fflush(m_pMLDebugFile);
+				}
 
 				m_HableScenePeakNits = exptm::PqToLinearNits(m_PeakMaxPq);
 
@@ -6354,17 +6627,38 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// its own >1 nit guard and silently did nothing. The extractor now
 				// averages in nits over the content rows.
 				if (m_bAutoRefWhite && m_fCurvePeakNits > 10.0f && m_iSDRDisplayNits > 0) {
-					// The TITLE's brightest scene, not the current one. Solving per scene
-					// made Everest's dark interiors raise the exposure — and refWhite is
-					// also the shoulder workload, so those scenes lost their highlights.
-					// Hand tuning never did that: 80 for Everest and 200 for a dark indoor
-					// master are per-TITLE choices, made on each title's brightest
-					// material. A running max reproduces exactly that, is monotone within
-					// a title, and cannot pump at cuts.
+					// THE CURRENT SCENE, not the title's brightest. This used to divide by
+					// a running MAX of the scene mean over the title. That is monotone — it
+					// only ever grows and never resets mid-title — so every brighter scene
+					// ticked srcAvg up and every later scene ticked refWhite DOWN to match
+					// the title's single brightest moment. Measured 2026-10-02 on the user's
+					// clip: refWhite marched 107.7 -> 90 -> 40 (its floor) while the scene
+					// means swung 2.4..43 nits, and the picture "just stayed dim altogether"
+					// and got dimmer as the title ran. The ratchet was added to stop
+					// night->noon pumping, but it did that by making exposure scene-blind —
+					// the exact opposite of the relative behaviour asked for.
+					//
+					// Now that the cut detector fires and the whole exposure chain SNAPS on
+					// the cut (see m_bSceneCut), a per-scene mean changes exposure only at
+					// shot boundaries, instantly, and LOCKS within a shot (m_MeanNitsSmooth
+					// does not move while m_SceneLocked) — so there is nothing left to pump.
+					// The night->noon case the max was protecting against is now handled
+					// correctly: the dark shot snaps to the dark shot's exposure. The
+					// shoulder ceiling below still bounds how far a dark scene may climb, so
+					// the "dark interior loses its highlights" regression the max was
+					// originally dodging stays dodged — by the ceiling, which is the right
+					// tool for it, not by blinding the solver to the scene.
 					if (m_MeanNitsSmooth > m_MeanNitsMax) {
-						m_MeanNitsMax = m_MeanNitsSmooth;
+						m_MeanNitsMax = m_MeanNitsSmooth;   // kept for the log/fallback only
 					}
-					const float srcAvg = m_MeanNitsMax;
+					// The SCENE REFERENCE, not this shot's measurement. m_fSceneMeanRef is
+					// the output of decideScene(): it snaps when the light genuinely changes
+					// and holds at the ensemble median when the cut is another angle on the
+					// light it already knows. Reading m_MeanNitsSmooth here instead would
+					// re-expose on every cut — which at the 0.7 s shot lengths measured in
+					// this clip is a strobe, not an adaptation.
+					const float srcAvg = (m_fSceneMeanRef > 0.0f) ? m_fSceneMeanRef
+					                                              : m_MeanNitsSmooth;
 					if (srcAvg > 1.0f) {
 						float want = powf(m_fRefWhiteTarget, 2.2f) * (float)m_iSDRDisplayNits
 						             * m_fCurvePeakNits / (2.2f * srcAvg);
@@ -6380,7 +6674,14 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 						// And a floor/ceiling for the pathological cases (black leader,
 						// bogus metadata) that no formula should be allowed to answer.
 						want = std::clamp(want, 40.0f, 240.0f);
-						if (m_fRefWhiteAuto > 0.0f) {
+						// Slew-limit the steady state, NEVER an accepted scene change. The
+						// ±33%/frame band exists so exposure cannot hunt between adjacent
+						// frames; when the scene decision says the LIGHT changed, every
+						// input has already jumped in one step and a limit there does not
+						// stop hunting — it just delays the correct answer by two or three
+						// frames, which is a visible climb. A held cut needs no bypass: the
+						// reference did not move, so `want` barely moves either.
+						if (m_fRefWhiteAuto > 0.0f && !(sceneCut && !m_bSceneSame)) {
 							want = std::clamp(want, 0.75f * m_fRefWhiteAuto, 1.333f * m_fRefWhiteAuto);
 						}
 						if (fabsf(want - m_fRefWhiteAuto) > 0.5f) {
