@@ -39,10 +39,15 @@
 #include <cstdio>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 #include <algorithm>
 
-static const int kW = 960, kH = 540;
+// Frame size is set from argv — a 960x540 point-sampled frame is fine for judging the
+// LOOK but cannot support a detail comparison against a 4K madVR grab, and silently
+// doing so would flatter or penalise the curve for reasons that have nothing to do with
+// the curve. Defaults to the extraction size so existing invocations still work.
+static int kW = 960, kH = 540;
 static const double kY_R = 0.2627, kY_G = 0.6780, kY_B = 0.0593;   // BT.2020 luma
 
 // BT.2020 -> BT.709, linear light (D65 on both sides, so no adaptation matrix).
@@ -60,6 +65,11 @@ static const double kP995Floor  = 0.85;
 static const double kM50        = 0.24;
 static const double kM995       = 0.90;
 static const double kMeanYield  = 0.10;
+// Gamut capacity target. 1.0 = map to the boundary exactly (no extra compression) —
+// the honest first test of "does the constraint, not the clamp, recover the detail".
+// The shipping dial measured ~0.55 against madVR on the Everest sky; that is a house
+// look choice and is deliberately NOT applied here until the mapping is shown to work.
+static const double kGamutCap   = 1.00;
 
 static const int    kHBins = 512;
 static const double kHNitsLo = 0.002, kHNitsHi = 6000.0;
@@ -137,11 +147,26 @@ static AParam Solve(const Hist& h, double srcMean, double p50, double p995)
 int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc < 3) { printf("usage: curve_render.exe <in.raw> <out.rgb24> [sdrNits=85]\n"); return 1; }
-    const double sdrNits = (argc > 3) ? atof(argv[3]) : 85.0;
+    if (argc < 3) {
+        printf("usage: curve_render.exe <in.raw> <out.rgb24> [width height]\n");
+        return 1;
+    }
+    if (argc >= 5) { kW = atoi(argv[3]); kH = atoi(argv[4]); }
 
     FILE* f = nullptr;
     if (fopen_s(&f, argv[1], "rb")) { printf("cannot open %s\n", argv[1]); return 1; }
+    // Verify the declared size against the file. A mismatch here would otherwise be
+    // read as image data and produce a plausible-looking but completely wrong render —
+    // the kind of error that survives review because it looks like a picture.
+    _fseeki64(f, 0, SEEK_END);
+    const long long bytes = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+    if (bytes != (long long)kW * kH * 6) {
+        printf("%s is %lld bytes, which is not %dx%d rgb48 (%d bytes)\n",
+               argv[1], bytes, kW, kH, kW * kH * 6);
+        fclose(f);
+        return 1;
+    }
     const size_t n = (size_t)kW * kH;
     std::vector<unsigned short> buf(n * 3);
     if (fread(buf.data(), 2, n * 3, f) != n * 3) { fclose(f); printf("short read\n"); return 1; }
@@ -197,6 +222,32 @@ int main(int argc, char** argv)
         double g7 = k2020to709[1][0]*ro + k2020to709[1][1]*go + k2020to709[1][2]*bo;
         double b7 = k2020to709[2][0]*ro + k2020to709[2][1]*go + k2020to709[2][2]*bo;
         if (r7 < -1e-4 || g7 < -1e-4 || b7 < -1e-4 || r7 > 1.0001 || g7 > 1.0001 || b7 > 1.0001) ++over;
+
+        // GAMUT MAPPING, not clamping. The first version of this render clamped, and it
+        // produced a featureless cyan slab where a jacket should be: on the 10:14:44
+        // frame 20.3% of pixels fell outside the 709 triangle, and a clamp collapses all
+        // of them onto the same edge point, deleting the texture the curve had just
+        // worked to preserve.
+        //
+        // The renderer already has the right rule (colorspace_gamut_conversion.hlsl):
+        // find where the pixel's own ray leaves the triangle and move it to a FRACTION of
+        // the way there, toward its own neutral. That keeps hue exactly and gives up only
+        // saturation, so neighbouring pixels stay neighbours instead of merging. Reusing
+        // it here rather than inventing a second one is the point of doing this offline.
+        const double y7 = 0.2126 * r7 + 0.7152 * g7 + 0.0722 * b7;
+        if (y7 > 1e-6) {
+            auto edge = [y7](double c) {
+                if (c < y7) { const double d = y7 - c; return (d > 1e-6) ? y7 / d : 1e6; }
+                const double d = c - y7;
+                return (d < 1e-6) ? 1e6 : (1.0 - y7) / d;
+            };
+            const double S = std::min(std::min(edge(r7), edge(g7)), edge(b7));
+            const double capEff = 0.95 + (kGamutCap - 0.95) * std::min(1.0, std::max(0.0, y7 / 0.40));
+            const double kk = std::min(1.0, capEff * S);
+            r7 = y7 + kk * (r7 - y7);
+            g7 = y7 + kk * (g7 - y7);
+            b7 = y7 + kk * (b7 - y7);
+        }
         r7 = std::min(std::max(r7, 0.0), 1.0);
         g7 = std::min(std::max(g7, 0.0), 1.0);
         b7 = std::min(std::max(b7, 0.0), 1.0);
@@ -212,7 +263,5 @@ int main(int argc, char** argv)
     fwrite(out.data(), 1, n * 3, o);
     fclose(o);
     printf("wrote %s (%zu bytes, %dx%d rgb24)\n", argv[2], n * 3, kW, kH);
-    (void)sdrNits;   // the curve outputs display-referred CODE; sdrNits is the panel's
-                     // white in nits and only matters once a real display renders this
     return 0;
 }
