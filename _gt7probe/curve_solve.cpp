@@ -255,6 +255,182 @@ static Curve Solve(const Hist& h)
     return c;
 }
 
+// ============================ THE ANALYTIC FORM ================================
+//
+// WHY THE KNOT SOLVE IS THE WRONG PARAMETERISATION
+//
+// Sixteen free knots against three binding conditions (mean target, p99.5 floor, clip
+// ceiling) leaves thirteen directions in which the objective is flat. The descent
+// therefore lands wherever it starts — which is precisely the 4-code wobble measured
+// between two frames whose source means differed by 0.01 nits. That was never a bug in
+// the descent; it was freedom in the model, and at runtime that freedom IS a pump.
+//
+// So shrink the model until the conditions determine it EXACTLY. Three parameters,
+// three conditions, and a closed form for two of them:
+//
+//     code(x) = 1 - exp( -k * (x/x0)^g )
+//
+// Monotone, smooth, and asymptotic to 1.0 — it CANNOT clip, so the clip constraint
+// disappears rather than being enforced. Imposing the two placement conditions:
+//
+//     y(p50)  = M50   ->  k*u = -ln(1-M50)     where u = (p50/x0)^g
+//     y(p995) = M995  ->  k*v = -ln(1-M995)    where v = (p995/x0)^g
+//
+// dividing:  v/u = (p995/p50)^g  =  ln(1/(1-M995)) / ln(1/(1-M50))
+//
+//     g = ln( 8.391 ) / ln( p99.5 / p50 )          for M50=0.24, M995=0.90
+//
+// The scene's own dynamic range therefore sets its contrast — a narrow-range interior
+// gets g near 1 and a 200:1 night-with-a-lamp gets a low g that opens the shadows. That
+// is not a tuned behaviour, it falls out of the two placement conditions.
+//
+// One parameter (u, equivalently the x0/k pair taken together) is left free and is
+// fixed by the mean target with a bisection. Deterministic, no local minima, and every
+// quantity it consumes — p50, p99.5, mean — is already measured and already scene-locked
+// by the exposure memory.
+// ======================================================================================
+
+static const double kM50  = 0.24;   // delivered mid code: madVR's accepted Everest grab
+static const double kM995 = 0.90;   // delivered p99.5: leaves headroom to ~0.97 at max
+static const double kMeanYield = 0.10;  // max the mean may rise above target when the
+                                        // highlight floor overrides it (house option A)
+
+struct AParam { double k, x0, g; };
+
+// defined below; APSolve's stage 2 needs it, so it is declared here
+static void ApDeliver(const AParam& a, const Hist& h, Delivered& d);
+
+static inline double APEval(const AParam& a, double nits)
+{
+    if (nits <= 0.0) return 0.0;
+    return 1.0 - std::exp(-a.k * std::pow(nits / a.x0, a.g));
+}
+
+// WELL-POSED FORM — one unknown, one equation, monotone.
+//
+// The first version pinned BOTH y(p50) and y(p99.5) and then tried to fit the mean with
+// the leftover parameter. It cannot: those two conditions already determine the curve
+// completely, because
+//
+//     k*(x/x0)^g  ==  TA*(x/p50)^g        for every x0 and k that satisfy both
+//
+// — x0 and k are redundant against the pair of anchors. The bisection therefore drove
+// them to 2.7e4 and 3e12 while the curve never changed, and the mean target missed by up
+// to 0.08. A degenerate parameterisation cannot be fixed by a better search; the model
+// has to shed the redundancy.
+//
+// So: the two quantities that actually matter are BRIGHTNESS (the mean target) and
+// HIGHLIGHT PRESERVATION (the p99.5 floor), and those are the constraints. The scene's
+// dynamic range sets the SHAPE — g, from the same log-log law as before — and is not a
+// constraint, so it cannot starve the solve of freedom. One unknown (the scale C) and
+// one monotone equation (the mean) then determines everything else, and the delivered
+// p99.5 is REPORTED rather than forced: if the floor still holds under a shape rule
+// fitted from real frames, that is a finding; if it breaks, that is also the finding.
+static AParam APSolve(const Hist& h, double srcMean, double p50, double p995)
+{
+    AParam a;
+    p50 = std::max(p50, 0.02); p995 = std::max(p995, p50 * 1.2);
+
+    // shape from the scene's own range: the contrast that carries p50's separation up to
+    // p99.5 without crushing it. Narrow-range interiors land near g=1, a 200:1 night
+    // interior with a lamp lands near 0.4 and opens the shadows.
+    a.g = std::log(std::log(1.0 / (1.0 - kM995)) / std::log(1.0 / (1.0 - kM50)))
+        / std::log(p995 / p50);
+    a.x0 = p995;                                    // anchor the shape at the highlight
+
+    const double tMean = kMeanAtRef * std::pow(std::max(srcMean, 0.05) / kRefSrcNits, kDamp);
+    double lo = 1e-6, hi = 1e6;                     // monotone in C: bigger C -> brighter
+    for (int it = 0; it < 60; ++it) {
+        const double mid = std::sqrt(lo * hi);
+        a.k = mid;
+        double acc = 0.0;
+        for (int i = 0; i < kHBins; ++i)
+            if (h.count[i] > 0.0) acc += h.count[i] * APEval(a, h.centre[i]);
+        if (acc / h.total > tMean) hi = mid; else lo = mid;
+    }
+    a.k = std::sqrt(lo * hi);
+
+    // STAGE 2 — HIGHLIGHTS WIN (house decision, 2026-10-05, option A).
+    //
+    // On ~2 of 12 real frames the mean target and the p99.5 floor are jointly
+    // infeasible: a scene with a 2.6-nit mean and a 226-nit lamp cannot put its average
+    // at 0.216 of white AND keep its highlights at 0.85 — that asks for more
+    // shadow-to-highlight separation than the display has. Something must yield, and the
+    // house answer is that the highlights do not. So when stage 1's solution violates the
+    // floor, k is raised (brightening) until the floor holds, and the mean lands above
+    // target. The yield is reported, never hidden.
+    //
+    // delP995 is monotone increasing in k, so this is another one-unknown bisection.
+    // Bounded: k may rise only until the floor holds, and the mean may yield by at most
+    // kMeanYield — a sanity rail for pathological frames (black leader with one specular)
+    // so a degenerate histogram cannot blow the exposure wide open.
+    Delivered d; ApDeliver(a, h, d);
+    if (d.p995 < kP995Floor) {
+        double klo = a.k, khi = a.k * 64.0;
+        for (int it = 0; it < 50; ++it) {
+            const double mid = std::sqrt(klo * khi);
+            a.k = mid;
+            ApDeliver(a, h, d);
+            if (d.p995 >= kP995Floor) khi = mid; else klo = mid;
+        }
+        a.k = std::sqrt(klo * khi);
+        ApDeliver(a, h, d);
+        if (d.mean > tMean + kMeanYield) {
+            // rail: give back the excess by re-solving the mean at the capped level
+            const double cap = tMean + kMeanYield;
+            double mlo = 1e-6, mhi = a.k;
+            for (int it = 0; it < 50; ++it) {
+                const double mid = std::sqrt(mlo * mhi);
+                a.k = mid;
+                ApDeliver(a, h, d);
+                if (d.mean > cap) mhi = mid; else mlo = mid;
+            }
+            a.k = std::sqrt(mlo * mhi);
+        }
+    }
+    return a;
+}
+
+static void ApDeliver(const AParam& a, const Hist& h, Delivered& d)
+{
+    d = Delivered{ 0,0,0,0,0 };
+    double acc = 0.0, cum = 0.0;
+    const double n50 = 0.50 * h.total, n995 = 0.995 * h.total;
+    bool g50 = false, g995 = false;
+    for (int i = 0; i < kHBins; ++i) {
+        if (h.count[i] <= 0.0) continue;
+        const double code = APEval(a, h.centre[i]);
+        acc += code * h.count[i];
+        if (code > d.maxCode) d.maxCode = code;
+        if (code >= kClipCode) d.clipFrac += h.count[i];
+        cum += h.count[i];
+        if (!g50 && cum >= n50)  { d.p50 = code; g50 = true; }
+        if (!g995 && cum >= n995){ d.p995 = code; g995 = true; }
+    }
+    d.mean = acc / h.total;
+    d.clipFrac /= h.total;
+}
+
+// Inverse quantile: the source nits at which the curve reaches a given output code.
+//
+// This is the representation the parametric form will be fitted in, and it is chosen
+// over the forward one for a specific reason. Forward (nits -> code), a curve that
+// adapts moves every sample point at once, so two curves that differ only in
+// placement look different everywhere. Inverse (code -> nits), a placement change is
+// a uniform shift of the whole list and a contrast change is a scaling of it — the
+// two things a solver is actually doing separate into two numbers that mean something.
+// If those numbers turn out to be simple functions of the four statistics, that
+// function is the runtime curve generator, and no iterative solve is needed at all.
+static double NitsAtCode(const Curve& c, double code)
+{
+    double lo = kKnotLo, hi = kKnotHi;
+    for (int it = 0; it < 60; ++it) {
+        const double mid = std::sqrt(lo * hi);
+        if (CurveEval(c, mid) > code) hi = mid; else lo = mid;
+    }
+    return std::sqrt(lo * hi);
+}
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -266,6 +442,11 @@ int main(int argc, char** argv)
 
     std::vector<Curve> curves;
     std::vector<std::string> names;
+    // The four statistics the runtime will actually have: mean, p50, p99.5, max.
+    // Everything the curve is fitted from must be expressible through these, or the
+    // parametric form cannot be built at runtime — the histogram is offline-only.
+    std::vector<double> vMean, vP50, vP995, vMax;
+    std::vector<Hist> hists;
 
     for (int a = 1; a < argc; ++a) {
         Hist h;
@@ -281,6 +462,50 @@ int main(int argc, char** argv)
                base, srcMean, tMean, d.mean, d.p50, d.p995, d.clipFrac * 100.0, d.maxCode);
         curves.push_back(c);
         names.push_back(base);
+
+        // source-side statistics, in nits
+        double cum = 0.0, q50 = 0.0, q995 = 0.0, mx = 0.0;
+        const double n50 = 0.50 * h.total, n995 = 0.995 * h.total;
+        bool g50 = false, g995 = false;
+        for (int i = 0; i < kHBins; ++i) {
+            if (h.count[i] <= 0.0) continue;
+            if (h.centre[i] > mx) mx = h.centre[i];
+            cum += h.count[i];
+            if (!g50 && cum >= n50)  { q50 = h.centre[i]; g50 = true; }
+            if (!g995 && cum >= n995){ q995 = h.centre[i]; g995 = true; }
+        }
+        vMean.push_back(srcMean); vP50.push_back(q50); vP995.push_back(q995); vMax.push_back(mx);
+        hists.push_back(h);
+    }
+
+    // ---- the analytic form, and whether it reproduces the knot solve --------------
+    {
+        printf("\n# ANALYTIC FORM  code = 1 - exp(-k*(x/x0)^g)   targets M50=%.2f M995=%.2f\n",
+               kM50, kM995);
+        printf("file            g      k       x0    | delMean  delP50  delP995  maxCd  clip%%"
+               " |  yield  | vs knots\n");
+        printf("                (yield = delivered mean minus its target; non-zero means the\n");
+        printf("                 highlight floor overrode the mean — house option A)\n");
+        double worstFit = 0.0;
+        for (size_t i = 0; i < curves.size(); ++i) {
+            const AParam a = APSolve(hists[i], vMean[i], vP50[i], vP995[i]);
+            Delivered d; ApDeliver(a, hists[i], d);
+            const double tMean = kMeanAtRef
+                * std::pow(std::max(vMean[i], 0.05) / kRefSrcNits, kDamp);
+            const double yield = d.mean - tMean;
+            double mx = 0.0;
+            for (int g2 = 0; g2 <= 400; ++g2) {
+                const double n = std::exp(std::log(0.02) + (g2 / 400.0) * (std::log(3000.0) - std::log(0.02)));
+                mx = std::max(mx, std::abs(APEval(a, n) - CurveEval(curves[i], n)));
+            }
+            worstFit = std::max(worstFit, mx);
+            printf("%-14s %6.3f %7.3f %8.2f | %7.3f %7.3f %7.3f %6.3f %6.3f | %+7.3f | %6.1f cd\n",
+                   names[i].c_str(), a.g, a.k, a.x0,
+                   d.mean, d.p50, d.p995, d.maxCode, d.clipFrac * 100.0, yield, mx * 255.0);
+        }
+        printf("\n   worst analytic-vs-knot difference: %.1f codes\n", worstFit * 255.0);
+        printf("   (the knot curves are free 16-knot fits and are NOT the goal — agreement\n");
+        printf("    within a few codes means the small family reaches the same targets.)\n");
     }
 
     // THE STABILITY METRIC. Max |delta code| between consecutive solved curves, over a
@@ -302,6 +527,48 @@ int main(int argc, char** argv)
         printf("\n   worst motion in this set: %.4f (%.1f codes)\n", worst, worst * 255.0);
         printf("   for reference: 1 code at 8-bit is ~0.4%% of range; the current shipping\n");
         printf("   chain's visible pump was measured as a multi-code crawl over ~1s.\n");
+    }
+
+    // ---- the inverse view: what the parametric form has to reproduce --------------
+    {
+        static const double kCodes[] = { 0.10, 0.25, 0.50, 0.75, 0.90 };
+        printf("\n# inverse quantiles — SOURCE NITS that produce each output code\n");
+        printf("file            srcMean   srcP50  srcP995   srcMax |");
+        for (double cd : kCodes) printf("  nits@%.2f", cd);
+        printf(" | spread@.9/.1\n");
+        for (size_t i = 0; i < curves.size(); ++i) {
+            printf("%-14s %8.2f %8.2f %8.1f %8.1f |",
+                   names[i].c_str(), vMean[i], vP50[i], vP995[i], vMax[i]);
+            double at[5];
+            for (int k = 0; k < 5; ++k) { at[k] = NitsAtCode(curves[i], kCodes[k]); printf(" %9.2f", at[k]); }
+            printf(" | %8.2f\n", at[4] / std::max(at[0], 1e-6));
+        }
+        printf("\n# ratios that a parametric form would have to predict from the statistics\n");
+        printf("file            nits@.50/srcP50   nits@.90/srcMax   nits@.10/srcP50\n");
+        for (size_t i = 0; i < curves.size(); ++i) {
+            const double a10 = NitsAtCode(curves[i], 0.10);
+            const double a50 = NitsAtCode(curves[i], 0.50);
+            const double a90 = NitsAtCode(curves[i], 0.90);
+            printf("%-14s %14.3f %16.4f %17.4f\n", names[i].c_str(),
+                   a50 / std::max(vP50[i], 1e-6),
+                   a90 / std::max(vMax[i], 1e-6),
+                   a10 / std::max(vP50[i], 1e-6));
+        }
+
+        FILE* f = nullptr;
+        if (0 == fopen_s(&f, "curves.csv", "w")) {
+            fprintf(f, "file,srcMean,srcP50,srcP995,srcMax");
+            for (int k = 0; k < kKnots; ++k) fprintf(f, ",k%02d_nits,k%02d_code", k, k);
+            fprintf(f, "\n");
+            for (size_t i = 0; i < curves.size(); ++i) {
+                fprintf(f, "%s,%.4f,%.4f,%.4f,%.4f", names[i].c_str(),
+                        vMean[i], vP50[i], vP995[i], vMax[i]);
+                for (int k = 0; k < kKnots; ++k) fprintf(f, ",%.4f,%.6f", KnotNits(k), curves[i].y[k]);
+                fprintf(f, "\n");
+            }
+            fclose(f);
+            printf("\n wrote curves.csv (%d frames x %d knots)\n", (int)curves.size(), kKnots);
+        }
     }
     return 0;
 }

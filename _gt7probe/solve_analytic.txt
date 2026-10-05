@@ -1,0 +1,84 @@
+﻿# house targets: mean=0.30@20nits damped^0.16  p99.5>=0.85  clip<=0.100%
+file            srcMean  tgtMean  delMean  delP50  delP995  clip%   maxCd
+e00060.raw         8.54    0.262    0.262    0.201    0.909  0.000   0.946
+e00300.raw        35.64    0.329    0.329    0.149    0.930  0.000   0.958
+e00900.raw        66.20    0.363    0.366    0.338    0.850  0.000   0.906
+e01500.raw       108.64    0.393    0.446    0.557    0.845  0.000   0.878
+e02100.raw        38.13    0.333    0.339    0.182    0.896  0.000   0.946
+e02700.raw        35.32    0.329    0.337    0.377    0.848  0.000   0.883
+e03300.raw        67.01    0.364    0.398    0.482    0.846  0.000   0.956
+e03900.raw        97.62    0.387    0.388    0.160    0.850  0.000   0.872
+e04500.raw        11.03    0.273    0.273    0.192    0.895  0.000   0.973
+e05100.raw         2.57    0.216    0.214    0.196    0.850  0.019   0.994
+e05700.raw        23.75    0.308    0.311    0.238    0.849  0.001   0.992
+e06000.raw         4.82    0.239    0.241    0.180    0.849  0.000   0.988
+
+# ANALYTIC FORM  code = 1 - exp(-k*(x/x0)^g)   targets M50=0.24 M995=0.90
+file            g      k       x0    | delMean  delP50  delP995  maxCd  clip% |  yield  | vs knots
+                (yield = delivered mean minus its target; non-zero means the
+                 highlight floor overrode the mean — house option A)
+e00060.raw      0.234   2.337   179.37 |   0.262   0.163   0.903  0.926  0.000 |  +0.000 |   86.2 cd
+e00300.raw      0.493   2.030   311.97 |   0.329   0.215   0.869  0.910  0.000 |  +0.000 |   27.2 cd
+e00900.raw      1.028   3.079   330.68 |   0.363   0.307   0.954  0.991  0.003 |  +0.000 |   26.7 cd
+e01500.raw      0.839   2.502   405.48 |   0.393   0.258   0.918  0.945  0.000 |  -0.000 |   89.3 cd
+e02100.raw      0.584   2.253   277.66 |   0.333   0.235   0.895  0.970  0.000 |  +0.000 |   33.3 cd
+e02700.raw      1.328   2.834   134.04 |   0.329   0.287   0.941  0.968  0.000 |  +0.000 |   26.6 cd
+e03300.raw      0.880   2.224   261.94 |   0.364   0.233   0.892  0.997  0.040 |  +0.000 |   81.0 cd
+e03900.raw      0.468   2.025   469.05 |   0.387   0.214   0.868  0.949  0.000 |  +0.000 |   45.8 cd
+e04500.raw      0.403   1.969   247.12 |   0.273   0.209   0.860  0.965  0.000 |  -0.000 |   12.9 cd
+e05100.raw      0.487   1.897    46.97 |   0.254   0.202   0.850  0.983  0.002 |  +0.038 |   51.4 cd
+e05700.raw      0.777   2.142   130.19 |   0.308   0.225   0.883  0.998  0.001 |  +0.000 |    8.6 cd
+e06000.raw      0.529   1.897    68.59 |   0.276   0.202   0.850  0.983  0.000 |  +0.037 |   22.0 cd
+
+   worst analytic-vs-knot difference: 89.3 codes
+   (the knot curves are free 16-knot fits and are NOT the goal — agreement
+    within a few codes means the small family reaches the same targets.)
+
+# curve motion between consecutive frames (max |delta code| over the grid)
+   e00060.raw     -> e00300.raw      max|dcode| = 0.1730  (44.1 codes)
+   e00300.raw     -> e00900.raw      max|dcode| = 0.2894  (73.8 codes)
+   e00900.raw     -> e01500.raw      max|dcode| = 0.3220  (82.1 codes)
+   e01500.raw     -> e02100.raw      max|dcode| = 0.1918  (48.9 codes)
+   e02100.raw     -> e02700.raw      max|dcode| = 0.1654  (42.2 codes)
+   e02700.raw     -> e03300.raw      max|dcode| = 0.1837  (46.8 codes)
+   e03300.raw     -> e03900.raw      max|dcode| = 0.1323  (33.7 codes)
+   e03900.raw     -> e04500.raw      max|dcode| = 0.1726  (44.0 codes)
+   e04500.raw     -> e05100.raw      max|dcode| = 0.1712  (43.7 codes)
+   e05100.raw     -> e05700.raw      max|dcode| = 0.2445  (62.4 codes)
+   e05700.raw     -> e06000.raw      max|dcode| = 0.1617  (41.2 codes)
+
+   worst motion in this set: 0.3220 (82.1 codes)
+   for reference: 1 code at 8-bit is ~0.4% of range; the current shipping
+   chain's visible pump was measured as a multi-code crawl over ~1s.
+
+# inverse quantiles — SOURCE NITS that produce each output code
+file            srcMean   srcP50  srcP995   srcMax |  nits@0.10  nits@0.25  nits@0.50  nits@0.75  nits@0.90 | spread@.9/.1
+e00060.raw         8.54     0.00    179.4    285.9 |      0.01      2.78     15.25     55.97    165.16 | 16515.56
+e00300.raw        35.64     4.19    312.0    442.5 |      2.56      7.49     23.68     79.14    226.66 |    88.64
+e00900.raw        66.20    41.80    330.7    497.2 |      9.48     27.83     78.47    195.41    473.21 |    49.91
+e01500.raw       108.64    32.16    405.5    482.9 |     11.47     17.42     29.05    226.87    577.24 |    50.34
+e02100.raw        38.13     7.28    277.7    592.1 |      4.95      9.80     23.77     71.55    290.94 |    58.81
+e02700.raw        35.32    27.01    134.0    155.1 |      5.42     15.27     42.06     91.42    167.70 |    30.92
+e03300.raw        67.01    23.35    261.9    792.4 |      6.49     12.09     24.41    164.02    385.68 |    59.41
+e03900.raw        97.62     4.99    469.1   1060.3 |      3.38      7.40     20.39     79.99   3000.00 |   887.47
+e04500.raw        11.03     1.27    247.1    916.6 |      0.12      2.79     16.31     72.85    261.43 |  2142.30
+e05100.raw         2.57     0.59     47.0    226.4 |      0.06      4.21     13.88     31.06     63.34 |  1060.92
+e05700.raw        23.75     8.42    130.2    542.6 |      2.80      9.08     29.82     80.18    174.16 |    62.16
+e06000.raw         4.82     1.23     68.6    294.3 |      0.24      3.28     15.15     43.12     91.27 |   388.06
+
+# ratios that a parametric form would have to predict from the statistics
+file            nits@.50/srcP50   nits@.90/srcMax   nits@.10/srcP50
+e00060.raw           5144.922           0.5777            3.3743
+e00300.raw              5.658           0.5122            0.6108
+e00900.raw              1.877           0.9518            0.2268
+e01500.raw              0.903           1.1953            0.3565
+e02100.raw              3.265           0.4913            0.6794
+e02700.raw              1.557           1.0815            0.2008
+e03300.raw              1.046           0.4867            0.2781
+e03900.raw              4.090           2.8293            0.6780
+e04500.raw             12.861           0.2852            0.0962
+e05100.raw             23.341           0.2797            0.1004
+e05700.raw              3.540           0.3210            0.3327
+e06000.raw             12.304           0.3101            0.1910
+
+ wrote curves.csv (12 frames x 16 knots)
