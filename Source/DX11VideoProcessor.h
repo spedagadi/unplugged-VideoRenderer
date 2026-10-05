@@ -582,6 +582,21 @@ private:
 	bool  m_ZoneSeen        = false;
 	float m_ZoneChangeFrac  = 0.0f;   // fraction of zones moved this frame (CSV)
 	float m_HableScenePeakNits = -1.0f;
+	// Running MAX of the measured scene peak within the current scene: fast attack, slow
+	// release, reset only on an accepted cut. The anchor above is scene-STABLE, which is
+	// what an exposure mean wants and what a highlight ceiling must not be — a scene that
+	// opens dark (fade from black) has no peak to measure yet, and locking the normaliser
+	// there under-estimates it for the whole scene, which is the destructive direction.
+	float m_fScenePeakMaxNits = 0.0f;
+	// Debounce for the true-max ceiling guard: a candidate peak must be seen on three
+	// consecutive frames before it raises the ceiling, so a grain spike cannot pin the
+	// normaliser high while a real flare (which repeats) can.
+	float m_fPeakMaxCand  = 0.0f;
+	int   m_uPeakMaxStreak = 0;
+	// Release is DISCRETE, not per-frame: one step every ~24 extractions. A normaliser
+	// that slides every frame is visible as shimmer no matter how slow the slide is; one
+	// that holds for a second and then steps is not.
+	int   m_uPeakDecayTick = 0;
 	float m_HablePrevPeakPq = -1.0f;        // previous raw PQ peak, for the cut test
 	// Soft-plus pre-compressor: display-relative; knee <= 0 disables.
 	float m_fSoftKnee      = 0.60f;
@@ -600,6 +615,11 @@ private:
 	// GT7 Adapt (TONE_CURVE_GT7_ADAPT): weight of the measured scene peak in the
 	// peak this curve maps FROM. 0 = plain GT7. cbuffer[24].
 	float m_fHdrGt7Adapt     = 0.25f;
+	// The weight actually sent to the shader, and actually used by the CPU mirror.
+	// Equals the dial when the signal states its own content peak; forced to 1.0 when
+	// it does not, because a metadata-less `cll` is the Title peak fallback and a
+	// fallback deserves no vote against a measurement. cbuffer[24].
+	float m_fGt7AdaptEff     = 0.25f;
 	// GT7_ALPHA: how far the shoulder reaches before it lands on the ceiling
 	// (1.47x at 0.25, 1.87x at 0.10). This is what limits how much exposure
 	// fHdrRefWhiteNits can buy before the highlights clamp. cbuffer[25].

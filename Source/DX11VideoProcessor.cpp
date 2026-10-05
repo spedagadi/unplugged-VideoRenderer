@@ -1488,10 +1488,71 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		if (mMax <= 10.0f) mMax = titlePeak;
 		if (cll <= 10.0f)  cll = mMax;
 		if (fall <= 1.0f)  fall = cll;
+
+		// IS THE CONTENT PEAK ACTUALLY KNOWN?
+		//
+		// GT7 Adapt blends two estimates of ONE quantity: the metadata's MaxCLL and the
+		// extractor's measured scene peak. The user's dial sets how much the measurement
+		// gets — but that question only has a meaning when there IS a second estimate to
+		// weigh it against. When the signal carries no static metadata at all, `cll` above
+		// is not an estimate of anything: it is the Title peak dial (default 1000, floor
+		// 100) wearing the metadata's clothes.
+		//
+		// Measured on Dolby Vision P7 from an Oppo (Gladiator 2 language menu):
+		// `sdata=0 cll=0 mmax=0` with the dial at 100, so the shader computed
+		//     lerp(100, ~1000, 0.25) = 325
+		// and the top two thirds of the highlight range slammed into the clamp — the exact
+		// failure this blend's own comment warns about ("a peak too LOW slams the top into
+		// the clamp"). A fallback default is not a measurement, and it must not receive
+		// confidence weight against one.
+		//
+		// REVERTED 2026-10-04 (option B): the weight is no longer forced to 1.0 when the
+		// signal carries no metadata. Forcing it made the gain divisor the fast peak ALONE,
+		// which maximised the sensitivity of a whole-image quantity to the noisiest statistic
+		// in the system — every flare, every fade, every grain excursion became a global
+		// brightness move. That is what "the adapt jumps crazily" was.
+		//
+		// The stability now comes from the FLOOR below instead: the metadata/dial peak is a
+		// minimum for the placement, and the measured peak may only raise it. So the
+		// placement cannot be dragged down by a dark frame (no blowout) and does not chase
+		// the fast peak at all while content sits below the stated peak (no movement).
+		m_fGt7AdaptEff = m_fHdrGt7Adapt;
+
+		// The peak the curve ACTUALLY divides by. cbuffer[9] stays the raw metadata value,
+		// because BT.2390 and ST.2094-10 derive their knee from it and must not inherit an
+		// adapted number. But every CPU-side prediction has to use the number the shader
+		// used: publishing the un-adapted cll here made auto-exposure's refWhite and the
+		// band controller's anchor prediction solve against a peak that no longer exists
+		// the moment the blend is non-zero — which is why the two could disagree with the
+		// picture on screen while each of them was individually self-consistent.
+		// The placement peak, and it must match the shader's expression EXACTLY — this is
+		// the number auto-exposure and the band controller solve against, and any drift
+		// between the two is the disagreement that previously showed up as the picture and
+		// the model each being self-consistent but not each other.
+		//
+		//     placement = max( cll,  lerp(cll, measured, w) )
+		//
+		// which is cll whenever the content sits at or below the stated peak, and rises
+		// toward the measured peak only when the content exceeds it. Two consequences, both
+		// deliberate:
+		//
+		//   - a dark frame can never pull the divisor down, so the gain can never run away
+		//     upward. That was the fade-from-black blowout (measured placement of 127 nits
+		//     on a scene containing a sun), and it is now structurally impossible while the
+		//     stated peak is sane.
+		//   - ordinary fluctuation below the stated peak moves NOTHING at all. The step the
+		//     user objected to needed the placement to chase the fast peak; below the floor
+		//     there is nothing to chase.
+		float effPeak = cll;
+		if (m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT
+		    && m_HableScenePeakNits > 10.0f && m_fGt7AdaptEff > 0.0f) {
+			effPeak = fmaxf(cll, (1.0f - m_fGt7AdaptEff) * cll
+			                    + m_fGt7AdaptEff * m_HableScenePeakNits);
+		}
 		cbuffer[9]  = cll;
 		// The same number the curve divides by, published for the CPU-side
 		// prediction that drives the relative mid-tone target.
-		m_fCurvePeakNits = cll;
+		m_fCurvePeakNits = effPeak;
 		cbuffer[10] = fall;
 		cbuffer[11] = mMax;
 		cbuffer[12] = mMin;
@@ -1559,7 +1620,9 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// [24] GT7 Adapt (selection 10): weight of the measured scene peak in the
 		// peak the curve maps FROM. Harmless for every other selection — only the
 		// GT7 branch reads it, and only when the selection is 10.
-		cbuffer[24] = m_fHdrGt7Adapt;
+		// The EFFECTIVE weight, not the dial: with no metadata to weigh against, the
+		// measurement takes the whole vote (see bPeakFromMeta above).
+		cbuffer[24] = m_fGt7AdaptEff;
 		// [25] the shoulder's reach (GT7_ALPHA). Takes a padding slot, so the buffer
 		// stays 28 floats / 112 bytes — no alignment risk.
 		cbuffer[25] = m_fHdrGt7Alpha;
@@ -1571,6 +1634,8 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// place. Applying it in both would double-compress. 28..31 keeps the buffer at
 		// 32 floats / 128 bytes, the next 16-byte multiple.
 		cbuffer[28] = (m_bMLActive && m_pPSMLChroma) ? 0.0f : 1.0f;
+		// 29..31 remain padding; the GT7 placement/protection peak split tried there on
+		// 2026-10-04 regressed badly (see the guard note in Render) and was reverted.
 		// [32] GT7 debug view (0 = off). 32..35 keeps the buffer at 36 floats / 144
 		// bytes, the next 16-byte multiple.
 		cbuffer[32] = m_fHdrGt7Dbg;
@@ -6302,6 +6367,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					// memory must not carry across it, or the next film inherits the last
 					// one's ensemble median.
 					m_fSceneMeanRef = m_MLMeanNitsRaw;
+					m_fScenePeakMaxNits = 0.0f;
 					m_ShotHistIdx = 0;
 					m_ShotHistN = 0;
 					m_nCluster = 0;
@@ -6600,16 +6666,112 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				if (m_bMLDebug && m_pMLDebugFile && (sceneCut || justLocked)) {
 					fwprintf(m_pMLDebugFile,
 						L"SCENE frame=%llu ev=%s same=%d shot=%.1f ref=%.1f med=%.1f hist=%d "
-						L"clus=%d peakNits=%.0f band=%d/%d/%d\n",
+						L"clus=%d anchorPk=%.0f maxPk=%.0f trueMax=%.0f usePk=%.0f band=%d/%d/%d\n",
 						(unsigned long long)m_MLDebugFrame, sceneCut ? "cut" : "lock",
 						(int)m_bSceneSame, (double)m_MLMeanNitsRaw, (double)m_fSceneMeanRef,
 						(double)MedianOf(m_ShotMeanNits, m_ShotHistN), m_ShotHistN, m_nCluster,
-						(double)exptm::PqToLinearNits(m_PeakMaxPq),
+						(double)exptm::PqToLinearNits(m_PeakMaxPq), (double)m_fScenePeakMaxNits,
+						(double)exptm::PqToLinearNits(m_MLFeatures[0]), (double)m_HableScenePeakNits,
 						m_BandPq[0] > 0.0f, m_BandPq[1] > 0.0f, m_BandPq[2] > 0.0f);
 					fflush(m_pMLDebugFile);
 				}
 
-				m_HableScenePeakNits = exptm::PqToLinearNits(m_PeakMaxPq);
+				// THE PEAK IS A MAXIMUM, NOT A LOCKED AVERAGE.
+				//
+				// The snap/settle/LOCK discipline is right for the exposure mean — a mean
+				// that follows content is a pump — and it is WRONG for the peak, for two
+				// reasons that compound. A scene's peak is not known at its start; it is
+				// discovered as the scene plays. And the error is asymmetric: under-estimating
+				// the peak slams the top of the range into the clamp, over-estimating costs a
+				// little exposure. A locked opening value guarantees the destructive direction
+				// whenever the scene opens dark.
+				//
+				// Measured 2026-10-04: Gladiator II's Paramount logo fades in from black, the
+				// anchor locked at 127 nits, the sky arrived seconds later, and the curve went
+				// on normalising by a peak that scene had outgrown eight seconds earlier — full
+				// blowout, every cloud floor gone.
+				//
+				// So: fast attack, slow release, reset only when a NEW scene is accepted (a
+				// held matched angle keeps its predecessor's ceiling, which is exactly the
+				// protection that is wanted). Fast attack because a highlight appearing is a
+				// clipping emergency; slow release because a single lens flare must not pin
+				// the normaliser high for a scene that has moved on.
+				const float measPeakNits = exptm::PqToLinearNits(maxPq);
+				// AND THE CEILING MUST SEE THE TRUE MAX, NOT THE PERCENTILE.
+				//
+				// p99.5 is the right statistic for EXPOSURE — stable, immune to one lamp —
+				// and structurally the WRONG one for a highlight ceiling, because excluding
+				// the brightest 0.5% excludes exactly the sun, the flare, the specular that
+				// defines where the scene actually tops out. Measured 2026-10-04 on the
+				// Gladiator II ship scene: usePk=130..289 from p99.5 while the flare sat far
+				// above it, so the whole cloud mass was lifted an extra stop into the
+				// shoulder's flattest region and the internal detail flattened out — the
+				// "missing highlight detail" report, and the capture proved it was a LIFT,
+				// not a clip (nothing reached 250).
+				//
+				// The true max is noisy — a grain spike is an anecdote — so it is debounced:
+				// a candidate must be seen on three consecutive frames before it raises the
+				// ceiling. A flare repeats; grain does not.
+				const float rawMaxNits  = exptm::PqToLinearNits(m_MLFeatures[0]);
+				const float measMaxNits = (rawMaxNits > 10.0f && rawMaxNits < 4000.0f)
+				                          ? rawMaxNits : measPeakNits;
+				const float target = fmaxf(measPeakNits, measMaxNits);
+
+				// THREE GATES, because the first version of this shimmered.
+				//
+				// This quantity rescales the ENTIRE image, so the rule is different from the
+				// one that governs the exposure mean: it may move RARELY and it may move in
+				// STEPS, but it may never move continuously. The first cut violated exactly
+				// that — it decayed every single frame and snapped up whenever grain happened
+				// to line up for three frames. A continuous slide punctuated by jumps, on the
+				// one number that re-weights every pixel, is precisely "visible shimmer".
+				//
+				//   margin      a rise must clear 10%. Below that it is not distinguishable
+				//               from film grain on a bright sky, which is the noise source
+				//               here — maxscl is a MAX, so grain shows up in it directly.
+				//   persistence five consecutive frames. A flare sustains; a dither spike
+				//               does not.
+				//   release     once per second, and only then. 4% per tick gives a ~25 s
+				//               time constant, which is what lets a long take come back down
+				//               after one flare. The point is not the rate, it is that the
+				//               other 23 frames of that second change NOTHING — between ticks
+				//               the curve is bit-identical, so there is nothing to shimmer.
+				//
+				// Net: the ceiling moves in deliberate >=10% steps, at most a few times a
+				// minute, and each step corresponds to a real content change.
+				if (sceneCut && !m_bSceneSame) {
+					m_fScenePeakMaxNits = target;
+					m_fPeakMaxCand = 0.0f;
+					m_uPeakMaxStreak = 0;
+					m_uPeakDecayTick = 0;
+				} else if (target > m_fScenePeakMaxNits * 1.10f) {
+					if (target > m_fPeakMaxCand) { m_fPeakMaxCand = target; m_uPeakMaxStreak = 1; }
+					else if (++m_uPeakMaxStreak >= 5) {
+						m_fScenePeakMaxNits = m_fPeakMaxCand;
+						m_fPeakMaxCand = 0.0f;
+						m_uPeakMaxStreak = 0;
+						m_uPeakDecayTick = 0;
+					}
+				} else {
+					m_fPeakMaxCand = 0.0f;
+					m_uPeakMaxStreak = 0;
+					// Discrete release: one 4% step per ~24 extractions, nothing between.
+					if (++m_uPeakDecayTick >= 24) {
+						m_uPeakDecayTick = 0;
+						m_fScenePeakMaxNits *= 0.96f;
+					}
+				}
+				// Never below the anchor: the anchor is the scene-stable estimate, the max is
+				// the guard against that estimate having been taken too early.
+				//
+				// The guard MUST be in the gain divisor. Reverted 2026-10-04: moving it out
+				// and giving it only the pre-compressor knee blew the highlights completely,
+				// because a knee can re-spread content that lands NEAR the ceiling — it cannot
+				// rescue content aimed FAR above it. The gain error from a flare-excluded peak
+				// was ~3.5x; the knee's whole authority is a fraction of the ceiling. There is
+				// no local mechanism that substitutes for the global one here.
+				m_HableScenePeakNits = fmaxf(exptm::PqToLinearNits(m_PeakMaxPq),
+				                             m_fScenePeakMaxNits);
 
 				// AUTO EXPOSURE. Solved here because m_PeakAvgPq snaps at cuts, settles
 				// briefly and then LOCKS — exactly the cadence at which an exposure

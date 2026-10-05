@@ -378,9 +378,24 @@ float4 main(PS_INPUT input) : SV_Target
         // precisely what the paragraph above is written against.
         float gtScenePeak = maxCLL;
         if (toneCurveSelection > 9.5 && hableScenePeakNits > 0.0) {
-            gtScenePeak = lerp(maxCLL, hableScenePeakNits, saturate(gt7Adapt));
+            // maxCLL is a FLOOR on the placement, and the measured peak may only RAISE it.
+            // Mirrors the CPU's effPeak exactly — the two must not drift, because that
+            // number is what auto-exposure and the band controller solve against.
+            //
+            // Plain lerp(maxCLL, measured, w) let a dark frame drag the divisor down with
+            // it, and since the gain is proportional to 1/divisor that is a whole-image
+            // brightening: the fade-from-black blowout, and the "adapt jumps crazily" step.
+            // With the floor, content at or below the stated peak moves nothing at all, and
+            // only a genuine excursion above it buys compression.
+            gtScenePeak = lerp(maxCLL, max(maxCLL, hableScenePeakNits), saturate(gt7Adapt));
         }
         const float gtGain = kGT7RangeFit * refNits / max(gtScenePeak, 1.0f);
+        // gtScenePeak MUST carry the fast running-max guard. A placement/protection split
+        // that divided the gain by the scene-locked anchor alone was tried and reverted
+        // 2026-10-04: it blew the highlights completely, because the pre-compressor knee
+        // has no authority over content aimed far above the ceiling. The brightness step
+        // that follows from a tracking gain is the price of not blowing out, and it is
+        // paid here deliberately — see the note at the guard's definition in Render().
 
         // Into the operator's own units, where the ceiling is sdrNits.
         float3 adapted = color.rgb * sdrNits * gtGain;
