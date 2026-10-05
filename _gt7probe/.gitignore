@@ -1,0 +1,14 @@
+# What is worth keeping here is the SOURCE and the REPORTS.
+
+# Build output — regenerable by run_probe.bat / the cl command line in each file's header.
+*.exe
+*.obj
+
+# Sweep tables: derived from the .cpp in seconds, and large enough to be noise in a diff.
+*.csv
+
+# Captured frames. Deliberately excluded for two separate reasons: 72 MB of raw
+# rgb48 is not what a source tree is for, and these are decoded frames from a
+# commercial Blu-ray — reproducible with the ffmpeg command lines recorded in
+# curve_probe.cpp / curve_solve.cpp, so there is no reason for them to live here.
+frames/

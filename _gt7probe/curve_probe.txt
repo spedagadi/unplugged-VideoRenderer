@@ -1,0 +1,37 @@
+﻿# decode calibration (PQ code -> nits, via Polyphony's eotfSt2084)
+   code 0.4000 ->     32.45 nits
+   code 0.5000 ->     92.24 nits
+   code 0.5811 ->    203.80 nits
+   code 0.7519 ->   1000.66 nits
+   code 0.9000 ->   3905.65 nits
+
+# source luminance distribution, CONTENT ROWS ONLY (nits, BT.2020 luma)
+file            bars  mean     p1     p5     p10    p25    p50    p75    p90    p95    p99    p99.5  p99.9      max   max/p50
+e00060.raw       70+ 70    8.53         0.0     0.0     0.0     0.0     0.0     0.0    12.5    71.1   163.5   178.4   205.6    289.2  69573.5
+e00300.raw       70+ 70   35.64         0.1     0.4     0.7     2.0     4.2    38.4   103.2   203.1   303.0   312.9   319.8    442.1    11.5
+e00900.raw       70+ 70   66.20         0.0     0.7     5.4    20.2    42.0    88.8   160.5   232.2   304.5   327.7   368.7    495.7     5.6
+e01500.raw       70+ 70  108.63         0.5     1.3     2.1     7.7    31.8   204.3   335.1   368.7   397.0   401.2   474.9    480.1     2.3
+e02100.raw       70+ 70   38.13         0.1     0.2     0.3     1.2     7.3    54.5   128.9   166.6   245.7   273.8   315.5    593.9    10.9
+e02700.raw       70+ 70   35.32         0.0     0.0     0.1     0.8    26.8    59.4    97.4   110.7   130.7   135.2   142.9    157.2     2.6
+e03300.raw       70+ 70   67.01         0.2     0.5     0.9     2.9    23.3   128.1   162.3   188.5   230.7   265.7   357.5    794.5     6.2
+e03900.raw       70+ 70   97.61         0.1     0.2     0.3     0.8     4.9   211.9   267.2   351.6   452.3   471.4   491.7   1066.3     5.0
+e04500.raw       70+ 70   11.03         0.1     0.2     0.3     0.5     1.3     5.6    23.0    47.3   178.8   245.0   436.4    919.4   165.2
+e05100.raw       70+ 70    2.58         0.1     0.1     0.1     0.3     0.6     1.8     5.5    11.2    33.2    47.5    93.4    226.9   128.0
+e05700.raw       70+ 70   23.75         0.0     0.1     0.2     1.2     8.3    30.5    79.4    90.1   120.3   129.4   143.8    540.2    17.7
+e06000.raw       70+ 70    4.82         0.1     0.1     0.1     0.6     1.2     6.1    11.9    15.5    49.9    67.8    84.2    295.0    48.1
+
+# spread across these frames — what any per-frame solver must track
+   p1            0.0 ..       0.5 nits   (562.6:1 across frames)
+   p25           0.0 ..      20.2 nits   (10273.5:1 across frames)
+   p50           0.0 ..      42.0 nits   (14204.3:1 across frames)
+   p90           5.5 ..     335.1 nits   (61.5:1 across frames)
+   p95          11.2 ..     368.7 nits   (32.9:1 across frames)
+   p99          33.2 ..     452.3 nits   (13.6:1 across frames)
+   p99.5        47.5 ..     471.4 nits   (9.9:1 across frames)
+   p99.9        84.2 ..     491.7 nits   (5.8:1 across frames)
+   max         157.2 ..    1066.3 nits   (6.8:1 across frames)
+   mean          2.6 ..     108.6 nits   (42.2:1 across frames)
+
+# frames sampled: 12
+# next: solve a monotone curve with knots at these percentile positions
+#       and report max |delta code| between consecutive frames.

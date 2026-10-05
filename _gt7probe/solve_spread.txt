@@ -1,0 +1,31 @@
+﻿# house targets: mean=0.30@20nits damped^0.16  p99.5>=0.85  clip<=0.100%
+file            srcMean  tgtMean  delMean  delP50  delP995  clip%   maxCd
+e00060.raw         8.54    0.262    0.262    0.201    0.909  0.000   0.946
+e00300.raw        35.64    0.329    0.329    0.149    0.930  0.000   0.958
+e00900.raw        66.20    0.363    0.366    0.338    0.850  0.000   0.906
+e01500.raw       108.64    0.393    0.446    0.557    0.845  0.000   0.878
+e02100.raw        38.13    0.333    0.339    0.182    0.896  0.000   0.946
+e02700.raw        35.32    0.329    0.337    0.377    0.848  0.000   0.883
+e03300.raw        67.01    0.364    0.398    0.482    0.846  0.000   0.956
+e03900.raw        97.62    0.387    0.388    0.160    0.850  0.000   0.872
+e04500.raw        11.03    0.273    0.273    0.192    0.895  0.000   0.973
+e05100.raw         2.57    0.216    0.214    0.196    0.850  0.019   0.994
+e05700.raw        23.75    0.308    0.311    0.238    0.849  0.001   0.992
+e06000.raw         4.82    0.239    0.241    0.180    0.849  0.000   0.988
+
+# curve motion between consecutive frames (max |delta code| over the grid)
+   e00060.raw     -> e00300.raw      max|dcode| = 0.1730  (44.1 codes)
+   e00300.raw     -> e00900.raw      max|dcode| = 0.2894  (73.8 codes)
+   e00900.raw     -> e01500.raw      max|dcode| = 0.3220  (82.1 codes)
+   e01500.raw     -> e02100.raw      max|dcode| = 0.1918  (48.9 codes)
+   e02100.raw     -> e02700.raw      max|dcode| = 0.1654  (42.2 codes)
+   e02700.raw     -> e03300.raw      max|dcode| = 0.1837  (46.8 codes)
+   e03300.raw     -> e03900.raw      max|dcode| = 0.1323  (33.7 codes)
+   e03900.raw     -> e04500.raw      max|dcode| = 0.1726  (44.0 codes)
+   e04500.raw     -> e05100.raw      max|dcode| = 0.1712  (43.7 codes)
+   e05100.raw     -> e05700.raw      max|dcode| = 0.2445  (62.4 codes)
+   e05700.raw     -> e06000.raw      max|dcode| = 0.1617  (41.2 codes)
+
+   worst motion in this set: 0.3220 (82.1 codes)
+   for reference: 1 code at 8-bit is ~0.4% of range; the current shipping
+   chain's visible pump was measured as a multi-code crawl over ~1s.

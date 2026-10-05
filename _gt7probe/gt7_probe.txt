@@ -1,0 +1,137 @@
+# GT7 parameterisation probe (v2)
+# operator constants: knee=0.444*ceiling  toe=53.8nits(abs)  C(ceiling)=0.835*ceiling  clamp binds at 2.046*ceiling
+# white target for the auto-gain candidates: 0.70 code
+
+## fidelity oracle (Polyphony's own SDR case, ceiling 250, input fb 0.5/1.23/0.75)
+   out = 0.1996 0.4907 0.2996   <- the HLSL port must reproduce these
+
+## port fidelity - Shaders/convert/gt7_tonemap.hlsl vs applyToneMapping
+   worst channel error over 7 ceilings x 6 colours: 3.916e-04 nits
+   targetI shortcut (I of a grey == its PQ code) error: 0.000e+00
+   PORT MATCHES - the nits-domain translation is exact
+
+## candidates at sdrNits=85 refWhite=225 scenePeak=1000
+   name               gain   whiteCd  peakCd   midCd   mTop  clip%   dPfit  dPnofit   dW    dirOK
+   V  verbatim        1.000    0.896   1.000   0.836  1.00  39.3     0.0      0.0    0.0      NO
+   H1 physical        1.000    1.000   1.000   1.000  1.00  64.6   169.8    169.8    0.0     yes
+   H2 peak-fit        0.085    0.464   0.921   0.405  0.84   0.0    31.2     31.2    0.0      NO
+   H3 white-knee      0.168    0.688   1.000   0.607  1.00  13.6    31.2     31.2   90.2      NO
+   H4 refWhite-ceil   1.000    0.921   1.000   0.865  2.65  70.8    58.7    181.3   80.9     yes
+   H5 double-anchor   0.460    0.965   1.000   0.915  1.00  47.9   169.8    169.8   90.2     yes
+   H6 knee+softplus   0.168    0.688   0.955   0.607  0.90   0.0    31.2     31.2   90.2      NO
+   H7 auto-white      0.172    0.700   1.000   0.616  1.00  14.8    31.2     31.2   90.2      NO
+   H8 auto+softplus   0.172    0.700   0.959   0.616  0.91   0.0    31.2     31.2   90.2      NO
+   H9 P-free white    0.172    0.700   1.000   0.616  1.00  14.8   169.8    169.8   90.2     yes
+   H10 Pfree+softplus   0.172    0.700   0.959   0.616  0.91   0.0   158.0    158.0   90.2     yes
+
+   dPfit/dPnofit = largest code change over sdrNits 25..400, with and without the
+                 /mTop fit. The gap IS the cancellation (T2).
+   dW            = largest code change over refWhite 100..300.
+   <= ~2 codes   = an inert dial on screen.
+
+## clipped fraction of the source range (fit on)
+   name               S=300    S=1000    S=4000
+   V  verbatim          0.0%    39.3%    69.6%
+   H1 physical         35.4%    64.6%    82.1%
+   H2 peak-fit          0.0%     0.0%     0.0%
+   H3 white-knee        0.0%    13.6%    56.8%
+   H4 refWhite-ceil    46.7%    70.8%    85.2%
+   H5 double-anchor    47.9%    47.9%    47.9%
+   H6 knee+softplus     0.0%     0.0%    40.9%
+   H7 auto-white        0.0%    14.8%    57.2%
+   H8 auto+softplus     0.0%     0.0%    41.6%
+   H9 P-free white     14.8%    14.8%    14.8%
+   H10 Pfree+softplus     0.0%     0.0%     0.0%
+
+## code value by band, as sdrNits moves (refWhite=225 scenePeak=1000)
+   band = fraction of the content peak. Hable row is the shipping branch
+   modelled with the live settings (hlN=0, chromaExp=1.01).
+   --- sdrNits = 25 ---
+     Hable(shipping)      0.366   0.614   0.800   0.927   1.000   clip 77.4%
+     H1 physical          1.000   1.000   1.000   1.000   1.000   clip 80.5%
+     H2 peak-fit          0.159   0.337   0.545   0.828   0.921   clip  0.0%
+     H3 white-knee        0.237   0.507   0.861   0.989   1.000   clip 13.6%
+     H4 refWhite-ceil     0.505   0.865   1.000   1.000   1.000   clip 83.3%
+     H5 double-anchor     0.901   1.000   1.000   1.000   1.000   clip 71.6%
+     H6 knee+softplus     0.237   0.507   0.851   0.906   0.955   clip  0.0%
+     H7 auto-white        0.240   0.516   0.869   0.994   1.000   clip 14.8%
+     H8 auto+softplus     0.240   0.516   0.853   0.910   0.959   clip  0.0%
+     H9 P-free white      0.498   0.969   1.000   1.000   1.000   clip 53.7%
+     H10 Pfree+softplus   0.498   0.893   1.000   1.000   1.000   clip 37.0%
+   --- sdrNits = 85 ---
+     Hable(shipping)      0.366   0.614   0.800   0.927   1.000   clip 54.9%
+     H1 physical          0.778   1.000   1.000   1.000   1.000   clip 64.6%
+     H2 peak-fit          0.187   0.405   0.648   0.828   0.921   clip  0.0%
+     H3 white-knee        0.281   0.607   0.861   0.989   1.000   clip 13.6%
+     H4 refWhite-ceil     0.505   0.865   1.000   1.000   1.000   clip 70.8%
+     H5 double-anchor     0.519   0.915   1.000   1.000   1.000   clip 47.9%
+     H6 knee+softplus     0.281   0.607   0.851   0.906   0.955   clip  0.0%
+     H7 auto-white        0.286   0.616   0.869   0.994   1.000   clip 14.8%
+     H8 auto+softplus     0.286   0.616   0.853   0.910   0.959   clip  0.0%
+     H9 P-free white      0.286   0.616   0.869   0.994   1.000   clip 14.8%
+     H10 Pfree+softplus   0.286   0.616   0.853   0.910   0.959   clip  0.0%
+   --- sdrNits = 400 ---
+     Hable(shipping)      0.282   0.473   0.616   0.714   0.770   clip  0.0%
+     H1 physical          0.389   0.696   0.921   1.000   1.000   clip 23.3%
+     H2 peak-fit          0.236   0.459   0.659   0.828   0.921   clip  0.0%
+     H3 white-knee        0.347   0.625   0.861   0.989   1.000   clip 13.6%
+     H4 refWhite-ceil     0.389   0.666   0.770   0.770   0.770   clip  0.0%
+     H5 double-anchor     0.257   0.489   0.703   0.867   0.953   clip  0.0%
+     H6 knee+softplus     0.347   0.625   0.851   0.906   0.955   clip  0.0%
+     H7 auto-white        0.351   0.633   0.869   0.994   1.000   clip 14.8%
+     H8 auto+softplus     0.351   0.633   0.853   0.910   0.959   clip  0.0%
+     H9 P-free white      0.141   0.305   0.450   0.580   0.682   clip  0.0%
+     H10 Pfree+softplus   0.141   0.305   0.450   0.580   0.682   clip  0.0%
+   madVR semantics want the LOWER target to sit HIGHER in the mid bands
+   (0.18/0.40) and to compress the top band more.
+
+## WARMTH - the question that started this. yellow-delta in 8-bit codes,
+## positive = warm. Source is the measured Everest head (223,221,176) at the
+## stated level; sdrNits=85 refWhite=225 scenePeak=1000.
+   level    Hable(shipping)   then each GT7 candidate
+     100 nits   Hable  +19.52   V  verbatim +16.88   H1 physical +17.66   H2 peak-fit  +8.47   H3 white-knee +12.56   H4 refWhite-ceil +25.49   H5 double-anchor +19.67   H6 knee+softplus +12.56   H7 auto-white +12.76   H8 auto+softplus +12.76   H9 P-free white +12.76   H10 Pfree+softplus +12.76
+     150 nits   Hable  +22.88   V  verbatim +19.25   H1 physical  +0.00   H2 peak-fit +10.72   H3 white-knee +15.70   H4 refWhite-ceil +23.92   H5 double-anchor +20.04   H6 knee+softplus +15.70   H7 auto-white +15.91   H8 auto+softplus +15.91   H9 P-free white +15.91   H10 Pfree+softplus +15.91
+     225 nits   Hable  +25.49   V  verbatim +20.15   H1 physical  +0.00   H2 peak-fit +13.53   H3 white-knee +19.48   H4 refWhite-ceil +21.50   H5 double-anchor +16.89   H6 knee+softplus +19.48   H7 auto-white +19.54   H8 auto+softplus +19.54   H9 P-free white +19.55   H10 Pfree+softplus +19.55
+     400 nits   Hable  +25.49   V  verbatim  +7.20   H1 physical  +0.00   H2 peak-fit +18.05   H3 white-knee +19.99   H4 refWhite-ceil  +0.64   H5 double-anchor  +0.00   H6 knee+softplus +16.41   H7 auto-white +20.04   H8 auto+softplus +14.70   H9 P-free white +20.04   H10 Pfree+softplus +14.71
+     700 nits   Hable  +25.49   V  verbatim  +0.00   H1 physical  +0.00   H2 peak-fit +19.71   H3 white-knee +13.61   H4 refWhite-ceil  +0.00   H5 double-anchor  +0.00   H6 knee+softplus  +9.36   H7 auto-white +12.81   H8 auto+softplus  +9.61   H9 P-free white +12.81   H10 Pfree+softplus  +9.62
+    1000 nits   Hable  +25.50   V  verbatim  +0.00   H1 physical  +0.00   H2 peak-fit +19.98   H3 white-knee  +0.00   H4 refWhite-ceil  +0.00   H5 double-anchor  +0.00   H6 knee+softplus +11.08   H7 auto-white  +0.00   H8 auto+softplus +11.02   H9 P-free white  +0.00   H10 Pfree+softplus +11.02
+
+   A NEGATIVE shift versus Hable = less warm = the improvement being sought.
+   Note GT7's chroma fade acts on I/targetI in PQ CODES, so it engages far
+   lower in nits than the 0.98/1.16 window suggests.
+
+## chroma fade window, in SOURCE NITS (ceiling = refWhite = 225)
+   I/targetI = 0.50  ->      9.5 nits
+   I/targetI = 0.90  ->    127.1 nits
+   I/targetI = 0.98  ->    201.0 nits
+   I/targetI = 1.00  ->    225.0 nits
+   I/targetI = 1.16  ->    546.0 nits
+   I/targetI = 1.40  ->   2011.6 nits
+
+## Hable vs GT7 as the shader runs it (frozen fit)  sdrNits=85 scenePeak=1000
+   refWhite    code@W        code@180nits    code@400nits     mean50-400
+              Hable   GT7    Hable   GT7    Hable   GT7    Hable    GT7
+      203      0.652  0.622    0.625  0.582    0.809  0.841    0.617  0.577  gt7 darker
+      225      0.665  0.700    0.614  0.616    0.800  0.853    0.606  0.606  GT7 BRIGHTER
+      250      0.679  0.765    0.603  0.653    0.792  0.861    0.596  0.635  GT7 BRIGHTER
+      280      0.695  0.831    0.592  0.699    0.783  0.871    0.585  0.664  GT7 BRIGHTER
+      300      0.706  0.853    0.585  0.720    0.778  0.878    0.579  0.682  GT7 BRIGHTER
+
+   If GT7's code@W CLIMBS as refWhite rises while Hable's falls, the slider
+   has OPPOSITE SENSE on the two curves — not merely a constant offset.
+
+## official GT7 as shipped - ceiling = sdrNits, no gain, no pre-fit
+   scenePeak=1000
+   sdrNits     50nit   180nit   400nit   700nit  1000nit     clip    code@250   mean50-400
+       50     0.921    1.000    1.000    1.000    1.000    72.8%     1.000       0.996
+       85     0.778    1.000    1.000    1.000    1.000    64.6%     1.000       0.971
+      150     0.607    0.962    1.000    1.000    1.000    52.9%     1.000       0.906
+      250     0.481    0.836    1.000    1.000    1.000    39.3%     0.921       0.806
+      400     0.389    0.696    0.921    1.000    1.000    23.3%     0.796       0.685
+
+   initializeAsHDR documents its valid range as 250..10000 nits, because the
+   curve constants assume a 250-nit paper white. Below that the ~2:1 shoulder
+   cannot span target..peak, so the top of the range flattens. That is the
+   operator working exactly as written, not a fault in the port.
+
+ wrote gt7_probe.csv
