@@ -1660,8 +1660,14 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// An external player (Oppo, UB820) has consumed the RPU and emitted a
 		// display-referred PQ signal; running a creative curve over it is double tone
 		// mapping. Identity transfer is what remains, with the Zion grade on top.
+		// Reference (Hable) is included because it is the DV default: Hable maps
+		// highlights to the target sdr nits better than any other curve on DV content
+		// (validated by the user across profiles), but on PLAYER-mapped DV it would be a
+		// second creative grade over an already-graded signal. The fingerprint decides
+		// which of the two Reference does: transfer, or Hable.
 		m_bDvIdentity =
-			(m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT) &&
+			(m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT ||
+			 m_iHdrLocalToneMappingType == TONE_CURVE_REFERENCE) &&
 			(m_srcExFmt.VideoTransferFunction == 15 /* PQ */) &&
 			(m_srcExFmt.VideoPrimaries == 9 /* BT.2020 */) &&
 			!m_Dovi.bValid &&

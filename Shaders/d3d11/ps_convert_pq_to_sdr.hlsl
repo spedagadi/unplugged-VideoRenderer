@@ -336,10 +336,19 @@ float4 main(PS_INPUT input) : SV_Target
     // Bounded, NOT `> 6.5`: 8 (GT7) is also above 6.5 and would silently render as
     // the reference curve. Any future selection has to be added to this test.
     if (toneCurveSelection > 6.5 && toneCurveSelection < 7.5) {
+        // On player-mapped DV this branch TRANSFERS instead of grading: Hable over an
+        // already-graded signal is the double map that produced every "blown/washed"
+        // report on that path. The fingerprint (see the CPU side) decides; dvIdentity
+        // carries it here. Same scalar, same rule as the GT7 Adapt branch.
+        if (dvIdentity > 0.5) {
+            const float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
+            color.rgb = saturate(color.rgb * (sdrNits / max(identityPeak, 100.0)) * expTrimGain);
+        } else {
         // Exposure trim first: an input gain, so +N pushes content up INTO the curve and
         // the shoulder takes the highlights, instead of an output gain that would clip
         // them. 1.0 (trim 0) is a no-op multiply and costs nothing.
         color.rgb = ToneMappingHable(color.rgb * expTrimGain);
+        }
 
         if (outputGamut < 0.5) {
             color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
