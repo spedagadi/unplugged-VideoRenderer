@@ -148,6 +148,17 @@ enum :int {
 	// Deliberately a SEPARATE selection rather than a replacement: it can be A/B'd
 	// against GT7 Adapt on the same live video, and the existing curves are untouched.
 	TONE_CURVE_DYNAMIC_AUTO = 11,
+	// 12 = IDENTITY TRANSFER. For content that has ALREADY been tone mapped upstream —
+	// Dolby Vision P7 played by an external player (Oppo, UB820), which consumes the
+	// RPU itself and emits a display-referred PQ signal with no static metadata left.
+	// Running a creative curve over that is double tone mapping; what remains is a
+	// transfer: the player's reference white becomes ours, by one scalar, plus the
+	// gamut work every SDR output needs.
+	//
+	// The one number it needs is the peak the PLAYER mapped to, which is a property of
+	// OUR capture chain (the EDID the sink presents), not of the content — so it is a
+	// configured constant, stated once, and never per title.
+	TONE_CURVE_IDENTITY  = 12,
 };
 
 #define SDR_NITS_DEF 50
@@ -482,6 +493,43 @@ struct Settings_t {
 	// picture. Diagnostic only; 0 is the normal picture. APPENDED (binary boundary).
 	float fHdrGt7Dbg = 0.0f;
 
+	// IDENTITY TRANSFER (TONE_CURVE_IDENTITY): the peak in nits that the UPSTREAM
+	// player mapped its output to. The transfer is one scalar — player white becomes
+	// panel white — so this is the only number the path needs, and it describes the
+	// capture chain (the EDID the sink presents to the player), not the content.
+	// Default 1000: the peak an HDR sink EDID normally advertises. APPENDED (binary
+	// boundary), so older callers see 0 and the renderer falls back to the default.
+	float fHdrIdentityPeakNits = 1000.0f;
+
+	// EXPOSURE TRIM, in thirds of a stop, -3..+3 (i.e. -1..+1 stop). A TASTE control,
+	// deliberately stepped and deliberately small: it is the answer to "a bit brighter
+	// / a bit darker" that does not require knowing a nits value.
+	//
+	// Applied as an INPUT gain (2^(trim/3)) before the curve, not as an output gain.
+	// Brightening after the curve clips; brightening before it pushes content up into
+	// the shoulder, which is what the shoulder is for, so the highlight handling
+	// degrades gracefully instead of falling off a cliff. APPENDED (binary boundary).
+	int iHdrExposureTrim = 0;
+
+	// S-CURVE TASTE, -5..5 each, applied in sRGB code space after the transfer and after
+	// gamut mapping, on Reference and on the DV identity transfer:
+	//
+	//   shadowLift  SHADOW DETAIL, not a black lift: c' = 1-(1-c)^q with q = 4^(v/5).
+	//               +5 spreads dark values apart (slope q at black) so shadow texture
+	//               becomes visible, black staying pinned at 0 and white at 1; -5
+	//               crushes shadows and opens highlights. An additive lift was tried
+	//               and rejected: it greys the image without adding any detail.
+	//   punch       blends toward (or away from) a smoothstep S about mid code: +5 is
+	//               the punchy/dark render, -5 the flat one.
+	//
+	// Both are monotone across their whole range by construction (the derivatives are
+	// bounded away from zero at the extremes), so no setting can invert or band the
+	// image. They are taste, they default to 0 = exact no-op, and they are deliberately
+	// on the two paths that have no other shape control — GT7 and the solved curve keep
+	// their own, validated shapes. APPENDED (binary boundary).
+	int iHdrShadowLift = 0;
+	int iHdrPunch      = 0;
+
 	// AUTO EXPOSURE. refWhite has been a per-title hand dial: Everest wants ~80, a
 	// dark indoor master wants ~200, and nothing in the metadata says which (this
 	// title's MaxFALL of 944 on an indoor drama is bogus; the maxFALL-derived formula
@@ -658,6 +706,10 @@ struct Settings_t {
 		fHdrRefWhiteTarget              = 0.42f;
 		bMLController                   = false;
 		fCtlWhiteNits                   = 203.0f;
+		fHdrIdentityPeakNits            = 1000.0f;
+		iHdrExposureTrim                = 0;
+		iHdrShadowLift                  = 0;
+		iHdrPunch                       = 0;
 	}
 };
 

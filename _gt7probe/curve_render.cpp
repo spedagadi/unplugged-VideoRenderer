@@ -64,7 +64,7 @@ static const double kDamp       = 0.16;
 static const double kP995Floor  = 0.85;
 static const double kM50        = 0.24;
 static const double kM995       = 0.90;
-static const double kMeanYield  = 0.10;
+static const double kShadowTarget = 0.118;   // where source p25 should land (GT7 measured)
 // Gamut capacity target. 1.0 = map to the boundary exactly (no extra compression) —
 // the honest first test of "does the constraint, not the clamp, recover the detail".
 // The shipping dial measured ~0.55 against madVR on the Everest sky; that is a house
@@ -84,11 +84,12 @@ static int BinOf(double n)
     return std::min(std::max(b, 0), kHBins - 1);
 }
 
-struct AParam { double k, x0, g; };
+struct AParam { double k, x0, g, p; };
 static inline double APEval(const AParam& a, double nits)
 {
     if (nits <= 0.0) return 0.0;
-    return 1.0 - std::exp(-a.k * std::pow(nits / a.x0, a.g));
+    const double b = 1.0 - std::exp(-a.k * std::pow(nits / a.x0, a.g));
+    return std::pow(std::max(b, 0.0), a.p);
 }
 
 static double MeanOf(const AParam& a, const Hist& h)
@@ -117,30 +118,37 @@ static AParam Solve(const Hist& h, double srcMean, double p50, double p995)
     a.g = std::log(std::log(1.0 / (1.0 - kM995)) / std::log(1.0 / (1.0 - kM50)))
         / std::log(p995 / p50);
     a.x0 = p995;
+    // Mirrors SolveDynamicAutoCurve after the toe: g from the mean target, p from the
+    // shadow anchor (allowed below 1, i.e. a lift), k closed form from the highlight
+    // anchor. The earlier floor/ceiling clamp on k is gone — it was the accidental
+    // regulator that hid the once-a-second pump.
     const double tMean = kMeanAtRef * std::pow(std::max(srcMean, 0.05) / kRefSrcNits, kDamp);
-    double lo = 1e-6, hi = 1e6;
-    for (int it = 0; it < 60; ++it) {
-        const double mid = std::sqrt(lo * hi); a.k = mid;
-        if (MeanOf(a, h) > tMean) hi = mid; else lo = mid;
-    }
-    a.k = std::sqrt(lo * hi);
-    if (P995Of(a, h) < kP995Floor) {
-        double klo = a.k, khi = a.k * 64.0;
-        for (int it = 0; it < 50; ++it) {
-            const double mid = std::sqrt(klo * khi); a.k = mid;
-            if (P995Of(a, h) >= kP995Floor) khi = mid; else klo = mid;
+    auto codeAt = [&](double gg, double pp, double Y) {
+        const double kk = -std::log(1.0 - std::pow(kM995, 1.0 / pp));
+        const double b = 1.0 - std::exp(-kk * std::pow(std::max(Y, 0.0) / p995, gg));
+        return std::pow(std::max(b, 0.0), pp);
+    };
+    auto meanAt = [&](double gg, double pp) {
+        double acc = 0.0;
+        for (int i = 0; i < kHBins; ++i) if (h.count[i] > 0.0) acc += h.count[i] * codeAt(gg, pp, h.centre[i]);
+        return acc / h.total;
+    };
+    auto solveP = [&](double gg) {
+        double lo = 0.25, hi = 8.0;
+        for (int it = 0; it < 34; ++it) {
+            const double mid = std::sqrt(lo * hi);
+            if (codeAt(gg, mid, p50) > kShadowTarget) lo = mid; else hi = mid;
         }
-        a.k = std::sqrt(klo * khi);
-        if (MeanOf(a, h) > tMean + kMeanYield) {
-            const double cap = tMean + kMeanYield;
-            double mlo = 1e-6, mhi = a.k;
-            for (int it = 0; it < 50; ++it) {
-                const double mid = std::sqrt(mlo * mhi); a.k = mid;
-                if (MeanOf(a, h) > cap) mhi = mid; else mlo = mid;
-            }
-            a.k = std::sqrt(mlo * mhi);
-        }
+        return std::sqrt(lo * hi);
+    };
+    double glo = 0.20, ghi = 2.5;
+    for (int it = 0; it < 40; ++it) {
+        const double gm = std::sqrt(glo * ghi);
+        if (meanAt(gm, solveP(gm)) > tMean) glo = gm; else ghi = gm;
     }
+    a.g = std::sqrt(glo * ghi);
+    a.p = solveP(a.g);
+    a.k = -std::log(1.0 - std::pow(kM995, 1.0 / a.p));
     return a;
 }
 

@@ -585,8 +585,15 @@ private:
 	// inherits it instead of needing its own guard. It is re-solved at scene lock,
 	// not per frame, so a flare cannot walk the whole image.
 	float m_MLQuantiles[ML_QUANT_N] = {};   // source PQ at 33 evenly spaced quantiles
-	float m_fDynG  = 0.0f;                  // contrast, from p99.5/p50
-	float m_fDynK  = 0.0f;                  // placement, from the mean target
+	// ...and the LATCHED copy the curve is solved from. The solve integrates the mean
+	// target over this table; feeding it the live table made g chase the frame's own
+	// distribution to hold a target that was locked, which is a contrast pump wearing
+	// a stable brightness as a disguise. Measured on a 60 s window at 2 fps: delMean
+	// flat at 0.353 while g wandered 1.08..1.88 inside one shot.
+	float m_MLQuantilesLocked[ML_QUANT_N] = {};
+	float m_fDynG  = 0.0f;                  // shape, solved from the mean target
+	float m_fDynK  = 0.0f;                  // placement, closed form from the highlight
+	float m_fDynP  = 1.0f;                  // toe exponent, solved from the shadow anchor
 	float m_fDynX0 = 0.0f;                  // highlight anchor, nits
 	bool  m_bDynValid = false;              // a solve has completed with sane inputs
 
@@ -597,13 +604,23 @@ private:
 	static constexpr float kDynMeanAtRef  = 0.30f;  // delivered mean code at a 20-nit source
 	static constexpr float kDynRefNits    = 20.0f;
 	static constexpr float kDynDamp       = 0.16f;  // mean target's response to scene level
-	static constexpr float kDynP995Floor  = 0.85f;  // highlight preservation, minimum
-	static constexpr float kDynP995Ceil   = 0.94f;  // ...and maximum: without it a bright
-	                                                 // scene pushes p99.5 against the
-	                                                 // asymptote and crushes the top
-	static constexpr float kDynM50        = 0.24f;  // shape anchors (madVR's accepted
-	static constexpr float kDynM995       = 0.90f;  // Everest grab reads 0.24 / 0.89)
-	static constexpr float kDynMeanYield  = 0.10f;  // how far the mean may be sacrificed
+	static constexpr float kDynHighTarget   = 0.90f;  // where the scene peak lands
+	static constexpr float kDynShadowTarget = 0.118f; // where source p25 lands. Measured,
+	                                                  // not chosen: GT7 Adapt's accepted
+	                                                  // render of the same frame puts its
+	                                                  // p25 at 30/255 = 0.118, and that
+	                                                  // shadow mass is what "punch" is.
+
+	// A black point was designed here on 2026-10-06 and deleted before shipping, and
+	// the arithmetic that killed it is worth keeping visible. The claim was that the
+	// curve spends its code range on visually-black nits and that lifting black would
+	// restore mid-tone slope. Checked against a real scene (mean 1.9 nits, peak 684):
+	// a black point at 0.25 of the mean moves the mean's elasticity from 0.066 to
+	// 0.062 — nothing. The "18% of the normalised range" figure that justified it was
+	// computed in LOG space while the curve's input is LINEAR nits, so it was a
+	// quarter of one nit against a 360:1 span. The flatness is real, but it is the
+	// mean TARGET sitting too high (0.206 vs GT7's measured 0.133 on the same frame),
+	// not the family lacking a toe. Do not re-add a black point without measuring.
 	// Spike test (2026-09-22): a cut is a DISCONTINUITY — the frame's delta
 	// dominates its recent 4-frame baseline, so occlusion and camera reframes
 	// (a ramp) cannot trip it, however far p99.5 wanders. (The slow re-anchor
@@ -627,6 +644,10 @@ private:
 	// opens dark (fade from black) has no peak to measure yet, and locking the normaliser
 	// there under-estimates it for the whole scene, which is the destructive direction.
 	float m_fScenePeakMaxNits = 0.0f;
+	// The scene peak as the curve sees it: provisional at an accepted cut, frozen at
+	// the lock, untouched until the next accepted cut. The running max above is a fast
+	// quantity and must not reach a solved curve directly.
+	float m_fScenePeakLockNits = 0.0f;
 	// Debounce for the true-max ceiling guard: a candidate peak must be seen on three
 	// consecutive frames before it raises the ceiling, so a grain spike cannot pin the
 	// normaliser high while a real flare (which repeats) can.
@@ -654,6 +675,11 @@ private:
 	// GT7 Adapt (TONE_CURVE_GT7_ADAPT): weight of the measured scene peak in the
 	// peak this curve maps FROM. 0 = plain GT7. cbuffer[24].
 	float m_fHdrGt7Adapt     = 0.25f;
+	// DV-already-mapped: an external player consumed the RPU and emitted display-
+	// referred PQ with no static metadata left. GT7 Adapt then transfers instead of
+	// tone maps (see cbuffer[34] and the shader branch), and the band controller stands
+	// down because its mirror models the GT7 curve, not identity.
+	bool  m_bDvIdentity      = false;
 	// The weight actually sent to the shader, and actually used by the CPU mirror.
 	// Equals the dial when the signal states its own content peak; forced to 1.0 when
 	// it does not, because a metadata-less `cll` is the Title peak fallback and a
@@ -666,6 +692,12 @@ private:
 	// GT7 debug view: 0 off, 1 chromaScale, 2 fade ratio, 3 knee crossing,
 	// 4 ceiling crossing. Renders that quantity as greyscale instead of the picture.
 	float m_fHdrGt7Dbg       = 0.0f;
+	// Peak the upstream player mapped its DV output to (identity transfer). Describes
+	// the capture chain's EDID, not the content; configured once.
+	float m_fHdrIdentityPeakNits = 1000.0f;
+	int   m_iExposureTrim        = 0;      // thirds of a stop, -5..+5; input gain 2^(t/3)
+	int   m_iShadowLift          = 0;      // -5..5, toe lift in code space
+	int   m_iPunch               = 0;      // -5..5, S-curve blend in code space
 	// Joint band controller (see Settings_t::bMLController). Solved values, smoothed.
 	// S = shadow toe slope (1 = off), G = gamma, R = highlight rolloff.
 	bool  m_bMLController = false;

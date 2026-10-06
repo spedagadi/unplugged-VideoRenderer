@@ -115,9 +115,31 @@ cbuffer PS_PARAMETERS : register(b0)
     // picture, so a spatial seam in any of them is visible directly rather than
     // inferred. cbuffer[32]; buffer is 36 floats / 144 bytes.
     float gt7Dbg;
-    float _padD0;
-    float _padD1;
-    float _padD2;
+    // Fourth Dynamic & Auto parameter: the toe exponent. The base curve
+    // 1-exp(-k u^g) is concave everywhere — it compresses from the first nit and so
+    // has no S, which measured as 0.00% of pixels below code 16 against GT7's 6.56%
+    // and a p10 of 126 against GT7's 19. Raising the output to p>1 crushes the low
+    // end while leaving the asymptote alone. Takes slot 33's padding.
+    float dynP;
+    // 1 = the source is Dolby Vision that an external player has ALREADY mapped to the
+    // sink: display-referred PQ with the RPU consumed and no static metadata left. GT7
+    // Adapt then transfers rather than tone maps — a second creative curve over an
+    // already-graded signal is double tone mapping, which is what the blown/washed
+    // Oppo frames were. Slot 34's padding.
+    float dvIdentity;
+    // The peak the upstream player mapped to, in nits. Only read when dvIdentity is
+    // set. Buffer is 40 floats / 160 bytes.
+    float identityPeak;
+    // Exposure trim as a precomputed INPUT gain, 2^(trim/3), trim in thirds of a stop
+    // over -3..+3. Applied before the curve so brightening is absorbed by the shoulder
+    // rather than clipping after it. Slot 36.
+    float expTrimGain;
+    // S-curve taste, normalised -1..1: shadow lift and punch. Shaped in sRGB code
+    // space after the transfer and after gamut mapping, because that is the space the
+    // eye and every measurement of "punch" live in. Slots 37/38.
+    float shadowLift;
+    float punch;
+    float _padE3;
 };
 
 #include "../convert/conv_matrix.hlsl"
@@ -246,6 +268,39 @@ float3 ToneMapSelectedCurve(float3 nits, float sdrNits)
     return saturate((mapped - displayMinNits) / max(sdrNits - displayMinNits, 1e-3));
 }
 
+// -----------------------------------------------------------------------------
+// S-CURVE TASTE: shadow DETAIL and punch, in sRGB code space.
+//
+// SHADOW DETAIL IS A SLOPE, NOT A LIFT. The first version of this added
+// lift*0.25*(1-c)^3 — an additive black-point lift. That raises the floor and greys
+// the image; it does not separate adjacent dark values, so it buys milkiness and no
+// detail, which is exactly the complaint it earned. What "see more in the shadows"
+// means is more DERIVATIVE in the dark range: neighbouring dark codes pushed apart.
+//
+//     c' = 1 - (1 - c)^q          q = 4^lift
+//
+// Black stays at 0 and white stays at 1 for every q, so nothing is lifted or washed;
+// the slope at black is q (4 at full open, 0.25 at full crush) and the top end pays
+// for it with compensating compression, which is what keeps the whole thing monotone
+// and endpoint-fixed. Positive lift opens the shadows and reveals their detail;
+// negative crushes them and opens the highlights. q=1 is the exact identity.
+//
+// Monotone for all q>0 by construction. Punch then blends toward a smoothstep S about
+// mid code (positive = punchy/dark, negative = flat); its worst-case slope is 0.40 at
+// the extremes, so neither term can fold or band a gradient at any setting.
+// -----------------------------------------------------------------------------
+float3 ApplyLook(float3 lin, float lift, float punch)
+{
+    if (abs(lift) < 1e-4 && abs(punch) < 1e-4) return lin;
+    float3 c = lin > 0.0031308 ? 1.055 * pow(max(lin, 0.0), 1.0 / 2.4) - 0.055
+                               : 12.92 * max(lin, 0.0);
+    const float q = exp2(lift * 2.0);                 // -1..1 -> 0.25..4
+    c = 1.0 - pow(max(1.0 - c, 0.0), q);
+    c = lerp(c, c * c * (3.0 - 2.0 * c), punch * 0.6);
+    c = saturate(c);
+    return c > 0.04045 ? pow((c + 0.055) / 1.055, 2.4) : c / 12.92;
+}
+
 float4 main(PS_INPUT input) : SV_Target
 {
     float4 color = tex.Sample(samp, input.Tex); // original pixel
@@ -281,7 +336,10 @@ float4 main(PS_INPUT input) : SV_Target
     // Bounded, NOT `> 6.5`: 8 (GT7) is also above 6.5 and would silently render as
     // the reference curve. Any future selection has to be added to this test.
     if (toneCurveSelection > 6.5 && toneCurveSelection < 7.5) {
-        color.rgb = ToneMappingHable(color.rgb);
+        // Exposure trim first: an input gain, so +N pushes content up INTO the curve and
+        // the shoulder takes the highlights, instead of an output gain that would clip
+        // them. 1.0 (trim 0) is a no-op multiply and costs nothing.
+        color.rgb = ToneMappingHable(color.rgb * expTrimGain);
 
         if (outputGamut < 0.5) {
             color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
@@ -294,6 +352,9 @@ float4 main(PS_INPUT input) : SV_Target
                 color.rgb = Colorspace_Gamut_Constrain(color.rgb,
                                                        (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
+        // Taste shaping last: it acts on the finished display-referred image, after
+        // gamut mapping, so it cannot push a mapped colour back out of the triangle.
+        color.rgb = ApplyLook(color.rgb, shadowLift, punch);
     }
     // ---------------------------------------------------------------------
     // 8 = GT7, Polyphony Digital's operator (MIT, v1.0 2025-08-10).
@@ -327,6 +388,30 @@ float4 main(PS_INPUT input) : SV_Target
           || (toneCurveSelection > 9.5 && toneCurveSelection < 10.5)) {
         const float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
         const float refNits = max(hableRefWhiteNits, 1.0f);
+
+        // IDENTITY TRANSFER — the DV-already-mapped path.
+        //
+        // An external player consumed the RPU and emitted display-referred PQ for the
+        // sink it saw. The creative mapping is therefore DONE, by someone who had the
+        // per-frame metadata we never will; a second curve over it is double tone
+        // mapping, which is what the blown Oppo frames were.
+        //
+        // color.rgb is source nits / sdrNits, so scaling by sdrNits/identityPeak yields
+        // fraction-of-the-PLAYER's-white, which under the identity assumption IS
+        // fraction-of-panel-white. One scalar. No peak divisor to guess, no reference
+        // white to dial, nothing per title — the only number is the EDID peak, which
+        // describes our capture chain rather than the content.
+        //
+        // saturate() is the whole highlight policy here: the player already placed its
+        // highlights, and anything above its stated peak is by definition not in the
+        // signal.
+        const bool idt = dvIdentity > 0.5;
+        if (idt) {
+            // The trim is the identity path's ONLY user-facing brightness lever — it has
+            // no refWhite and no curve — so it lives here as well, same input-gain rule.
+            color.rgb = saturate(color.rgb * (sdrNits / max(identityPeak, 100.0)) * expTrimGain);
+        }
+        if (!idt) {
 
         // --------------------------------------------------------------------
         // GT7, ADAPTED FORM — ceiling = display peak, input gain from refWhite
@@ -477,6 +562,9 @@ float4 main(PS_INPUT input) : SV_Target
         // sdrNits, the two compose instead of cancelling (measured 158 codes of
         // travel across 25..400).
         color.rgb = mapped / max(sdrNits, 1e-3);
+        }   // !idt — the identity path skips the curve, the pre-compressor, the chroma
+            // fade and the luminance-linked desaturation: all of them describe
+            // compression this path deliberately does not perform.
 
         if (outputGamut < 0.5) {
             color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
@@ -489,6 +577,11 @@ float4 main(PS_INPUT input) : SV_Target
                 color.rgb = Colorspace_Gamut_Constrain(color.rgb,
                                                        (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
+        // The identity transfer has no curve of its own to give it character, so the
+        // taste shaping applies here — and ONLY on the identity path within this
+        // branch: GT7 and GT7 Adapt keep their validated shapes untouched. Applied
+        // after gamut mapping so it cannot push a mapped colour back out of triangle.
+        if (idt) color.rgb = ApplyLook(color.rgb, shadowLift, punch);
     }
     // ---------------------------------------------------------------------
     // 11 = DYNAMIC & AUTO. One solved transfer function replaces the whole
@@ -516,7 +609,8 @@ float4 main(PS_INPUT input) : SV_Target
         const float g  = (dynX0 > 1.0) ? dynG : 0.6;
         const float k  = (dynX0 > 1.0) ? dynK : 2.303;
 
-        const float code = 1.0 - exp(-k * pow(Y / x0, g));
+        const float base = 1.0 - exp(-k * pow(Y / x0, g));
+        const float code = pow(max(base, 0.0), (dynP > 1.0) ? dynP : 1.0);
         // The curve outputs DISPLAY-REFERRED CODE (0..1 of panel white), which is what
         // the house targets are stated in and what the probe measured. Encoding is
         // gamma 2.2 here, so the rest of the pipeline sees linear light as it does for
