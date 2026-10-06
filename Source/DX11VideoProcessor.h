@@ -565,6 +565,45 @@ private:
 	float m_BandPq[3] = { -1.0f, -1.0f, -1.0f };   // p25, p50, p99
 	float m_BandPeakPq = -1.0f;                     // p99.5
 	bool  m_bSceneSame = false;                     // last cut held (logged verdict)
+
+	// ---- DYNAMIC & AUTO CURVE (TONE_CURVE_DYNAMIC_AUTO) ----------------------
+	// One monotone transfer function, SOLVED from the source distribution against
+	// stated house targets, replacing the fourteen-scalar chain that currently
+	// implements one implicitly. Validated offline in _gt7probe/curve_solve.cpp and
+	// curve_render.cpp on real decoded frames before any of it reached here.
+	//
+	//     code(nits) = 1 - exp( -k * (nits/x0)^g )
+	//
+	// Monotone, C-infinity smooth, and asymptotic to 1.0 — it cannot clip, which is
+	// why there is no clip control and no clip constraint. Three parameters, and all
+	// three are determined: g by the scene's own dynamic range, k by the mean target,
+	// x0 anchored at the highlight.
+	//
+	// The inputs are the content-row quantile table and the scene-locked statistics —
+	// the SAME quantities the exposure memory already stabilises. That is the point:
+	// the temporal problem was solved once, for the mean and the peak, and the curve
+	// inherits it instead of needing its own guard. It is re-solved at scene lock,
+	// not per frame, so a flare cannot walk the whole image.
+	float m_MLQuantiles[ML_QUANT_N] = {};   // source PQ at 33 evenly spaced quantiles
+	float m_fDynG  = 0.0f;                  // contrast, from p99.5/p50
+	float m_fDynK  = 0.0f;                  // placement, from the mean target
+	float m_fDynX0 = 0.0f;                  // highlight anchor, nits
+	bool  m_bDynValid = false;              // a solve has completed with sane inputs
+
+	// HOUSE TARGETS. Constants, deliberately not dials: the whole premise is that the
+	// user states a LOOK once and the machine derives the curve. Each carries the
+	// measurement that fixed it. They live here, next to the solver, so that what the
+	// curve aims at is as visible as how it is solved.
+	static constexpr float kDynMeanAtRef  = 0.30f;  // delivered mean code at a 20-nit source
+	static constexpr float kDynRefNits    = 20.0f;
+	static constexpr float kDynDamp       = 0.16f;  // mean target's response to scene level
+	static constexpr float kDynP995Floor  = 0.85f;  // highlight preservation, minimum
+	static constexpr float kDynP995Ceil   = 0.94f;  // ...and maximum: without it a bright
+	                                                 // scene pushes p99.5 against the
+	                                                 // asymptote and crushes the top
+	static constexpr float kDynM50        = 0.24f;  // shape anchors (madVR's accepted
+	static constexpr float kDynM995       = 0.90f;  // Everest grab reads 0.24 / 0.89)
+	static constexpr float kDynMeanYield  = 0.10f;  // how far the mean may be sacrificed
 	// Spike test (2026-09-22): a cut is a DISCONTINUITY — the frame's delta
 	// dominates its recent 4-frame baseline, so occlusion and camera reframes
 	// (a ramp) cannot trip it, however far p99.5 wanders. (The slow re-anchor
@@ -918,6 +957,11 @@ private:
 
 	void UpdateMLActive();
 	void SetMLParams();
+	// Derive the Dynamic & Auto curve's three parameters from the scene-locked source
+	// statistics and the house targets. Called from the anchor block, after the scene
+	// state machine has decided — so it inherits the cut detection and the lock rather
+	// than needing its own, which is the whole reason the curve does not pump.
+	void SolveDynamicAutoCurve();
 	void ExtractMLFeatures();
 	void UpdateMLBarsFromDetected();
 	void CreateMLTextures();

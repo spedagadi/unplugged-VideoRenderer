@@ -129,6 +129,25 @@ enum :int {
 	// avoid; it is also why plain GT7 stays the default whenever maxCLL is real.
 	// fHdrGt7Adapt = 0 makes this curve byte-identical to TONE_CURVE_GT7.
 	TONE_CURVE_GT7_ADAPT = 10,
+	// 11 = Dynamic & Auto: the curve is SOLVED, not dialled.
+	//
+	// Every other entry here is a fixed shape plus scalars (refWhite, maxCLL, sdrNits,
+	// the knee dials) that the user sets, which means the user is being asked to know
+	// something about the title — its peak, its nits, where its white should land. On a
+	// Dolby Vision P7 capture from a player that has already applied the RPU, none of
+	// that is knowable: the stream carries no ST 2086 and no MaxCLL at all, and the
+	// fallback is a dial that was silently sitting at its 100-nit floor while the
+	// content peaked near 1000.
+	//
+	// This one takes the source distribution and house targets and derives
+	//     code(nits) = 1 - exp( -k * (nits/x0)^g )
+	// per scene. No content peak to enter, no reference white to choose, nothing to
+	// re-set per title. Validated offline against twelve real Everest frames spanning
+	// a 2.1-nit night camp to a 135-nit snow summit before it was wired in here.
+	//
+	// Deliberately a SEPARATE selection rather than a replacement: it can be A/B'd
+	// against GT7 Adapt on the same live video, and the existing curves are untouched.
+	TONE_CURVE_DYNAMIC_AUTO = 11,
 };
 
 #define SDR_NITS_DEF 50

@@ -102,9 +102,14 @@ cbuffer PS_PARAMETERS : register(b0)
     // last stage that can change chroma — which is ps_ml_chroma when the grade is up,
     // and this shader when it is not. cbuffer[28].
     float gamutMapHere;
-    float _padG0;
-    float _padG1;
-    float _padG2;
+    // DYNAMIC & AUTO CURVE (selection 11): the three parameters of
+    //     code(nits) = 1 - exp( -k * (nits/x0)^g )
+    // solved on the CPU from the scene-locked source statistics and the house targets.
+    // They take the three padding slots, so the buffer stays 36 floats / 144 bytes and
+    // no existing offset moves. x0 arrives as 0 until the first solve completes.
+    float dynG;
+    float dynK;
+    float dynX0;
     // GT7 debug view: 0 = off, 1 = chromaScale, 2 = fade ratio, 3 = knee crossing,
     // 4 = ceiling crossing. Renders the chosen quantity as greyscale INSTEAD of the
     // picture, so a spatial seam in any of them is visible directly rather than
@@ -480,6 +485,60 @@ float4 main(PS_INPUT input) : SV_Target
             // over the constraint (gamutMapHere = 0) the primaries conversion vanished
             // with it and the frame reached the panel still in 2020 primaries —
             // washed out exactly as if the output gamut were BT.2020.
+            if (gamutMapHere > 0.5)
+                color.rgb = Colorspace_Gamut_Constrain(color.rgb,
+                                                       (gamutCap > 0.001f) ? gamutCap : 1.0f);
+        }
+    }
+    // ---------------------------------------------------------------------
+    // 11 = DYNAMIC & AUTO. One solved transfer function replaces the whole
+    // scalar chain: the CPU derives g, k and x0 from the scene-locked source
+    // distribution and the house targets (see SolveDynamicAutoCurve), and this
+    // branch applies them.
+    //
+    // Bounded on both sides like every other selection here — an open `> 10.5`
+    // would capture any future curve the way GT7's `> 7.5` once swallowed the
+    // spline.
+    // ---------------------------------------------------------------------
+    else if (toneCurveSelection > 10.5 && toneCurveSelection < 11.5) {
+        const float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
+        const float3 nits = color.rgb * sdrNits;
+        // BT.2020 luma, because the source IS bt2020nc. The 709 weights would
+        // mis-weight red by ~40% relative, and red is where HDR film differs most
+        // from SDR — the error would land in the one quantity that places the
+        // entire image.
+        const float Y = max(dot(nits, float3(0.2627, 0.6780, 0.0593)), 1e-6);
+
+        // Until the first solve lands, fall back to a shape a typical scene would
+        // solve to rather than rendering something unmapped. One frame at most:
+        // the solve runs in the same Render() call, before the draw.
+        const float x0 = (dynX0 > 1.0) ? dynX0 : max(maxCLL, 100.0);
+        const float g  = (dynX0 > 1.0) ? dynG : 0.6;
+        const float k  = (dynX0 > 1.0) ? dynK : 2.303;
+
+        const float code = 1.0 - exp(-k * pow(Y / x0, g));
+        // The curve outputs DISPLAY-REFERRED CODE (0..1 of panel white), which is what
+        // the house targets are stated in and what the probe measured. Encoding is
+        // gamma 2.2 here, so the rest of the pipeline sees linear light as it does for
+        // every other curve.
+        const float yLin = pow(saturate(code), 2.2);
+
+        // Chroma follows luminance by preserving the pixel's RGB RATIOS, applied in
+        // LINEAR light — the same rule the reference path uses for gGain, and for the
+        // same documented reason: scaling luma in linear while scaling chroma in the
+        // code domain makes saturation depend on the gain, so a moving statistic
+        // drains the colour. Here there is no separate chroma term at all: whatever
+        // saturation survives is a consequence of the curve, not a dial.
+        color.rgb = (nits / Y) * yLin;
+
+        if (outputGamut < 0.5) {
+            color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
+            // MAPPED, not clamped. Clamping collapses every out-of-gamut pixel onto
+            // the same edge point: measured on a cyan down jacket at 20% out of
+            // triangle, it rendered as a featureless slab with the weave deleted,
+            // while the red beanie beside it kept its texture. Moving each pixel a
+            // fraction of the way toward its OWN neutral keeps hue and gives up only
+            // saturation, so neighbours stay neighbours.
             if (gamutMapHere > 0.5)
                 color.rgb = Colorspace_Gamut_Constrain(color.rgb,
                                                        (gamutCap > 0.001f) ? gamutCap : 1.0f);

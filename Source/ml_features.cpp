@@ -93,7 +93,8 @@ constexpr float kCropLimit = 0.01f;
 
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[ML_FEATURE_DIM],
                      MLLumaDomain domain, MLBarBounds* bars, float* outTextureEnergy,
-                     float* outPeakP995, float* outActiveFrac, float* outMeanNits)
+                     float* outPeakP995, float* outActiveFrac, float* outMeanNits,
+                     float* outQuantiles)
 {
 	const int w = ML_DOWNSAMPLE_W;
 	const int h = ML_DOWNSAMPLE_H;
@@ -297,7 +298,11 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 	// its mean and max are trained values, and excluding the bars there would shift
 	// every prediction on every scope film. This is a separate statistic for one
 	// consumer.
-	if (outPeakP995) {
+	// The content-rows histogram serves two consumers now: the anchor peak and the
+	// Dynamic & Auto curve's quantile table. Both need the PICTURE, not the frame —
+	// for the same reason: each one scales or places the entire image, so a subtitle
+	// or player chrome in the bars must not move it.
+	if (outPeakP995 || outQuantiles) {
 		thread_local uint32_t anchorHist[65536];
 		ZeroMemory(anchorHist, sizeof(anchorHist));
 		// Bottom band of the PICTURE excluded as well, because subtitles are not
@@ -377,9 +382,34 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 		//
 		// One constant, deliberately: if it needs to move, it moves here.
 		constexpr float kAnchorPeakPercentile = 0.995f;
-		*outPeakP995 = (anchorCount > 0)
-			? HistogramPercentile(anchorHist, anchorCount, kAnchorPeakPercentile)
-			: HistogramPercentile(histogram, total, kAnchorPeakPercentile);
+		if (outPeakP995) {
+			*outPeakP995 = (anchorCount > 0)
+				? HistogramPercentile(anchorHist, anchorCount, kAnchorPeakPercentile)
+				: HistogramPercentile(histogram, total, kAnchorPeakPercentile);
+		}
+
+		// The quantile table. One cumulative walk, not one per point: at 33 points the
+		// per-point walk the percentile API does would rescan 65536 bins 33 times on the
+		// render thread for no benefit.
+		if (outQuantiles) {
+			const uint32_t* src = (anchorCount > 0) ? anchorHist : histogram;
+			const int srcCount = (anchorCount > 0) ? anchorCount : total;
+			if (srcCount > 0) {
+				unsigned long long acc = 0;
+				int bin = 0, q = 0;
+				for (; q < ML_QUANT_N; ++q) {
+					const double want = ((double)q / (ML_QUANT_N - 1)) * (double)srcCount;
+					while (bin < 65536 && (double)acc < want) { acc += src[bin]; ++bin; }
+					// Stepping back one bin gives the value at the quantile rather than
+					// the first bin past it; at 65536 bins over [0,1] the difference is
+					// ~1.5e-5 PQ and irrelevant next to a 256x144 readback.
+					outQuantiles[q] = (float)((double)(bin > 0 ? bin - 1 : 0) * scale);
+				}
+				for (; q < ML_QUANT_N; ++q) outQuantiles[q] = outQuantiles[ML_QUANT_N - 1];
+			} else {
+				for (int i = 0; i < ML_QUANT_N; ++i) outQuantiles[i] = 0.0f;
+			}
+		}
 	}
 
 	if (bars) {

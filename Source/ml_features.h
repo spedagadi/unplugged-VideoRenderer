@@ -77,6 +77,24 @@ struct MLBarBounds {
 // reasons about exposure, which is why an auto-exposure solver built on it never
 // fired. Averaging in nits is the only form of "the scene average" that means
 // something physically.
+// `outQuantiles`, when given, receives ML_QUANT_N source luminance values in PQ, at
+// the evenly spaced quantile positions u = 0, 1/(N-1), ... 1 — i.e. the bottom of the
+// distribution at index 0 and the top at index N-1.
+//
+// This exists because the Dynamic & Auto curve is SOLVED, not dialled, and a solve
+// needs the delivered MEAN of a candidate curve, which is an integral over the whole
+// distribution. The six percentiles in features[3..8] are not enough to reconstruct
+// it: the delivered mean is dominated by the lower half, and the model contract in
+// features[] deliberately reports the FULL frame including letterbox bars (see the
+// note above outPeakP995), whereas this is measured over the content rows like the
+// anchor peak.
+//
+// Thirty-three points is not a precision choice, it is a cost one: integrating the
+// curve over a quantile table is exact for a monotone smooth curve to well under a
+// code, and it keeps the interface a 132-byte array instead of a 256 KB histogram
+// crossing a module boundary.
+constexpr int ML_QUANT_N = 33;
+
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch,
                      float features[ML_FEATURE_DIM],
                      MLLumaDomain domain = MLLumaDomain::PQ,
@@ -84,7 +102,8 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch,
                      float* outTextureEnergy = nullptr,
                      float* outPeakP995 = nullptr,
                      float* outActiveFrac = nullptr,
-                     float* outMeanNits = nullptr);
+                     float* outMeanNits = nullptr,
+                     float* outQuantiles = nullptr);
 
 // ---------------------------------------------------------------------------
 // DELIVERED-FRAME STATISTICS (the closed-loop instrument)

@@ -1449,10 +1449,12 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 	                     ToneLutActive() ? 1.0f : 0.0f,
 	                     m_ToneLutKey.pqMin, m_ToneLutKey.pqMax,
 	                     (float)kToneLutSize, 0,
-	                     // 7 = REFERENCE, 8 = GT7, 9 = SPLINE, 10 = GT7 ADAPT. Upper bound
-	                     // must cover ALL of them or discard() quietly rewrites the
-	                     // selection to 3 (Hable), i.e. the row would do nothing.
-	                     (float)discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_GT7_ADAPT),
+	                     // 7 = REFERENCE, 8 = GT7, 9 = SPLINE, 10 = GT7 ADAPT,
+	                     // 11 = DYNAMIC & AUTO. Upper bound must cover ALL of them or
+	                     // discard() quietly rewrites the selection to 3 (Hable), i.e.
+	                     // the row would do nothing and the picture would look like the
+	                     // curve was ignored. This has bitten on every curve added so far.
+	                     (float)discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_DYNAMIC_AUTO),
 	                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 	// The metadata, guarded exactly as SetHDR10ShaderParams guards it.
@@ -1634,8 +1636,16 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// place. Applying it in both would double-compress. 28..31 keeps the buffer at
 		// 32 floats / 128 bytes, the next 16-byte multiple.
 		cbuffer[28] = (m_bMLActive && m_pPSMLChroma) ? 0.0f : 1.0f;
-		// 29..31 remain padding; the GT7 placement/protection peak split tried there on
-		// 2026-10-04 regressed badly (see the guard note in Render) and was reverted.
+		// [29..31] the Dynamic & Auto curve. Three floats that fully specify one
+		// monotone transfer function, in the three padding slots — so the buffer stays
+		// 36 floats / 144 bytes and no existing offset moves. (A GT7 placement/
+		// protection split briefly occupied 29/30 and was reverted; see the guard note
+		// in Render. These are unrelated values that happen to reuse the same padding.)
+		// Until the first solve completes, x0 is sent as 0 and the shader falls through
+		// to the plain curve rather than rendering a curve it has not been given.
+		cbuffer[29] = m_fDynG;
+		cbuffer[30] = m_fDynK;
+		cbuffer[31] = m_bDynValid ? m_fDynX0 : 0.0f;
 		// [32] GT7 debug view (0 = off). 32..35 keeps the buffer at 36 floats / 144
 		// bytes, the next 16-byte multiple.
 		cbuffer[32] = m_fHdrGt7Dbg;
@@ -1653,12 +1663,15 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// refW is the EFFECTIVE reference white (the solved value when auto exposure
 		// is on) and avgN the scene mean in nits it was solved from, so "is auto
 		// exposure doing anything" is answerable from one log line.
-		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} ad={:.2f} refW={:.1f} sPk={:.1f} avgN={:.1f}",
+		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} ad={:.2f} refW={:.1f} sPk={:.1f} avgN={:.1f} dyn={} g={:.3f} k={:.3f} x0={:.1f}",
 			(uintptr_t)m_pCorrectionConstants.p, 10000.0f / m_iSDRDisplayNits, m_iSDRDisplayNits,
 			m_fHdrHighlightNeutral, m_fHdrChromaExp,
-			discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_GT7_ADAPT),
+			discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_DYNAMIC_AUTO),
 			m_fHdrGt7Blend, m_fHdrGt7Adapt,
-			m_fEffRefWhite, m_HableScenePeakNits, m_MeanNitsSmooth);
+			m_fEffRefWhite, m_HableScenePeakNits, m_MeanNitsSmooth,
+			// The solved curve, so "did the solver run and with what" is one field
+			// rather than an inference from the picture.
+			(int)m_bDynValid, m_fDynG, m_fDynK, m_fDynX0);
 		m_pDeviceContext->UpdateSubresource(m_pCorrectionConstants, 0, nullptr, &cbuffer, 0, 0);
 		// Arm the read-back: the next few correction draws report the buffer they
 		// ACTUALLY had bound at b0 and its float values. [CBPROBE] absent after this
@@ -2444,6 +2457,98 @@ static float MedianOf(const float* v, int n)
 	return (m & 1) ? t[m >> 1] : 0.5f * (t[m / 2 - 1] + t[m / 2]);
 }
 
+// -----------------------------------------------------------------------------
+// THE DYNAMIC & AUTO CURVE — one solved transfer function instead of a chain of
+// scalars that each secretly implement part of one.
+//
+//     code(nits) = 1 - exp( -k * (nits / x0)^g )
+//
+// Monotone, smooth, asymptotic to 1.0. It cannot clip, so there is nothing to dial
+// and nothing to constrain against clipping.
+//
+// All three parameters are DETERMINED, none is chosen:
+//
+//   g   from the scene's own dynamic range. Asking "where should p50 and p99.5 land"
+//       of this shape and dividing the two equations leaves
+//           g = ln( ln(1/(1-M995)) / ln(1/(1-M50)) ) / ln( p99.5 / p50 )
+//       so a narrow-range interior gets g near 1 and a night scene with a lamp gets a
+//       low g that opens the shadows. That is not a tuned behaviour — it falls out of
+//       the two placement targets.
+//   k   from the mean target, by bisection over the source quantile table.
+//   x0  anchored at the scene's own p99.5.
+//
+// And because x0 IS p99.5, the delivered value AT the highlight is exactly 1-exp(-k),
+// so the highlight placement window is a clamp on one number rather than a second
+// search. That is the whole reason this is cheap enough to run per scene.
+//
+// THE WINDOW IS THE PRIORITY, AND IT IS A HOUSE DECISION (option A, 2026-10-05).
+// On the real frames measured in _gt7probe, the mean target and the highlight floor
+// are jointly infeasible about 2 times in 12: a scene with a 2.6-nit mean and a 226-nit
+// lamp cannot put its average at 0.216 of white AND keep its highlights at 0.85 — that
+// asks for more separation than the panel has. Something must yield, and the answer
+// chosen is that the highlights do not. Clamping k to the window implements exactly
+// that: the mean lands wherever it can, and the ceiling also stops the opposite
+// failure, where a bright scene pushes p99.5 against the asymptote and crushes the top
+// percentile into white (measured at 00:36:55, delivered p99.5 = 0.990).
+// -----------------------------------------------------------------------------
+void CDX11VideoProcessor::SolveDynamicAutoCurve()
+{
+	if (!m_bMLFeaturesReady) return;
+
+	// Source distribution, in nits. The quantile table is measured over the CONTENT
+	// rows for the same reason the anchor peak is: player chrome and subtitles in the
+	// letterbox bars must not be allowed to move a quantity that places the whole
+	// image. It is also why the six model percentiles in features[] cannot be used
+	// here — they deliberately report the full frame, and they exclude the lower half
+	// where the delivered mean is actually made.
+	float q[ML_QUANT_N];
+	for (int i = 0; i < ML_QUANT_N; ++i) q[i] = exptm::PqToLinearNits(m_MLQuantiles[i]);
+
+	// Prefer the SCENE-LOCKED statistics over the live ones. This is the connection
+	// that makes the curve not pump: m_BandPq / m_BandPeakPq / m_fSceneMeanRef move
+	// when the scene state machine allows them to and not at all while a scene is
+	// held, so a flare entering frame changes a measurement but not the curve.
+	const float p50pq  = (m_BandPq[1]   > 0.0f) ? m_BandPq[1]
+	                                            : m_MLQuantiles[(ML_QUANT_N - 1) / 2];
+	const float p995pq = (m_BandPeakPq > 0.0f) ? m_BandPeakPq
+	                                           : m_MLQuantiles[ML_QUANT_N - 1];
+	const double p50   = fmax((double)exptm::PqToLinearNits(p50pq), 0.02);
+	const double p995  = fmax((double)exptm::PqToLinearNits(p995pq), p50 * 1.2);
+	const double srcMean = (m_fSceneMeanRef > 0.0f) ? (double)m_fSceneMeanRef
+	                                                : (double)m_MLMeanNitsRaw;
+	if (srcMean <= 0.01 || p995 <= 0.05) return;
+
+	// shape
+	double g = std::log(std::log(1.0 / (1.0 - kDynM995)) / std::log(1.0 / (1.0 - kDynM50)))
+             / std::log(p995 / p50);
+	g = std::clamp(g, 0.15, 2.5);
+
+	// placement, from the damped mean target
+	const double target = kDynMeanAtRef * std::pow(srcMean / kDynRefNits, kDynDamp);
+	auto deliveredMean = [&](double k) {
+		double acc = 0.0;
+		for (int i = 0; i < ML_QUANT_N; ++i)
+			acc += 1.0 - std::exp(-k * std::pow((double)q[i] / p995, g));
+		return acc / ML_QUANT_N;
+	};
+	double lo = 1e-4, hi = 20.0;
+	for (int it = 0; it < 48; ++it) {
+		const double mid = std::sqrt(lo * hi);
+		if (deliveredMean(mid) > target) hi = mid; else lo = mid;
+	}
+	double k = std::sqrt(lo * hi);
+
+	// the highlight window — see the note above
+	const double kFloor = -std::log(1.0 - kDynP995Floor);
+	const double kCeil  = -std::log(1.0 - kDynP995Ceil);
+	k = std::clamp(k, kFloor, kCeil);
+
+	m_fDynG  = (float)g;
+	m_fDynK  = (float)k;
+	m_fDynX0 = (float)p995;
+	m_bDynValid = true;
+}
+
 void CDX11VideoProcessor::SetMLParams()
 {
 	float gamma   = 1.0f;
@@ -3100,7 +3205,12 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	// VP, so only the SOURCE decides its domain; the correction is downstream of it.
 	const MLLumaDomain domain =
 		MLFeatureDomainIsPq() ? MLLumaDomain::PQ : MLLumaDomain::SDRGamma22;
-	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain, &m_MLBarDetected, &m_MLRawTexture, &m_MLPeakPq995, &m_MLActiveFrac, &m_MLMeanNitsRaw);
+	// m_MLQuantiles is the source distribution the Dynamic & Auto curve is solved
+	// against — 33 content-row quantiles, the same table the offline probe integrates
+	// over in _gt7probe/curve_solve.cpp. Passing it here rather than reconstructing the
+	// distribution from features[3..8] is deliberate: those six percentiles exclude the
+	// lower half, which is where the delivered mean is actually made.
+	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain, &m_MLBarDetected, &m_MLRawTexture, &m_MLPeakPq995, &m_MLActiveFrac, &m_MLMeanNitsRaw, m_MLQuantiles);
 	m_pDeviceContext->Unmap(m_MLStaging, 0);
 
 	if (m_bMLDebug && m_pMLDebugFile) {
@@ -6770,6 +6880,15 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// rescue content aimed FAR above it. The gain error from a flare-excluded peak
 				// was ~3.5x; the knee's whole authority is a fraction of the ceiling. There is
 				// no local mechanism that substitutes for the global one here.
+				// Solve the curve AFTER the scene state machine has decided and BEFORE
+				// anything reads the parameters. Ordering is the whole design: the solver
+				// consumes m_BandPq / m_BandPeakPq / m_fSceneMeanRef, which only this
+				// block is allowed to move, so the curve cannot respond to anything the
+				// cut detector and the lock have not already approved. Solving anywhere
+				// else would give it a statistic that moves on its own schedule — which
+				// is precisely the pump this project has spent a week removing.
+				SolveDynamicAutoCurve();
+
 				m_HableScenePeakNits = fmaxf(exptm::PqToLinearNits(m_PeakMaxPq),
 				                             m_fScenePeakMaxNits);
 
