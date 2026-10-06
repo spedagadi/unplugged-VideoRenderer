@@ -1650,33 +1650,10 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		cbuffer[31] = m_bDynValid ? m_fDynX0 : 0.0f;
 		cbuffer[33] = m_bDynValid ? m_fDynP : 1.0f;   // toe exponent, slot 33's padding
 
-		// DV-ALREADY-MAPPED detection, from the fingerprint the DeckLink source
-		// documents (BT.2020 + no PQ/HLG static flag = the player replaced the HDR10
-		// InfoFrame with Dolby's VSIF) — evaluated here from quantities the renderer
-		// already holds, so no engine or UI plumbing is needed:
-		//   PQ transfer + BT.2020 primaries + NO static metadata + the renderer's own
-		//   DV parser did NOT fire (file-path DV is handled elsewhere and must not be
-		//   double-excluded).
-		// An external player (Oppo, UB820) has consumed the RPU and emitted a
-		// display-referred PQ signal; running a creative curve over it is double tone
-		// mapping. Identity transfer is what remains, with the Zion grade on top.
-		// Reference (Hable) is included because it is the DV default: Hable maps
-		// highlights to the target sdr nits better than any other curve on DV content
-		// (validated by the user across profiles), but on PLAYER-mapped DV it would be a
-		// second creative grade over an already-graded signal. The fingerprint decides
-		// which of the two Reference does: transfer, or Hable.
-		m_bDvIdentity =
-			(m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT ||
-			 m_iHdrLocalToneMappingType == TONE_CURVE_REFERENCE) &&
-			(m_srcExFmt.VideoTransferFunction == 15 /* PQ */) &&
-			(m_srcExFmt.VideoPrimaries == 9 /* BT.2020 */) &&
-			!m_Dovi.bValid &&
-			!(m_hdr10Cll > 10u || m_lastHdr10.hdr10.MaxContentLightLevel > 10);
-		cbuffer[34] = m_bDvIdentity ? 1.0f : 0.0f;
-		// The peak the upstream player mapped to — a property of the capture chain's
-		// EDID, not of the content, which is why it is configured once and never per
-		// title. Only read by the shader when cbuffer[34] is set.
-		cbuffer[35] = (m_fHdrIdentityPeakNits > 10.0f) ? m_fHdrIdentityPeakNits : 1000.0f;
+		// (The DV identity transfer and its cbuffer slots 34/35 were removed here: DV is
+		// one case now — Hable plus the taste controls — whether it arrives from an
+		// external player or from a file. The user's A/B across DV content settled it;
+		// d96afab retains the transfer if it is ever wanted back.)
 		// Precomputed 2^(trim/3) so the shader does one multiply, not a pow per pixel.
 		cbuffer[36] = powf(2.0f, (float)m_iExposureTrim / 3.0f);
 		// S-curve taste, normalised to -1..1; the shader shapes in sRGB code space.
@@ -1699,7 +1676,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// refW is the EFFECTIVE reference white (the solved value when auto exposure
 		// is on) and avgN the scene mean in nits it was solved from, so "is auto
 		// exposure doing anything" is answerable from one log line.
-		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} ad={:.2f} refW={:.1f} sPk={:.1f} avgN={:.1f} dyn={} g={:.3f} k={:.3f} x0={:.1f} p={:.3f} id={}",
+		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} ad={:.2f} refW={:.1f} sPk={:.1f} avgN={:.1f} dyn={} g={:.3f} k={:.3f} x0={:.1f} p={:.3f}",
 			(uintptr_t)m_pCorrectionConstants.p, 10000.0f / m_iSDRDisplayNits, m_iSDRDisplayNits,
 			m_fHdrHighlightNeutral, m_fHdrChromaExp,
 			discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_DYNAMIC_AUTO),
@@ -1707,7 +1684,7 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 			m_fEffRefWhite, m_HableScenePeakNits, m_MeanNitsSmooth,
 			// The solved curve, so "did the solver run and with what" is one field
 			// rather than an inference from the picture.
-			(int)m_bDynValid, m_fDynG, m_fDynK, m_fDynX0, m_fDynP, (int)m_bDvIdentity);
+			(int)m_bDynValid, m_fDynG, m_fDynK, m_fDynX0, m_fDynP);
 		m_pDeviceContext->UpdateSubresource(m_pCorrectionConstants, 0, nullptr, &cbuffer, 0, 0);
 		// Arm the read-back: the next few correction draws report the buffer they
 		// ACTUALLY had bound at b0 and its float values. [CBPROBE] absent after this
@@ -2773,18 +2750,10 @@ void CDX11VideoProcessor::SetMLParams()
 			if (m_fMLTargetMid > 0.001f && MLFeatureDomainIsPq() &&
 			    (m_iHdrLocalToneMappingType == TONE_CURVE_GT7 ||
 			     m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT) &&
-			    m_iSDRDisplayNits > 0 &&
-			    (m_bDvIdentity || m_fCurvePeakNits > 10.0f)) {
+			    m_iSDRDisplayNits > 0 && m_fCurvePeakNits > 10.0f) {
 				const float srcAvgNits = exptm::PqToLinearNits(m_MLFeatures[1]);
-				// Identity mirror, in the SAME domain GradeChainDelivered uses
-				// (PQ-normalised I), so the top-up it derives is consistent with the
-				// controller's: the delivered fraction is nits over the player's peak,
-				// re-expressed as the grade sees it.
-				const float cur = m_bDvIdentity
-					? exptm::LinearNitsToPq(fminf(1.0f, srcAvgNits / fmaxf(m_fHdrIdentityPeakNits, 10.0f))
-					                        * (float)m_iSDRDisplayNits) / 0.5893f
-					: PredictGt7Encoded(srcAvgNits, m_fEffRefWhite,
-				                        m_fCurvePeakNits, (float)m_iSDRDisplayNits,
+				const float cur = PredictGt7Encoded(srcAvgNits, m_fEffRefWhite,
+				                                    m_fCurvePeakNits, (float)m_iSDRDisplayNits,
 				                                    m_fHdrGt7Alpha);
 				if (cur > 0.001f && cur < 0.999f) {
 					autoTopUp = logf(cur) / logf(m_fMLTargetMid) - gamma;
@@ -2958,17 +2927,10 @@ void CDX11VideoProcessor::SetMLParams()
 			m_iSDRDisplayNits, (double)m_fEffRefWhite);
 		fflush(m_pMLDebugFile);
 	}
-	// The controller runs on the identity transfer too — that is the point of the mode:
-	// the player has graded the picture, the controller corrects its DELIVERY. What
-	// changes is the mirror: GradeChainDelivered takes w as a linear fraction of panel
-	// white, and under identity that fraction is simply nits/identityPeak, so the
-	// prediction is exact rather than modelled. Solving against the GT7 mirror here
-	// would correct for a curve that is not running.
 	const bool ctl = m_bMLController && m_bMLFeaturesReady &&
 	                 (m_iHdrLocalToneMappingType == TONE_CURVE_GT7 ||
 	                  m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT) &&
-	                 m_iSDRDisplayNits > 0 &&
-	                 (m_bDvIdentity || m_fCurvePeakNits > 10.0f);
+	                 m_iSDRDisplayNits > 0 && m_fCurvePeakNits > 10.0f;
 	if (ctl) {
 		// A CUT IS NOT DRIFT. Everything below smooths, and every one of those
 		// smoothing rules was written against a real pumping artifact — but the
@@ -3015,13 +2977,7 @@ void CDX11VideoProcessor::SetMLParams()
 		float wA[3], wT[3];
 		for (int i = 0; i < 3; i++) {
 			const float nits = exptm::PqToLinearNits(bandPq[i]);
-			// Identity mirror: the player's transfer is a scalar, so the delivered
-			// fraction before the grade is exactly nits over the peak it mapped to.
-			// No model, no approximation — which is why the controller is MORE
-			// trustworthy on this path than on GT7, not less.
-			wA[i] = m_bDvIdentity
-			      ? fminf(1.0f, nits / fmaxf(m_fHdrIdentityPeakNits, 10.0f))
-			      : PredictGt7RelLinear(nits, m_fEffRefWhite, m_fCurvePeakNits, sdrN, m_fHdrGt7Alpha);
+			wA[i] = PredictGt7RelLinear(nits, m_fEffRefWhite, m_fCurvePeakNits, sdrN, m_fHdrGt7Alpha);
 			// RELATIVE to the scene's own range, not absolute nits and not a constant.
 			//
 			// An absolute law (1 - exp(-nits/W)) told a 0.25-nit source to deliver
@@ -9045,10 +9001,6 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	}
 	if (config.fHdrGt7Dbg != m_fHdrGt7Dbg) {
 		m_fHdrGt7Dbg = std::clamp(config.fHdrGt7Dbg, 0.0f, 4.0f);
-		changeLuminanceParams = true;
-	}
-	if (config.fHdrIdentityPeakNits != m_fHdrIdentityPeakNits) {
-		m_fHdrIdentityPeakNits = std::clamp(config.fHdrIdentityPeakNits, 100.0f, 4000.0f);
 		changeLuminanceParams = true;
 	}
 	if (config.iHdrExposureTrim != m_iExposureTrim) {

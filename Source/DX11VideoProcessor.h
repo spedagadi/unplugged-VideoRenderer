@@ -675,11 +675,6 @@ private:
 	// GT7 Adapt (TONE_CURVE_GT7_ADAPT): weight of the measured scene peak in the
 	// peak this curve maps FROM. 0 = plain GT7. cbuffer[24].
 	float m_fHdrGt7Adapt     = 0.25f;
-	// DV-already-mapped: an external player consumed the RPU and emitted display-
-	// referred PQ with no static metadata left. GT7 Adapt then transfers instead of
-	// tone maps (see cbuffer[34] and the shader branch), and the band controller stands
-	// down because its mirror models the GT7 curve, not identity.
-	bool  m_bDvIdentity      = false;
 	// The weight actually sent to the shader, and actually used by the CPU mirror.
 	// Equals the dial when the signal states its own content peak; forced to 1.0 when
 	// it does not, because a metadata-less `cll` is the Title peak fallback and a
@@ -692,9 +687,6 @@ private:
 	// GT7 debug view: 0 off, 1 chromaScale, 2 fade ratio, 3 knee crossing,
 	// 4 ceiling crossing. Renders that quantity as greyscale instead of the picture.
 	float m_fHdrGt7Dbg       = 0.0f;
-	// Peak the upstream player mapped its DV output to (identity transfer). Describes
-	// the capture chain's EDID, not the content; configured once.
-	float m_fHdrIdentityPeakNits = 1000.0f;
 	int   m_iExposureTrim        = 0;      // thirds of a stop, -5..+5; input gain 2^(t/3)
 	int   m_iShadowLift          = 0;      // -5..5, toe lift in code space
 	int   m_iPunch               = 0;      // -5..5, S-curve blend in code space

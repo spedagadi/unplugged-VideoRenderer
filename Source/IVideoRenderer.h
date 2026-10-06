@@ -493,13 +493,6 @@ struct Settings_t {
 	// picture. Diagnostic only; 0 is the normal picture. APPENDED (binary boundary).
 	float fHdrGt7Dbg = 0.0f;
 
-	// IDENTITY TRANSFER (TONE_CURVE_IDENTITY): the peak in nits that the UPSTREAM
-	// player mapped its output to. The transfer is one scalar — player white becomes
-	// panel white — so this is the only number the path needs, and it describes the
-	// capture chain (the EDID the sink presents to the player), not the content.
-	// Default 1000: the peak an HDR sink EDID normally advertises. APPENDED (binary
-	// boundary), so older callers see 0 and the renderer falls back to the default.
-	float fHdrIdentityPeakNits = 1000.0f;
 
 	// EXPOSURE TRIM, in thirds of a stop, -3..+3 (i.e. -1..+1 stop). A TASTE control,
 	// deliberately stepped and deliberately small: it is the answer to "a bit brighter
@@ -706,7 +699,6 @@ struct Settings_t {
 		fHdrRefWhiteTarget              = 0.42f;
 		bMLController                   = false;
 		fCtlWhiteNits                   = 203.0f;
-		fHdrIdentityPeakNits            = 1000.0f;
 		iHdrExposureTrim                = 0;
 		iHdrShadowLift                  = 0;
 		iHdrPunch                       = 0;

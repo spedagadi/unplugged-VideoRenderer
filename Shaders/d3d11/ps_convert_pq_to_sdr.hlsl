@@ -121,15 +121,11 @@ cbuffer PS_PARAMETERS : register(b0)
     // and a p10 of 126 against GT7's 19. Raising the output to p>1 crushes the low
     // end while leaving the asymptote alone. Takes slot 33's padding.
     float dynP;
-    // 1 = the source is Dolby Vision that an external player has ALREADY mapped to the
-    // sink: display-referred PQ with the RPU consumed and no static metadata left. GT7
-    // Adapt then transfers rather than tone maps — a second creative curve over an
-    // already-graded signal is double tone mapping, which is what the blown/washed
-    // Oppo frames were. Slot 34's padding.
-    float dvIdentity;
-    // The peak the upstream player mapped to, in nits. Only read when dvIdentity is
-    // set. Buffer is 40 floats / 160 bytes.
-    float identityPeak;
+    // Slots 34/35 carried the DV identity transfer's flag and peak until it was removed:
+    // DV is now ONE case (Hable + taste) whether it arrives from a player or a file, so
+    // there is nothing left to flag. Padding again; buffer is 40 floats / 160 bytes.
+    float _padD0;
+    float _padD1;
     // Exposure trim as a precomputed INPUT gain, 2^(trim/3), trim in thirds of a stop
     // over -3..+3. Applied before the curve so brightening is absorbed by the shoulder
     // rather than clipping after it. Slot 36.
@@ -336,19 +332,10 @@ float4 main(PS_INPUT input) : SV_Target
     // Bounded, NOT `> 6.5`: 8 (GT7) is also above 6.5 and would silently render as
     // the reference curve. Any future selection has to be added to this test.
     if (toneCurveSelection > 6.5 && toneCurveSelection < 7.5) {
-        // On player-mapped DV this branch TRANSFERS instead of grading: Hable over an
-        // already-graded signal is the double map that produced every "blown/washed"
-        // report on that path. The fingerprint (see the CPU side) decides; dvIdentity
-        // carries it here. Same scalar, same rule as the GT7 Adapt branch.
-        if (dvIdentity > 0.5) {
-            const float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
-            color.rgb = saturate(color.rgb * (sdrNits / max(identityPeak, 100.0)) * expTrimGain);
-        } else {
         // Exposure trim first: an input gain, so +N pushes content up INTO the curve and
         // the shoulder takes the highlights, instead of an output gain that would clip
         // them. 1.0 (trim 0) is a no-op multiply and costs nothing.
         color.rgb = ToneMappingHable(color.rgb * expTrimGain);
-        }
 
         if (outputGamut < 0.5) {
             color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
@@ -414,13 +401,13 @@ float4 main(PS_INPUT input) : SV_Target
         // saturate() is the whole highlight policy here: the player already placed its
         // highlights, and anything above its stated peak is by definition not in the
         // signal.
-        const bool idt = dvIdentity > 0.5;
-        if (idt) {
-            // The trim is the identity path's ONLY user-facing brightness lever — it has
-            // no refWhite and no curve — so it lives here as well, same input-gain rule.
-            color.rgb = saturate(color.rgb * (sdrNits / max(identityPeak, 100.0)) * expTrimGain);
-        }
-        if (!idt) {
+        // (An identity transfer for player-mapped DV lived here from 48ab0f0 to d96afab:
+        // one scalar, on the theory that a second curve over an already-graded signal is
+        // a double map. The user's A/B across DV content decided otherwise — Hable maps
+        // highlights to the target sdr nits better than anything else on DV, from a
+        // player or from a file, and DV is ONE case, not two. Removed rather than left
+        // dormant; d96afab has it if it is ever wanted back.)
+        {
 
         // --------------------------------------------------------------------
         // GT7, ADAPTED FORM — ceiling = display peak, input gain from refWhite
@@ -571,9 +558,7 @@ float4 main(PS_INPUT input) : SV_Target
         // sdrNits, the two compose instead of cancelling (measured 158 codes of
         // travel across 25..400).
         color.rgb = mapped / max(sdrNits, 1e-3);
-        }   // !idt — the identity path skips the curve, the pre-compressor, the chroma
-            // fade and the luminance-linked desaturation: all of them describe
-            // compression this path deliberately does not perform.
+        }
 
         if (outputGamut < 0.5) {
             color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
@@ -586,11 +571,6 @@ float4 main(PS_INPUT input) : SV_Target
                 color.rgb = Colorspace_Gamut_Constrain(color.rgb,
                                                        (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
-        // The identity transfer has no curve of its own to give it character, so the
-        // taste shaping applies here — and ONLY on the identity path within this
-        // branch: GT7 and GT7 Adapt keep their validated shapes untouched. Applied
-        // after gamut mapping so it cannot push a mapped colour back out of triangle.
-        if (idt) color.rgb = ApplyLook(color.rgb, shadowLift, punch);
     }
     // ---------------------------------------------------------------------
     // 11 = DYNAMIC & AUTO. One solved transfer function replaces the whole
