@@ -310,13 +310,19 @@ float4 main(PS_INPUT input) : SV_Target
     // Bounded, NOT `> 6.5`: 8 (GT7) is also above 6.5 and would silently render as
     // the reference curve. Any future selection has to be added to this test.
     if (toneCurveSelection > 6.5 && toneCurveSelection < 7.5) {
-        // NO taste operators here any more. Exposure trim, shadow detail and punch
-        // moved to ps_ml_taste.hlsl, which draws AFTER the automatic grade: they used
-        // to run here, before the model's gamma/shadow/rolloff were applied on top of
-        // them, so the user's setting could be silently undone downstream.
-        // expTrimGain, shadowLift and punch are still declared in this cbuffer (the
-        // layout is shared with the C++ side) but are NOT read on this path.
-        color.rgb = ToneMappingHable(color.rgb);
+        // EXPOSURE TRIM stays pre-curve, and this is why: Hable is a display-referred
+        // curve -- hable(x)/hable(4.8), asymptoting below 1.0 -- so a gain applied
+        // BEFORE it is absorbed by the shoulder. The same gain applied AFTER it has
+        // nowhere to go except past full scale, and saturated highlights clip. Moving
+        // trim into the taste stage was a regression: blown highlights. Shadow detail
+        // and punch moved, and stay moved, because they shape what the viewer sees and
+        // must therefore be the last word.
+        //
+        // So the rule is not "user last" applied blindly to every dial. A dial that
+        // changes LIGHT belongs before the curve; a dial that changes SHAPE belongs
+        // after it. shadowLift and punch are still declared in this cbuffer (the
+        // layout is shared with the C++ side) but are read by ps_ml_taste.hlsl.
+        color.rgb = ToneMappingHable(color.rgb * expTrimGain);
 
         if (outputGamut < 0.5) {
             color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);

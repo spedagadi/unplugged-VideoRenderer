@@ -366,7 +366,11 @@ private:
 	// (ps_ml_taste.hlsl) drawn after the grade, so the user's dials are the last word
 	// instead of something the model can undo. Stamp bumped because a log line from a
 	// v3 build and one from v4 look identical but describe different stage orders.
-	static constexpr const wchar_t* kLookStamp = L"v4-taste-stage-win48-q0.6";
+	// v5: exposure trim went BACK to pre-curve after v4 moved it. A display-referred
+	// Hable absorbs a pre-curve gain in its shoulder; post-curve the same gain can
+	// only clip -- measured at +2 trimming 39/256 ramp codes past full scale, +5
+	// 202/256. Only the SHAPE dials (shadow detail, punch) stay in the taste stage.
+	static constexpr const wchar_t* kLookStamp = L"v5-shape-post-trim-pre-win48";
 	// Content RECT in the DELIVERED (window-sized) caches — pillarbox columns from
 	// m_videoRect plus the film's own letterbox rows mapped through it. Logged with
 	// every line so the crop is auditable rather than assumed.

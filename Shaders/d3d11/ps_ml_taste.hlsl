@@ -33,7 +33,9 @@ cbuffer TasteParams : register(b0)
 {
 	float shadowLift;    // -1..1, normalised from the -5..+5 dial
 	float punch;         // -1..1
-	float expTrimGain;   // 2^(trim/3), 1.0 = no-op
+	float reserved0;     // was expTrimGain: exposure is LIGHT, so it belongs before
+	                     // the curve, where the shoulder absorbs it. Kept as a slot so
+	                     // the C++ layout and this declaration stay one-to-one.
 	float active;        // 0 = every dial at 0 -> passthrough; also 0 on the PQ path
 	float dbgView;       // 0 off, 1 = |delta| the dials applied, 2 = shadow window mask
 	float _pad0;
@@ -84,18 +86,13 @@ float3 Taste(float3 code)
 	// _gt7probe/taste_check.ps1 asserts it.
 	const float3 lin = pow(max(code, 0.0), 2.2);
 
-	// 1. Exposure trim -- a LIGHT gain, so it belongs in linear light. Applying it
-	//    in code space would be a different, stronger operation.
-	float3 lit = lin * expTrimGain;
-	{
-		const float hi = max(lit.r, max(lit.g, lit.b));
-		if (hi > 1.0) {
-			lit /= hi;                     // keep hue, land the brightest channel at 1
-		}
-	}
+	// NO exposure trim here. Trim changes LIGHT, so it is applied before the curve
+	// (ps_convert_pq_to_sdr.hlsl), where Hable's shoulder absorbs it. Applying it
+	// post-curve blew saturated highlights, because a display-referred curve has
+	// already promised its top end to 1.0 and a gain after that has nowhere to go.
 
-	// 2. Shape the luma, in code space.
-	float3 linq = max(lit, 1e-6);
+	// 1. Shape the luma, in code space.
+	float3 linq = max(lin, 1e-6);
 	float yIn = LumaCode(linq);
 	float y = pow(yIn, 1.0 / 2.2);
 
@@ -117,7 +114,7 @@ float3 Taste(float3 code)
 	const float sgn = (y > 0.5) ? 1.0 : ((y < 0.5) ? -1.0 : 0.0);
 	y = saturate(0.5 + sgn * 0.5 * pow(max(2.0 * d, 0.0), s));
 
-	// 3. Carry the shaped luma back without touching colour.
+	// 2. Carry the shaped luma back without touching colour.
 	const float yOut = max(pow(y, 2.2), 1e-6);
 	float scale = yOut / yIn;
 	{

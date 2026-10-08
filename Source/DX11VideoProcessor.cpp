@@ -8325,7 +8325,11 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			// validated shapes, and an extra S-curve on top of GT7's shoulder is a
 			// different picture than anyone has agreed to.
 			const bool bRefCurve = (m_iHdrLocalToneMappingType == TONE_CURVE_REFERENCE);
-			const bool bAnyDial  = (m_iExposureTrim || m_iShadowLift || m_iPunch);
+			// Exposure trim is deliberately NOT in this test: trim is a LIGHT change
+			// and is applied before the curve, where the shoulder absorbs it. Only the
+			// SHAPE dials run here, so a trim-only setting must not cost a full-screen
+			// draw.
+			const bool bAnyDial  = (m_iShadowLift || m_iPunch);
 			// The operators are defined on the pipeline's gamma-2.2 display-referred
 			// code. On a PQ (HDR) swapchain the frame here is PQ-coded and the same
 			// maths means something else entirely, so pass through rather than apply
@@ -8334,11 +8338,12 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			const bool bPqOut = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
 			const bool bApply = bAnyDial && bRefCurve && !bPqOut && !m_bHDRPassthroughRaw;
 
-			struct { float lift, punch, gain, active, dbg, p0, p1, p2; } tp = {};
-			tp.lift   = (float)m_iShadowLift / 5.0f;
-			tp.punch  = (float)m_iPunch / 5.0f;
-			tp.gain   = powf(2.0f, (float)m_iExposureTrim / 3.0f);
-			tp.active = bApply ? 1.0f : 0.0f;
+			struct { float lift, punch, reserved0, active, dbg, p0, p1, p2; } tp = {};
+			tp.lift     = (float)m_iShadowLift / 5.0f;
+			tp.punch    = (float)m_iPunch / 5.0f;
+			tp.reserved0 = 0.0f;   // was expTrimGain; trim is pre-curve now. Field kept
+			                       // so this struct and the HLSL cbuffer stay one-to-one.
+			tp.active   = bApply ? 1.0f : 0.0f;
 			// gt7Dbg 1 and 2 render the taste operators themselves (delta map / shadow
 			// window mask). They only mean that here when the reference curve is up --
 			// under GT7 the same values are its own debug views, and GT7 draws earlier,
@@ -8352,10 +8357,10 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSTaste.p, m_pTasteParams, 0, false);
 				if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
 					fwprintf(m_pMLDebugFile,
-						L"TASTE_DRAW step=%u hr=%x apply=%d lift=%.2f punch=%.2f gain=%.3f dbg=%.0f "
+						L"TASTE_DRAW step=%u hr=%x apply=%d lift=%.2f punch=%.2f dbg=%.0f trim=%d(pre-curve) "
 						L"curveOk=%d anyDial=%d pqOut=%d raw=%d\n",
 						(unsigned)step, (unsigned)hr, (int)bApply, (double)tp.lift, (double)tp.punch,
-						(double)tp.gain, (double)tp.dbg, (int)bRefCurve, (int)bAnyDial, (int)bPqOut,
+						(double)tp.dbg, m_iExposureTrim, (int)bRefCurve, (int)bAnyDial, (int)bPqOut,
 						(int)m_bHDRPassthroughRaw);
 					fflush(m_pMLDebugFile);
 				}
