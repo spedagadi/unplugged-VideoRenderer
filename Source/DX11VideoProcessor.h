@@ -300,6 +300,12 @@ private:
 	CComPtr<ID3D11PixelShader> m_pPSMLHighlight;
 	CComPtr<ID3D11PixelShader> m_pPSMLChroma;
 	CComPtr<ID3D11PixelShader> m_pPSMLBars;
+	// TASTE stage -- the user's dials, applied AFTER every automatic stage so the
+	// grade cannot silently undo them. Created with the other post-scale shaders but
+	// drawn unconditionally: a dial that only works while the ML grade happens to be
+	// enabled is the "row does nothing" bug with extra steps.
+	CComPtr<ID3D11PixelShader> m_pPSTaste;
+	CComPtr<ID3D11Buffer>      m_pTasteParams;   // 8 floats: lift, punch, trimGain, active, dbg, pad x3
 
 	// P0 black-bars temporal state
 	bool m_bMLBarsEnabled = true;      // repaint bars to display black (registry: MLBars)
@@ -329,6 +335,38 @@ private:
 	// The instrument's OWN throttle — deliberately not the peak anchor's cut/lock
 	// state. See ReadDeliveredStats' call site in Render().
 	uint64_t m_uDeliveredLastFrame = 0;
+	// A taste dial moved: measure the delivered frame on the NEXT frame rather than
+	// waiting for the scene-rate throttle, and stamp the line with the dial values.
+	// Without this, "did punch change the pixels" needs a human eyeball to answer --
+	// the throttle can run 30 frames between lines and the values never appear on
+	// the same line as the measurement, so the two cannot be correlated at all.
+	bool m_bTasteProbePending = false;
+	// The taste values the MEASURED frame was actually drawn with, stamped at
+	// downsample time. Printing the live members instead is wrong by one push: the
+	// caches hold a frame rendered before the settings push that armed the read, so
+	// a sweep logs each dial value against the previous one's picture. Measured, that
+	// showed up as pu=+1 and pu=-1 producing byte-identical statistics -- impossible
+	// for two different operators, and the tell that the attribution was lagged.
+	int m_DeliveredTrim   = 0;
+	int m_DeliveredShadow = 0;
+	int m_DeliveredPunch  = 0;
+	// Build stamp for the taste operators. A CLASS member, not a function-local:
+	// both the [SHADER-CB] push and the DELIVERED line print it, and two copies of
+	// a literal drift apart -- which would make the two lines disagree about which
+	// build produced them, defeating the whole purpose. Bump on every change to
+	// ApplyLook's operators, the window knee, or the trim mapping.
+	// -a2: the operators are unchanged from v2; the attribution is not. a1 printed
+	// the dials live at log time, which lagged the measured frame by one push, and
+	// ml_debug.csv is append-mode -- so old and new lines would otherwise sit side by
+	// side with the same stamp and different meanings.
+	// v3: the operators moved onto LUMINANCE. v2 shaped R, G and B independently,
+	// which is a colour operation -- saturation and hue rode on the dial and the
+	// frame went unnatural past about +/-3 on live DV material.
+	// v4: the operators moved OUT of the converter into their own stage
+	// (ps_ml_taste.hlsl) drawn after the grade, so the user's dials are the last word
+	// instead of something the model can undo. Stamp bumped because a log line from a
+	// v3 build and one from v4 look identical but describe different stage orders.
+	static constexpr const wchar_t* kLookStamp = L"v4-taste-stage-win48-q0.6";
 	// Content RECT in the DELIVERED (window-sized) caches — pillarbox columns from
 	// m_videoRect plus the film's own letterbox rows mapped through it. Logged with
 	// every line so the crop is auditable rather than assumed.

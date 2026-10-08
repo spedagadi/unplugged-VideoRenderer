@@ -81,6 +81,7 @@ IDF_PS_11_ML_GAMMA              FILE                    "..\\_bin\\shaders\\ps_m
 IDF_PS_11_ML_SHADOW             FILE                    "..\\_bin\\shaders\\ps_ml_shadow.cso"
 IDF_PS_11_ML_HIGHLIGHT          FILE                    "..\\_bin\\shaders\\ps_ml_highlight.cso"
 IDF_PS_11_ML_FACE_DOWN          FILE                    "..\\_bin\\shaders\\ps_ml_face_down.cso"
+IDF_PS_11_ML_TASTE              FILE                    "..\\_bin\\shaders\\ps_ml_taste.cso"
 IDF_PS_11_CONVERT_HLG_TO_PQ     FILE                    "..\\_bin\\shaders\\ps_convert_hlg_to_pq.cso"
 IDF_PS_11_CONVERT_BITMAP_TO_PQ  FILE                    "..\\_bin\\shaders\\ps_convert_bitmap_to_pq.cso"
 IDF_PS_11_CONVERT_BITMAP_TO_PQ1 FILE                    "..\\_bin\\shaders\\ps_convert_bitmap_to_pq1.cso"

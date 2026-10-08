@@ -265,37 +265,15 @@ float3 ToneMapSelectedCurve(float3 nits, float sdrNits)
 }
 
 // -----------------------------------------------------------------------------
-// S-CURVE TASTE: shadow DETAIL and punch, in sRGB code space.
+// The taste operators (exposure trim, shadow detail, punch) used to live here and
+// were MOVED to Shaders/d3d11/ps_ml_taste.hlsl, which draws after the automatic
+// grade. They ran before it, so the model's gamma, shadow slope and highlight
+// rolloff were applied on top of the user's dials and could undo them silently.
 //
-// SHADOW DETAIL IS A SLOPE, NOT A LIFT. The first version of this added
-// lift*0.25*(1-c)^3 — an additive black-point lift. That raises the floor and greys
-// the image; it does not separate adjacent dark values, so it buys milkiness and no
-// detail, which is exactly the complaint it earned. What "see more in the shadows"
-// means is more DERIVATIVE in the dark range: neighbouring dark codes pushed apart.
-//
-//     c' = 1 - (1 - c)^q          q = 4^lift
-//
-// Black stays at 0 and white stays at 1 for every q, so nothing is lifted or washed;
-// the slope at black is q (4 at full open, 0.25 at full crush) and the top end pays
-// for it with compensating compression, which is what keeps the whole thing monotone
-// and endpoint-fixed. Positive lift opens the shadows and reveals their detail;
-// negative crushes them and opens the highlights. q=1 is the exact identity.
-//
-// Monotone for all q>0 by construction. Punch then blends toward a smoothstep S about
-// mid code (positive = punchy/dark, negative = flat); its worst-case slope is 0.40 at
-// the extremes, so neither term can fold or band a gradient at any setting.
+// expTrimGain / shadowLift / punch are still declared in the cbuffer below because
+// the layout is shared with the C++ side, but this shader no longer reads them --
+// see the Reference branch. One implementation of each shape, in one stage.
 // -----------------------------------------------------------------------------
-float3 ApplyLook(float3 lin, float lift, float punch)
-{
-    if (abs(lift) < 1e-4 && abs(punch) < 1e-4) return lin;
-    float3 c = lin > 0.0031308 ? 1.055 * pow(max(lin, 0.0), 1.0 / 2.4) - 0.055
-                               : 12.92 * max(lin, 0.0);
-    const float q = exp2(lift * 2.0);                 // -1..1 -> 0.25..4
-    c = 1.0 - pow(max(1.0 - c, 0.0), q);
-    c = lerp(c, c * c * (3.0 - 2.0 * c), punch * 0.6);
-    c = saturate(c);
-    return c > 0.04045 ? pow((c + 0.055) / 1.055, 2.4) : c / 12.92;
-}
 
 float4 main(PS_INPUT input) : SV_Target
 {
@@ -332,10 +310,13 @@ float4 main(PS_INPUT input) : SV_Target
     // Bounded, NOT `> 6.5`: 8 (GT7) is also above 6.5 and would silently render as
     // the reference curve. Any future selection has to be added to this test.
     if (toneCurveSelection > 6.5 && toneCurveSelection < 7.5) {
-        // Exposure trim first: an input gain, so +N pushes content up INTO the curve and
-        // the shoulder takes the highlights, instead of an output gain that would clip
-        // them. 1.0 (trim 0) is a no-op multiply and costs nothing.
-        color.rgb = ToneMappingHable(color.rgb * expTrimGain);
+        // NO taste operators here any more. Exposure trim, shadow detail and punch
+        // moved to ps_ml_taste.hlsl, which draws AFTER the automatic grade: they used
+        // to run here, before the model's gamma/shadow/rolloff were applied on top of
+        // them, so the user's setting could be silently undone downstream.
+        // expTrimGain, shadowLift and punch are still declared in this cbuffer (the
+        // layout is shared with the C++ side) but are NOT read on this path.
+        color.rgb = ToneMappingHable(color.rgb);
 
         if (outputGamut < 0.5) {
             color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
@@ -348,9 +329,8 @@ float4 main(PS_INPUT input) : SV_Target
                 color.rgb = Colorspace_Gamut_Constrain(color.rgb,
                                                        (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
-        // Taste shaping last: it acts on the finished display-referred image, after
-        // gamut mapping, so it cannot push a mapped colour back out of the triangle.
-        color.rgb = ApplyLook(color.rgb, shadowLift, punch);
+        // Nothing after the gamut step: the taste operators and their debug views
+        // now live in the taste stage, which runs after the grade.
     }
     // ---------------------------------------------------------------------
     // 8 = GT7, Polyphony Digital's operator (MIT, v1.0 2025-08-10).

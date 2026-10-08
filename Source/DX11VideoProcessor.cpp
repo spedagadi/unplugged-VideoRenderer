@@ -884,6 +884,8 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_pPSMLHighlight.Release();
 	m_pPSMLChroma.Release();
 	m_pPSMLBars.Release();
+	m_pPSTaste.Release();
+	m_pTasteParams.Release();
 	m_SkinLUT.Release();
 	m_SkinLUTSRV.Release();
 	m_pSamplerSkin.Release();
@@ -989,6 +991,13 @@ UINT CDX11VideoProcessor::GetPostScaleSteps()
 	}
 	if (m_bMLActive && m_pPSMLChroma) {
 		nSteps++; // chroma vector tuning (skin-guarded)
+	}
+	// The taste stage draws AFTER the grade block, unconditionally -- it is user
+	// settings, not a grade feature -- so it is counted here outside the m_bMLActive
+	// guards. The ring is sized from this function, so an uncounted step does not
+	// fail loudly: it reuses a texture that is still being sampled.
+	if (m_pPSTaste && m_pTasteParams) {
+		nSteps++;
 	}
 	if (m_bMLActive && m_pPSMLBars && m_bMLBarsEnabled && !m_bMLDebugCopy && !m_bHDRPassthroughRaw) {
 		nSteps++; // P0 bar repaint
@@ -1635,12 +1644,12 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// [28] who applies the mapping. The chroma pass is the last stage that can
 		// change chroma, so when it runs the constraint belongs there; when the grade
 		// is down, nothing downstream touches chroma and this shader is the right
-		// place. Applying it in both would double-compress. 28..31 keeps the buffer at
-		// 32 floats / 128 bytes, the next 16-byte multiple.
+		// place. Applying it in both would double-compress.
 		cbuffer[28] = (m_bMLActive && m_pPSMLChroma) ? 0.0f : 1.0f;
 		// [29..31] the Dynamic & Auto curve. Three floats that fully specify one
-		// monotone transfer function, in the three padding slots — so the buffer stays
-		// 36 floats / 144 bytes and no existing offset moves. (A GT7 placement/
+		// monotone transfer function, in three former padding slots. The buffer is
+		// 40 floats / 160 bytes (see the declaration above); no existing offset moves.
+		// (A GT7 placement/
 		// protection split briefly occupied 29/30 and was reverted; see the guard note
 		// in Render. These are unrelated values that happen to reuse the same padding.)
 		// Until the first solve completes, x0 is sent as 0 and the shader falls through
@@ -1659,8 +1668,11 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// S-curve taste, normalised to -1..1; the shader shapes in sRGB code space.
 		cbuffer[37] = (float)m_iShadowLift / 5.0f;
 		cbuffer[38] = (float)m_iPunch / 5.0f;
-		// [32] GT7 debug view (0 = off). 32..35 keeps the buffer at 36 floats / 144
-		// bytes, the next 16-byte multiple.
+		// [32] GT7 debug view (0 = off). Slots 34, 35 and 39 are padding; the array is
+		// FLOAT[40] and every CreateBuffer below sizes itself from sizeof(cbuffer), so
+		// there is no second copy of this layout to keep in step. The shader's cbuffer
+		// declares the same 40 in the same order -- that, not a comment, is the
+		// contract.
 		cbuffer[32] = m_fHdrGt7Dbg;
 	}
 
@@ -1676,7 +1688,15 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// refW is the EFFECTIVE reference white (the solved value when auto exposure
 		// is on) and avgN the scene mean in nits it was solved from, so "is auto
 		// exposure doing anything" is answerable from one log line.
-		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} ad={:.2f} refW={:.1f} sPk={:.1f} avgN={:.1f} dyn={} g={:.3f} k={:.3f} x0={:.1f} p={:.3f}",
+		// look= is a BUILD STAMP, not decoration: the .ax carries this C++ and the
+		// shader compiled beside it, so a line that prints the stamp proves the
+		// running filter is the build that has the windowed shadow operator and the
+		// mid-pivot punch. A line WITHOUT it means an older .ax is loaded, which is
+		// indistinguishable on screen from "the operator is weak" and has already
+		// cost a debugging session. tr/sh/pu print the raw dial and the normalised
+		// value the shader receives, so "the value never arrived" is separable from
+		// "the value arrived and did nothing".
+		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} ad={:.2f} refW={:.1f} sPk={:.1f} avgN={:.1f} dyn={} g={:.3f} k={:.3f} x0={:.1f} p={:.3f} look={} tr={} gain={:.3f} sh={} shN={:.2f} pu={} puN={:.2f} dbg={:.0f}",
 			(uintptr_t)m_pCorrectionConstants.p, 10000.0f / m_iSDRDisplayNits, m_iSDRDisplayNits,
 			m_fHdrHighlightNeutral, m_fHdrChromaExp,
 			discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_DYNAMIC_AUTO),
@@ -1684,7 +1704,9 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 			m_fEffRefWhite, m_HableScenePeakNits, m_MeanNitsSmooth,
 			// The solved curve, so "did the solver run and with what" is one field
 			// rather than an inference from the picture.
-			(int)m_bDynValid, m_fDynG, m_fDynK, m_fDynX0, m_fDynP);
+			(int)m_bDynValid, m_fDynG, m_fDynK, m_fDynX0, m_fDynP,
+			kLookStamp, m_iExposureTrim, cbuffer[36], m_iShadowLift, cbuffer[37],
+			m_iPunch, cbuffer[38], m_fHdrGt7Dbg);
 		m_pDeviceContext->UpdateSubresource(m_pCorrectionConstants, 0, nullptr, &cbuffer, 0, 0);
 		// Arm the read-back: the next few correction draws report the buffer they
 		// ACTUALLY had bound at b0 and its float values. [CBPROBE] absent after this
@@ -2099,6 +2121,23 @@ void CDX11VideoProcessor::InitMLResources()
 	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLDownsample, IDF_PS_11_ML_DOWNSAMPLE));
 	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSMLBars, IDF_PS_11_ML_BARS));
 	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPSFaceDown, IDF_PS_11_ML_FACE_DOWN));
+	// The taste stage is NOT part of the grade: it must exist (and draw) whether or
+	// not the ML grade is enabled, because the dials are the user's own settings.
+	// A failed create leaves m_pPSTaste null, GetPostScaleSteps() then stops counting
+	// it, and the dials do nothing visibly -- which is why the failure is logged.
+	if (FAILED(CreatePShaderFromResource(&m_pPSTaste, IDF_PS_11_ML_TASTE))) {
+		DLog(L"InitMLResources() TASTE shader failed -- exposure/shadow/punch will NOT apply");
+		m_pPSTaste.Release();
+	}
+	{
+		struct { float lift, punch, gain, active, dbg, p0, p1, p2; } tasteInit = { 0.f, 0.f, 1.f, 0.f, 0.f };
+		D3D11_BUFFER_DESC bt = { sizeof(tasteInit), D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE };
+		D3D11_SUBRESOURCE_DATA st = { &tasteInit };
+		if (FAILED(m_pDevice->CreateBuffer(&bt, &st, &m_pTasteParams))) {
+			DLog(L"InitMLResources() taste cbuffer failed -- exposure/shadow/punch will NOT apply");
+			m_pTasteParams.Release();
+		}
+	}
 	{
 		struct { float IsPQ; float pad[3]; } faceDownInit = {};
 		D3D11_BUFFER_DESC bd = { sizeof(faceDownInit), D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE };
@@ -4401,9 +4440,30 @@ void CDX11VideoProcessor::ReadDeliveredStats(unsigned long long frame)
 	// crop= is printed so every number on the line is auditable: if the band is wrong
 	// (or the source's own bars differ from the window's), that shows here instead of
 	// silently becoming "shadow crush".
+	//
+	// look=/tr=/sh=/pu=/dbg= are here so ONE line answers "what did the user ask for,
+	// what did the shader get, and what did the frame become". curveOut is measured
+	// AFTER the tone curve and the taste operators, postGrade AFTER the grade chain --
+	// so a dial that moves curveOut but not postGrade is being overwritten downstream,
+	// and a dial that moves neither never reached ApplyLook at all. Before this,
+	// deciding between those two needed a human watching the screen, which is not
+	// instrumentation. dbg= is the debug-view selector, because a DELIVERED line that
+	// says the picture is a greyscale delta map is a line nobody can interpret.
+	// tr/sh/pu are the values the measured frame was DRAWN with (stamped at
+	// downsample time), not the values live at log time -- those differ by one push
+	// during a sweep, and the lag is printed explicitly when it exists so a line can
+	// never be read as measuring a setting it was not drawn with.
+	wchar_t lag[80] = L"";
+	if (m_DeliveredTrim != m_iExposureTrim || m_DeliveredShadow != m_iShadowLift
+	    || m_DeliveredPunch != m_iPunch) {
+		swprintf_s(lag, L" lag[live tr=%+d sh=%+d pu=%+d]",
+		           m_iExposureTrim, m_iShadowLift, m_iPunch);
+	}
 	fwprintf(m_pMLDebugFile,
-		L"DELIVERED frame=%llu crop=[%d..%d]x[%d..%d] of %dx%d win=%dx%d vid=%dx%d (%.1f%% of frame) | curveOut: %s | postGrade: %s\n",
-		frame, m_DeliveredTopRow, m_DeliveredBotRow, m_DeliveredLeftCol, m_DeliveredRightCol,
+		L"DELIVERED frame=%llu look=%s tr=%+d sh=%+d pu=%+d dbg=%.0f%s | crop=[%d..%d]x[%d..%d] of %dx%d win=%dx%d vid=%dx%d (%.1f%% of frame) | curveOut: %s | postGrade: %s\n",
+		frame, kLookStamp, m_DeliveredTrim, m_DeliveredShadow, m_DeliveredPunch,
+		(double)m_fHdrGt7Dbg, lag,
+		m_DeliveredTopRow, m_DeliveredBotRow, m_DeliveredLeftCol, m_DeliveredRightCol,
 		ML_DOWNSAMPLE_H, ML_DOWNSAMPLE_W,
 		(int)m_windowRect.Width(), (int)m_windowRect.Height(),
 		(int)m_videoRect.Width(), (int)m_videoRect.Height(),
@@ -6455,8 +6515,14 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 			//
 			// 30 render frames is ~0.5 s at 60, ~1.25 s at 24 — fine for a scene-level
 			// number, and the read-back (2 Maps) is the only real cost.
-			if (m_bMLDebug && m_MLDebugFrame - m_uDeliveredLastFrame >= 30) {
+			// m_bTasteProbePending makes a dial move produce a measurement on the next
+			// frame instead of up to 30 frames later: the pending flag is set where the
+			// taste values are clamped, so the DELIVERED line lands in the same instant
+			// the picture changed and the two can be compared. Note the caches hold the
+			// frame that was just drawn, so this reads the effect of the NEW values.
+			if (m_bMLDebug && (m_bTasteProbePending || m_MLDebugFrame - m_uDeliveredLastFrame >= 30)) {
 				m_uDeliveredLastFrame = m_MLDebugFrame;
+				m_bTasteProbePending = false;
 				ReadDeliveredStats(m_MLDebugFrame);
 			}
 
@@ -7946,6 +8012,11 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			if (m_bMLDebug && pRT != pRenderTarget) {
 				DownsampleDelivered(*pTex, m_MLDeliveredCurveOut.p);
 				m_bDeliveredA = true;
+				// Stamp the dials THIS frame was drawn with. Read at log time instead
+				// and every line pairs a dial value with the previous push's picture.
+				m_DeliveredTrim   = m_iExposureTrim;
+				m_DeliveredShadow = m_iShadowLift;
+				m_DeliveredPunch  = m_iPunch;
 			}
 
 			// [CBPROBE] read-back, armed by every [SHADER-CB] push. Nothing rebound
@@ -8238,6 +8309,63 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			}
 		}
 
+		// TASTE -- the user's dials, drawn after every automatic stage (the grade
+		// block above has just closed) and before the bar repaint, so bars keep the
+		// last word on letterbox black.
+		//
+		// Placed here rather than in the converter because the dials used to run
+		// BEFORE the grade: the model's gamma, shadow slope and highlight rolloff
+		// were applied on top of what the user asked for, so a dial could be undone
+		// silently and nothing explained it. User intent goes last, or it isn't
+		// intent.
+		if (m_pPSTaste && m_pTasteParams) {
+			StepSetting();
+			// Semantics preserved from the converter: taste applies to the Unplugged
+			// (Reference) curve only. GT7 and the solved curves keep their own
+			// validated shapes, and an extra S-curve on top of GT7's shoulder is a
+			// different picture than anyone has agreed to.
+			const bool bRefCurve = (m_iHdrLocalToneMappingType == TONE_CURVE_REFERENCE);
+			const bool bAnyDial  = (m_iExposureTrim || m_iShadowLift || m_iPunch);
+			// The operators are defined on the pipeline's gamma-2.2 display-referred
+			// code. On a PQ (HDR) swapchain the frame here is PQ-coded and the same
+			// maths means something else entirely, so pass through rather than apply
+			// a wrong curve quietly; raw HDR/DV passthrough is bypassed too, since
+			// nothing has been tone-mapped at that point.
+			const bool bPqOut = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+			const bool bApply = bAnyDial && bRefCurve && !bPqOut && !m_bHDRPassthroughRaw;
+
+			struct { float lift, punch, gain, active, dbg, p0, p1, p2; } tp = {};
+			tp.lift   = (float)m_iShadowLift / 5.0f;
+			tp.punch  = (float)m_iPunch / 5.0f;
+			tp.gain   = powf(2.0f, (float)m_iExposureTrim / 3.0f);
+			tp.active = bApply ? 1.0f : 0.0f;
+			// gt7Dbg 1 and 2 render the taste operators themselves (delta map / shadow
+			// window mask). They only mean that here when the reference curve is up --
+			// under GT7 the same values are its own debug views, and GT7 draws earlier,
+			// so claiming them unconditionally would overwrite a view someone asked for.
+			tp.dbg    = (bApply && m_fHdrGt7Dbg > 0.5f && m_fHdrGt7Dbg < 2.5f) ? m_fHdrGt7Dbg : 0.0f;
+
+			D3D11_MAPPED_SUBRESOURCE mr = {};
+			if (SUCCEEDED(m_pDeviceContext->Map(m_pTasteParams, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr))) {
+				memcpy(mr.pData, &tp, sizeof(tp));
+				m_pDeviceContext->Unmap(m_pTasteParams, 0);
+				hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSTaste.p, m_pTasteParams, 0, false);
+				if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
+					fwprintf(m_pMLDebugFile,
+						L"TASTE_DRAW step=%u hr=%x apply=%d lift=%.2f punch=%.2f gain=%.3f dbg=%.0f "
+						L"curveOk=%d anyDial=%d pqOut=%d raw=%d\n",
+						(unsigned)step, (unsigned)hr, (int)bApply, (double)tp.lift, (double)tp.punch,
+						(double)tp.gain, (double)tp.dbg, (int)bRefCurve, (int)bAnyDial, (int)bPqOut,
+						(int)m_bHDRPassthroughRaw);
+					fflush(m_pMLDebugFile);
+				}
+			} else {
+				// A failed Map leaves the previous frame's values in the buffer, which
+				// would apply a stale look with no indication. Say so, loudly, in the
+				// same log the dials are being diagnosed from.
+				DLog(L"TASTE: Map() failed -- dials NOT applied this frame");
+			}
+		}
 		// Skin-retention metric on real video (frame log; every ~30 frames):
 			// source preview vs graded output over person/skin pixels.
 			if (m_bMLDebug && m_pMLDebugFile && !m_bMLDebugCopy && (m_MLDebugFrame % 30 == 15)) {
@@ -9006,14 +9134,17 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	if (config.iHdrExposureTrim != m_iExposureTrim) {
 		m_iExposureTrim = std::clamp(config.iHdrExposureTrim, -5, 5);
 		changeLuminanceParams = true;
+		m_bTasteProbePending = true;
 	}
 	if (config.iHdrShadowLift != m_iShadowLift) {
 		m_iShadowLift = std::clamp(config.iHdrShadowLift, -5, 5);
 		changeLuminanceParams = true;
+		m_bTasteProbePending = true;
 	}
 	if (config.iHdrPunch != m_iPunch) {
 		m_iPunch = std::clamp(config.iHdrPunch, -5, 5);
 		changeLuminanceParams = true;
+		m_bTasteProbePending = true;
 	}
 	if (config.fCtlWhiteNits != m_fCtlWhiteNits) {
 		m_fCtlWhiteNits = std::clamp(config.fCtlWhiteNits, 100.0f, 400.0f);
