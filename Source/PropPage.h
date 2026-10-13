@@ -24,7 +24,12 @@
 
 // CVRMainPPage
 
-class __declspec(uuid("DA46D181-07D6-441D-B314-019AEB10148A"))
+// New GUID, same reason as the renderer's: these two property pages are registered
+// by the same AMovieDllRegisterServer2 pass over g_Templates, so keeping upstream's
+// {DA46D181-...} would let a legacy MPCVR registration answer the CLSID and open
+// ITS dialog on top of OUR filter -- a settings UI reading the wrong registry key,
+// which looks like lost settings rather than a wrong object.
+class __declspec(uuid("57EA578F-1187-48F1-8E93-86713589221B"))
 	CVRMainPPage : public CBasePropertyPage, public CWindow
 {
 	CComQIPtr<IVideoRenderer> m_pVideoRenderer;
@@ -66,7 +71,7 @@ private:
 
 // CVRInfoPPage
 
-class __declspec(uuid("D697132B-FCA4-4401-8869-D3B39D0750DB"))
+class __declspec(uuid("43183E16-B1BA-4170-BBF7-6FA989BC1CB9"))
 	CVRInfoPPage : public CBasePropertyPage, public CWindow
 {
 	HFONT m_hMonoFont = nullptr;

@@ -19,7 +19,7 @@ REM along with this program.  If not, see <http://www.gnu.org/licenses/>.
 SETLOCAL ENABLEDELAYEDEXPANSION
 CD /D %~dp0
 
-SET "TITLE=MPC Video Renderer"
+SET "TITLE=Unplugged Renderer"
 SET "PROJECT=MpcVideoRenderer"
 
 SET "MSBUILD_SWITCHES=/nologo /consoleloggerparameters:Verbosity=minimal /maxcpucount /nodeReuse:true"

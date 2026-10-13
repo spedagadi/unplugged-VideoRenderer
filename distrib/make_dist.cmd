@@ -42,26 +42,25 @@ IF NOT DEFINED VERMINOR GOTO nover
 IF NOT DEFINED VERBUILD GOTO nover
 IF NOT DEFINED REVNUM GOTO nover
 
-SET "DIST_DIR=_bin\MpcVideoRenderer-%VERMAJOR%.%VERMINOR%.%VERBUILD%.%REVNUM%"
+REM UnpluggedRenderer-<ver>: the folder is named for this product. With the own CLSID
+REM and unplugged_vr.ax this leaves nothing in the build tree that an install of the
+REM upstream filter could collide with.
+SET "DIST_DIR=_bin\UnpluggedRenderer-%VERMAJOR%.%VERMINOR%.%VERBUILD%.%REVNUM%"
 IF NOT EXIST "%DIST_DIR%\" MKDIR "%DIST_DIR%"
 
-IF EXIST "_bin\Filter_x64\MpcVideoRenderer64.ax" (
-  COPY /Y "_bin\Filter_x64\MpcVideoRenderer64.ax" "%DIST_DIR%\" >NUL
+IF EXIST "_bin\Filter_x64\unplugged_vr.ax" (
+  COPY /Y "_bin\Filter_x64\unplugged_vr.ax" "%DIST_DIR%\" >NUL
   IF ERRORLEVEL 1 SET "FAILED=1"
 ) ELSE (
-  ECHO [WARN] _bin\Filter_x64\MpcVideoRenderer64.ax not found - build Release x64 first.
-)
-IF EXIST "_bin\Filter_x86\MpcVideoRenderer.ax" (
-  COPY /Y "_bin\Filter_x86\MpcVideoRenderer.ax" "%DIST_DIR%\" >NUL
-  IF ERRORLEVEL 1 SET "FAILED=1"
-) ELSE (
-  ECHO [WARN] _bin\Filter_x86\MpcVideoRenderer.ax not found - build Release x86 first.
+  ECHO [ERROR] _bin\Filter_x64\unplugged_vr.ax not found - build Release x64 first.
+  SET "FAILED=1"
 )
 
-COPY /Y "distrib\Install_MPCVR_32.cmd"         "%DIST_DIR%\" >NUL
-COPY /Y "distrib\Install_MPCVR_64.cmd"         "%DIST_DIR%\" >NUL
-COPY /Y "distrib\Uninstall_MPCVR_32.cmd"       "%DIST_DIR%\" >NUL
-COPY /Y "distrib\Uninstall_MPCVR_64.cmd"       "%DIST_DIR%\" >NUL
+REM x86 dropped deliberately: the product is x64-only (the installer sets
+REM ArchitecturesAllowed=x64compatible), and shipping an Install_*_32.cmd alongside a
+REM folder with no 32-bit .ax in it is a script that can only fail.
+COPY /Y "distrib\Install_Unplugged_64.cmd"     "%DIST_DIR%\" >NUL
+COPY /Y "distrib\Uninstall_Unplugged_64.cmd"   "%DIST_DIR%\" >NUL
 COPY /Y "distrib\Reset_Settings.cmd"           "%DIST_DIR%\" >NUL
 COPY /Y "LICENSE.txt"                          "%DIST_DIR%\" >NUL
 COPY /Y "Readme.md"                            "%DIST_DIR%\" >NUL
@@ -96,10 +95,8 @@ IF EXIST "Source\onnxrt\yolo26n-seg_op21.onnx" (
 ECHO.
 ECHO Distribution folder ready:  "%CD%\%DIST_DIR%"
 ECHO.
-ECHO   Register x64:   right click "%DIST_DIR%\Install_MPCVR_64.cmd"   -^> Run as administrator
-ECHO   Deregister x64: right click "%DIST_DIR%\Uninstall_MPCVR_64.cmd" -^> Run as administrator
-ECHO   Register x86:   right click "%DIST_DIR%\Install_MPCVR_32.cmd"   -^> Run as administrator
-ECHO   Deregister x86: right click "%DIST_DIR%\Uninstall_MPCVR_32.cmd" -^> Run as administrator
+ECHO   Register:     right click "%DIST_DIR%\Install_Unplugged_64.cmd"   -^> Run as administrator
+ECHO   Deregister:   right click "%DIST_DIR%\Uninstall_Unplugged_64.cmd" -^> Run as administrator
 ECHO.
 EXIT /B %FAILED%
 

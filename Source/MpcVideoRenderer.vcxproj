@@ -43,7 +43,12 @@
     <TargetExt>.ax</TargetExt>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Platform)'=='x64'">
-    <TargetName>$(ProjectName)64</TargetName>
+    <!-- unplugged_vr.ax, not MpcVideoRenderer64.ax: a distinct file name is what
+         stops this filter being overwritten in place by (or overwriting) a legacy
+         MPC Video Renderer install that happens to use the same folder. The CLSID
+         change alone would not: same file name plus a shared directory is how one
+         install silently replaces the other's binary. -->
+    <TargetName>unplugged_vr</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <Link>

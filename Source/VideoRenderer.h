@@ -73,7 +73,14 @@ const AMOVIESETUP_MEDIATYPE sudPinTypesIn[] = {
 
 class CVideoRendererInputPin;
 
-class __declspec(uuid("71F080AA-8661-4093-B15E-4F6903E77D0A"))
+// UNPLUGGED CLSID -- deliberately NOT the upstream {71F080AA-8661-4093-B15E-4F6903E77D0A}.
+// Sharing that GUID meant whichever .ax registered LAST owned the InprocServer32
+// entry for BOTH, so an install of the upstream filter could silently take over
+// this one's activation (or the reverse). A distinct GUID is the only thing that
+// makes side-by-side coexistence possible; the friendly name is not it, and the
+// MERIT_DO_NOT_USE registration below means nothing auto-discovers either one --
+// hosts must name this CLSID explicitly.
+class __declspec(uuid("E8BD7497-6880-4CD6-8C51-5FA97ECDAC3F"))
 	CMpcVideoRenderer
 	: public CBaseVideoRenderer2
 	, public IKsPropertySet

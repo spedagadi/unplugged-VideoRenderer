@@ -41,7 +41,10 @@ const AMOVIESETUP_PIN sudpPins[] = {
 };
 
 const AMOVIESETUP_FILTER sudFilter[] = {
-	{&__uuidof(CMpcVideoRenderer), L"MPC Video Renderer", MERIT_DO_NOT_USE, (UINT)std::size(sudpPins), sudpPins, CLSID_LegacyAmFilterCategory},
+	// "Unplugged Renderer" -- the name graphedit/other hosts show. This one is
+	// presentational: every host that works with this filter does so by CLSID, so
+	// renaming it breaks nothing functional. The GUID above is the load-bearing one.
+	{&__uuidof(CMpcVideoRenderer), L"Unplugged Renderer", MERIT_DO_NOT_USE, (UINT)std::size(sudpPins), sudpPins, CLSID_LegacyAmFilterCategory},
 };
 
 CFactoryTemplate g_Templates[] = {
