@@ -123,6 +123,20 @@ float3 Colorspace_Gamut_Conversion_2020_to_709(const float3 rgb)
 // Y=0.15 was pulled to 0.58 where madVR sits at 0.75 -- UNDER-saturated, red now
 // higher than madVR's -- while the mid sky at Y=0.42 still needed 0.40. One constant
 // cannot be both, and a step cannot be a slope.
+// DO NOT "FIX" THIS BACK TO A STEP AT Y=0.15. That was attempted on 2026-10-12 when the
+// Dune 12 dusk sky read fill 0.804 at Y=0.14 with capEff 0.802 granted — i.e. the dial
+// could not act at ANY value, which looks exactly like a band that finishes too late. The
+// tree already contains the measurement of that repair, five lines above: the step over
+// Y 0.02..0.15 pulled a deep sky at Y=0.15 to 0.58 where madVR sits at 0.75, UNDER-
+// saturating it and putting red above madVR's. Same luminance, opposite requirement.
+//
+// And the new reading agrees: madVR's delivered fill at Y~0.09-0.14 is 0.75 on the Everest
+// sky, 0.585-0.676 on the Bladerunner cyan, and 0.413 on the Dune 12 dusk sky. A function
+// of luminance alone cannot pass through three different values at one Y, so this ramp is
+// not the defect -- it is the wrong AXIS. What separates those three is how far the colour
+// sat OUTSIDE 709 before anything was done to it, which the primaries matrix and the
+// saturate() both destroy before this function is ever called. The fix is to carry that
+// extent in, not to re-tune the slope.
 float GamutCapAtY(const float Y, const float cap)
 {
     return lerp(0.95, max(cap, 1e-3f), saturate(Y / 0.40));
@@ -184,6 +198,54 @@ float GamutEdgeScale(const float c, const float Y)
 // chroma pass. What the constraint actually needs is only the edge scale and the move
 // toward the pixel's own neutral point, and both of those are defined on whatever
 // primaries the colour is currently in.
+// CAPACITY AUTHORITY: how much say the cap gets over THIS colour.
+//
+// k = capEff*S is a FILL TARGET, so it lands every colour at `capEff` of the way to the
+// edge — legal or not. Measured consequence on mastered graphics (linear 709, cap 0.55):
+//     punchy yellow text  (255,230, 15) -> (239,225,107)   blue invented 15 -> 107
+//     deep orange / fire  (255,115,  5) -> (202,125, 64)   red dropped, blue up 13x
+// A colour only escaped the pull if it had 1/capEff of spare room (S >= 1.8 at 0.55),
+// which no saturated colour has — so the value fitted to madVR's SKY was simultaneously
+// bleaching legal content. Those two want opposite things from one knob, and the
+// variable that separates them is LEGALITY, not lightness: a 2020 sky arrives outside
+// 709 after the primaries matrix (S < 1), a mastered graphic does not (S >= 1).
+//
+// So authority ramps with how far OUTSIDE the colour is: 0 when it fits (no pull at all,
+// however saturated — which is what keeps yellow text yellow), 1 once it is kEdge or
+// further past its own bound (the full capEff, i.e. exactly the old behaviour, so the
+// sky and the tent measurements the cap was fitted against still hold).
+//
+// The ramp is not cosmetic. A hard `if (S >= 1)` steps chroma at the gamut boundary and
+// rings on any gradient that crosses it — and gradient energy in fabric is precisely what
+// GamutCapAtY's lightness relaxation was fitted to protect.
+static const float kGamutCapEdge = 0.90f;
+
+// ESCAPE DEPTH — MEASURED AND REJECTED. Left in, set to 1.0 (the identity), because the
+// number is the result and the constant is the switch.
+//
+// The hypothesis: madVR sits the Dune dusk sky at gamut fill 0.413 where we sat at 0.804,
+// so a colour further OUTSIDE 709 should be pulled harder than one barely outside —
+// target fill = capEff x S^(p-1) instead of capEff, with p = 2.
+//
+// The measurement (fillmap.ps1, same frame, one pass over both renders): D9 fill went
+// 0.804 -> 0.796. Nothing. Which is itself the answer — the constraint's own k came out
+// ~= capEff, meaning S was already very close to 1.0, meaning this sky is NOT deep outside
+// 709; it is a legal colour sitting at 80% of the capacity madVR only uses 41% of. So the
+// wrong quantity was being fixed. madVR's fill FALLS as luminance rises (0.60 -> 0.54 ->
+// 0.43 -> 0.31 across the top four bands) while ours RISES (0.74 -> 0.83 -> 0.80 -> 0.57):
+// that is a missing level-linked desaturation, which lives in ps_ml_chroma (MLHiDesat),
+// not a missing gamut term.
+//
+// Raising this above 1.0 again would only pull colours that are genuinely far outside the
+// triangle harder — deep saturated blues — with no measurement asking for it.
+static const float kGamutEscapePow = 1.0f;
+
+
+float GamutCapAuthority(const float S)
+{
+    return saturate((1.0f - S) / max(1.0f - kGamutCapEdge, 1e-4f));
+}
+
 float3 Colorspace_Gamut_Constrain(const float3 rgb, const float cap)
 {
     const float Y = saturate(dot(rgb, float3(0.2126, 0.7152, 0.0722)));
@@ -191,7 +253,11 @@ float3 Colorspace_Gamut_Constrain(const float3 rgb, const float cap)
 
     const float S = min(min(GamutEdgeScale(rgb.r, Y), GamutEdgeScale(rgb.g, Y)),
                         GamutEdgeScale(rgb.b, Y));
-    const float k = min(1.0f, capEff * S);
+    const float authority = GamutCapAuthority(S);
+    // Target fill = capEff x S^(p-1); k = target x S. p = 1 makes the hinge exactly 1 and
+    // this reduces, term for term, to the behaviour this file shipped before.
+    const float hinge = pow(clamp(S, 0.0f, 1.0f), max(kGamutEscapePow - 1.0f, 0.0f));
+    const float k = min(1.0f, lerp(1.0f, capEff * hinge, authority) * S);
 
     return saturate(Y + k * (rgb - Y));
 }
@@ -223,7 +289,15 @@ float3 Colorspace_Gamut_Compress_2020_to_709(const float3 rgb, const float cap)
 
     const float S = min(min(GamutEdgeScale(mapped.r, Y), GamutEdgeScale(mapped.g, Y)),
                         GamutEdgeScale(mapped.b, Y));
-    const float k = min(1.0f, capEff * S);
+    // Same authority rule as Colorspace_Gamut_Constrain, from the same helper: a colour
+    // that FITS is not asked to give up chroma, however saturated it is. Keeping the two
+    // paths on one definition is deliberate — a cap that behaves differently depending on
+    // which stage applied it is how "the sky obeyed the cap while the tent did not"
+    // happened in the first place.
+    const float authority = GamutCapAuthority(S);
+    // Same hinge as Constrain, so the two paths cannot disagree about what the cap means.
+    const float hinge = pow(clamp(S, 0.0f, 1.0f), max(kGamutEscapePow - 1.0f, 0.0f));
+    const float k = min(1.0f, lerp(1.0f, capEff * hinge, authority) * S);
 
     return saturate(Y + k * (mapped - Y));
 }

@@ -37,7 +37,17 @@
 #define WM_MPCVR_TRAY_MSG     (WM_APP + 0x1001)
 #define MPCVR_TRAY_ICON_ID    0x51
 
-#define OPT_REGKEY_VIDEORENDERER           L"Software\\MPC-BE Filters\\MPC Video Renderer"
+// Our OWN settings key. It used to be the upstream filter's path, which meant this
+// filter and an install of that one shared a single settings store: separate COM
+// identities, same UseD3D11 / TextureFormat / etc. Each would overwrite the other's
+// values, and "Restore default settings" in one reset the other.
+//
+// The upstream path is kept below, and only below, so existing values can be carried
+// over once -- it is a migration source, not our identity.
+#define OPT_REGKEY_VIDEORENDERER           L"Software\\Unplugged\\Renderer"
+#define OPT_REGKEY_VIDEORENDERER_LEGACY    L"Software\\MPC-BE Filters\\MPC Video Renderer"
+#define OPT_REGKEY_UNPLUGGED_ROOT          L"Software\\Unplugged"
+#define OPT_SettingsMigrated               L"RendererSettingsMigrated"
 #define OPT_UseD3D11                       L"UseD3D11"
 #define OPT_ShowStatistics                 L"ShowStatistics"
 #define OPT_TrayIcon                       L"TrayIcon"
@@ -192,8 +202,78 @@ static LRESULT CALLBACK ParentWndProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM
 // CMpcVideoRenderer
 //
 
+// One-time carry-over of settings from the legacy shared key.
+//
+// The condition is deliberately NOT "the new key is missing": that would make
+// distrib\Reset_Settings.cmd (which deletes the new key to restore defaults) silently
+// re-import the upstream filter's settings, so a reset would appear to have
+// done nothing. A marker under our own root makes the migration exactly once per
+// machine, whatever the user then does to either key.
+//
+// Values are enumerated rather than copied by name on purpose: the settings list is
+// long and grows, and a hand-written list here would drift out of step with the
+// reader below -- which is the same "two copies of one fact" failure the key sharing
+// was.
+static void MigrateLegacyRendererSettings()
+{
+	CRegKey marker;
+	if (ERROR_SUCCESS == marker.Open(HKEY_CURRENT_USER, OPT_REGKEY_UNPLUGGED_ROOT, KEY_READ)) {
+		DWORD done = 0;
+		if (ERROR_SUCCESS == marker.QueryDWORDValue(OPT_SettingsMigrated, done) && done) {
+			return;
+		}
+	}
+
+	CRegKey legacy;
+	if (ERROR_SUCCESS != legacy.Open(HKEY_CURRENT_USER, OPT_REGKEY_VIDEORENDERER_LEGACY, KEY_READ)) {
+		// Nothing to inherit. Mark it done anyway, so a legacy key created later by
+		// some other product is never swallowed by us.
+		if (ERROR_SUCCESS == marker.Create(HKEY_CURRENT_USER, OPT_REGKEY_UNPLUGGED_ROOT)) {
+			marker.SetDWORDValue(OPT_SettingsMigrated, 1);
+		}
+		return;
+	}
+
+	CRegKey fresh;
+	if (ERROR_SUCCESS != fresh.Create(HKEY_CURRENT_USER, OPT_REGKEY_VIDEORENDERER)) {
+		DLog(L"settings migration: cannot create {}", OPT_REGKEY_VIDEORENDERER);
+		return;
+	}
+
+	int copied = 0;
+	for (DWORD i = 0; ; ++i) {
+		wchar_t name[256] = {};
+		DWORD nameChars = (DWORD)std::size(name);
+		DWORD data = 0;
+		DWORD cb = sizeof(data);
+		DWORD type = 0;
+		// A fixed 4-byte buffer reports ERROR_MORE_DATA for anything larger (strings,
+		// binary); that is the filter for "not one of ours", not a failure.
+		LONG rc = RegEnumValue(legacy, i, name, &nameChars, nullptr, &type,
+			reinterpret_cast<LPBYTE>(&data), &cb);
+		if (rc == ERROR_NO_MORE_ITEMS) {
+			break;
+		}
+		if (rc != ERROR_SUCCESS || type != REG_DWORD || cb != sizeof(DWORD)) {
+			continue;
+		}
+		if (ERROR_SUCCESS == fresh.SetDWORDValue(name, data)) {
+			++copied;
+		}
+	}
+
+	if (ERROR_SUCCESS == marker.Create(HKEY_CURRENT_USER, OPT_REGKEY_UNPLUGGED_ROOT)) {
+		marker.SetDWORDValue(OPT_SettingsMigrated, 1);
+	}
+
+	// Logged because the alternative is a user seeing their old settings in a "new"
+	// product, or missing them, with no way to tell which key answered.
+	DLog(L"settings migration: copied {} value(s) from '{}' to '{}'; the new key is authoritative from now on",
+		copied, OPT_REGKEY_VIDEORENDERER_LEGACY, OPT_REGKEY_VIDEORENDERER);
+}
+
 CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
-	: CBaseVideoRenderer2(__uuidof(this), L"MPC Video Renderer", pUnk, phr)
+	: CBaseVideoRenderer2(__uuidof(this), L"Unplugged Renderer", pUnk, phr)
 {
 	DLog(L"CMpcVideoRenderer::CMpcVideoRenderer()");
 
@@ -216,7 +296,9 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 	m_pInputPin = new CVideoRendererInputPin(this, phr, L"In", this);
 	ASSERT(S_OK == *phr);
 
-	// read settings
+	// read settings -- after any one-time carry-over from the legacy shared key, so
+	// the first run after this build keeps the values a user already tuned.
+	MigrateLegacyRendererSettings();
 
 	CRegKey key;
 	if (ERROR_SUCCESS == key.Open(HKEY_CURRENT_USER, OPT_REGKEY_VIDEORENDERER, KEY_READ)) {
@@ -677,7 +759,7 @@ HRESULT CMpcVideoRenderer::Receive(IMediaSample* pSample)
 	// override CBaseRenderer::Receive() for the implementation of the search during the pause
 
 	if (m_bFlushing) {
-		DLog(L"CMpcVideoRenderer::Receive() - flushing, skip sample");
+		VLog(L"CMpcVideoRenderer::Receive() - flushing, skip sample");   // one line per sample during a flush
 		return S_OK;
 	}
 
@@ -1549,7 +1631,7 @@ void CMpcVideoRenderer::AddTrayIcon()
 	nid.uID = MPCVR_TRAY_ICON_ID;
 	nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
 	nid.uCallbackMessage = WM_MPCVR_TRAY_MSG;
-	wcscpy_s(nid.szTip, L"MPC Video Renderer");
+	wcscpy_s(nid.szTip, L"Unplugged Renderer");
 	nid.hIcon = (HICON)::LoadImageW(g_hInst, MAKEINTRESOURCE(IDI_MPCVR_TRAY), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
 
 	if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
@@ -1630,7 +1712,7 @@ void CMpcVideoRenderer::ShowConfigDialog()
 		if (SUCCEEDED(pProp->GetPages(&caGUID))) {
 			OleCreatePropertyFrame(
 				m_hTrayWnd, 0, 0,
-				fi.achName[0] ? fi.achName : L"MPC Video Renderer",
+				fi.achName[0] ? fi.achName : L"Unplugged Renderer",
 				1, &pFilterUnk,
 				caGUID.cElems, caGUID.pElems,
 				0,                    // Locale identifier
@@ -2194,7 +2276,9 @@ STDMETHODIMP CMpcVideoRenderer::GetString(LPCSTR field, LPWSTR* value, int* char
 	std::wstring str;
 
 	if (!strcmp(field, "name")) {
-		str = L"MPC Video Renderer";
+		// Reported to the host (and to the Unplugged app's status panel). The engine
+		// matches on this only for display, never to decide anything.
+		str = L"Unplugged Renderer";
 	}
 	else if (!strcmp(field, "version")) {
 		str = _CRT_WIDE(VERSION_STR);

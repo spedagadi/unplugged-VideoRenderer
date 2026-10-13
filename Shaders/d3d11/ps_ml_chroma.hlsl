@@ -134,7 +134,17 @@ float4 main(PS_INPUT input) : SV_Target
 {
 	float4 color = tex.Sample(samp, input.Tex);
 
-	if (MLChromaGate < 0.5)
+	// The GRADE's boost and the USER's highlight desat are two different switches and
+	// they used to share one gate: `if (MLChromaGate < 0.5) return` exited before the
+	// desat too, so turning Zion's chroma tuning off silently killed hdr.hiDesat — the
+	// exact "my dial does nothing" confusion the rail exists to avoid. Measured on the
+	// Dune 12 dusk sky: chroma off, cyan unchanged, and Hi-Desat at max only denting it
+	// when chroma was back on. The pass now runs whenever EITHER wants it, and the boost
+	// alone is gated below.
+	//
+	// Both off still short-circuits: no ICtCp round trip, no LUT sample, and the output
+	// is bit-identical to what this pass returned before this existed.
+	if (MLChromaGate < 0.5 && MLHiDesat <= 0.001f)
 		return GamutConstrain(color);
 
 	// Convert to linear nits → ICtCp
@@ -174,28 +184,86 @@ float4 main(PS_INPUT input) : SV_Target
 		eff = lerp(skin_weight, skin_weight * P, MLSkinPersonStrength);
 	}
 
-	// Chroma boost curve: 1.0 at black → neutral at knee → fire at peak.
-	// Monotonic ramp matches tone-mapping desaturation profile (highlights
-	// lose more saturation than shadows). No boost on near-black noise.
+	// One level axis shared by both operators below: this pass's own normalised
+	// intensity. Both key on it so they cannot disagree about where a pixel sits.
 	float I_peak = (IsPQ > 0.5) ? max(MLL1Max, 0.01) : SDR_I_PEAK_PQ;
 	float I_norm = ictcp.x / I_peak;
-	float luma_boost;
-	if (I_norm <= MLChromaKnee) {
-		float t = I_norm / max(MLChromaKnee, 0.01);
-		luma_boost = lerp(1.0, MLChromaNeutral, t);
-	} else {
-		float t = saturate((I_norm - MLChromaKnee) / max(1.0 - MLChromaKnee, 0.01));
-		luma_boost = lerp(MLChromaNeutral, MLChromaFire, pow(t, 1.5));
-	}
 
-	// Suppress boost on skin (person-gated LUT weight)
-	float chroma_scalar = lerp(luma_boost, 1.0,
-	                           saturate(eff * MLChromaSkinProtect));
-	chroma_scalar = clamp(chroma_scalar, 1.0, 1.50);
+	// ── the GRADE's boost, gated by MLChromaGate ────────────────────────────────────
+	// 1.0 at black -> neutral at knee -> fire at peak. Monotonic ramp matches a
+	// tone-mapping desaturation profile (highlights lose more saturation than shadows).
+	// No boost on near-black noise.
+	float chroma_scalar = 1.0f;
+	if (MLChromaGate >= 0.5) {
+		float luma_boost;
+		if (I_norm <= MLChromaKnee) {
+			float tb = I_norm / max(MLChromaKnee, 0.01);
+			luma_boost = lerp(1.0, MLChromaNeutral, tb);
+		} else {
+			float tb = saturate((I_norm - MLChromaKnee) / max(1.0 - MLChromaKnee, 0.01));
+			luma_boost = lerp(MLChromaNeutral, MLChromaFire, pow(tb, 1.5));
+		}
+		// Suppress boost on skin (person-gated LUT weight)
+		chroma_scalar = clamp(lerp(luma_boost, 1.0, saturate(eff * MLChromaSkinProtect)),
+		                      1.0f, 1.50f);
+	}
 
 	// Scale Ct/Cp — perceptually uniform chroma boost
 	ictcp.y *= chroma_scalar;
 	ictcp.z *= chroma_scalar;
+
+	// Post-curve highlight desaturation — the term the tone curve structurally cannot
+	// have, and the counterweight to the boost above.
+	//
+	// WHY IT BELONGS HERE. The converter desaturates by pow(gGain, chromaExp-1), where
+	// gGain is the CURVE's compression of that pixel. But the band steps run afterwards
+	// and move I in ICtCp while holding Ct/Cp ABSOLUTE (see ps_ml_gamma.hlsl:6) —
+	// constant chroma magnitude over changed intensity is, by definition, a change of
+	// RELATIVE saturation. A band lift washes colour out, a band crush pushes it up,
+	// and the converter's exponent has already been decided and cannot see either. This
+	// pass is the last stage that can change chroma, so it is the only place the
+	// DELIVERED level is known: keying here accounts for the curve, the bands and
+	// micro-contrast at once, without modelling any of them on the CPU.
+	//
+	// SAME DOMAIN, ON PURPOSE. The window is keyed on I_norm, the very quantity whose
+	// Ct/Cp it scales. Neither MLChromaKnee (the BOOST's knee, a different question) nor
+	// the grade's MLHighlightKnee (ps_ml_gamma's domain) is reused for it: comparing
+	// either against I_norm is the I-vs-chroma split that has made saturation drift with
+	// the curve three times already in this project. The two edges below are fitted
+	// constants belonging to THIS operator, expressed in THIS pass's units.
+	//
+	// SDR PATH ONLY (IsPQ < 0.5). When the grade runs on a PQ image the tone curve has
+	// not run yet, so there is no delivered level to refer to and the converter's
+	// exponent is the whole story — applying this there would desaturate twice.
+	//
+	// SHAPE: A WINDOW, NOT A RAMP TO THE CEILING. Fitted, not chosen — fillmap.ps1 on the
+	// Dune 12 dusk frame (2026-10-12), seven matched bands against madVR, taking the
+	// chroma scale madVR uses relative to ours (his gamut fill / ours) at each band's
+	// I_norm:
+	//     I_norm   0.44   0.55   0.57   0.59   0.61   0.66   0.78
+	//     needed   0.96   0.81   0.76   0.71   0.66   0.54   0.54
+	//     window   1.00   0.82   0.76   0.71   0.66   0.54   0.50   <- smoothstep .45->.70, dial .50
+	//     fill     0.58   0.61   0.59   0.57   0.55   0.43   0.28
+	//     madVR    0.56   0.60   0.60   0.58   0.54   0.43   0.31
+	// mean |error| 0.014 across the seven. The linear ramp this term shipped with scores
+	// 0.125 — nine times worse — and its failure is the reported symptom: only 13% engaged
+	// where the complaint lives (I_norm 0.59) and fully engaged by the ceiling, i.e.
+	// "hiDesat at max barely changes the sky but flattens the speculars". madVR's
+	// desaturation is a WINDOW that closes by I_norm ~0.70, not a ramp that finishes at
+	// the top of the range. The window's upper edge also stops the term from spending
+	// itself on the speculars it was never meant to touch.
+	const float kHiDesatStart = 0.45f;
+	const float kHiDesatEnd   = 0.70f;
+	// Skin keeps its colour at any setting: the pull is damped by the same person-gated
+	// P(skin) weight that suppresses the boost, so this cannot drain a face — the one rule
+	// that is not negotiable here. MLHiDesat 0 leaves the branch entirely.
+	if (MLHiDesat > 0.001 && IsPQ < 0.5) {
+		const float guard = 1.0 - saturate(eff * MLChromaSkinProtect);
+		const float w = smoothstep(kHiDesatStart, kHiDesatEnd, I_norm);
+		const float desat = 1.0 - clamp(MLHiDesat, 0.0f, 1.0f) * w * guard;
+		ictcp.y *= desat;
+		ictcp.z *= desat;
+	}
 
 	// Inverse: ICtCp → linear nits → output
 	float3 rgb_out = ictcp_to_linear(ictcp);

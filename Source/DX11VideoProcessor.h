@@ -370,7 +370,26 @@ private:
 	// Hable absorbs a pre-curve gain in its shoulder; post-curve the same gain can
 	// only clip -- measured at +2 trimming 39/256 ramp codes past full scale, +5
 	// 202/256. Only the SHAPE dials (shadow detail, punch) stay in the taste stage.
-	static constexpr const wchar_t* kLookStamp = L"v5-shape-post-trim-pre-win48";
+	// v6: the Unplugged curve's highlight ceiling now comes from the master's MaxCLL
+	// when the signal carries it (cbuffer[39], nits), else upstream's fixed 4.8 x
+	// sdrNits. Metadata-free sources (DV over HDMI, capture) are byte-identical to v5.
+	// v7: the GT7 family changed in four places that all look identical in the picture
+	// until one of them fails — exposure trim folded into the placement gain (so the
+	// shoulder absorbs it instead of the clamp), the chroma-fade reference derived FROM
+	// that gain rather than restating it (restating it is what ate the highlight cores),
+	// refWhite capped at the shoulder's reach for the manual path as well as the solved
+	// one, and GT7PreCompress's restored residual bounded against black (an unbounded
+	// residual is how a dark fleck inside an explosion rendered as a black pixel).
+	// Bumped because the guard above is invisible in every log line the filter emits:
+	// without a stamp change there is no way to tell a guarded build from the one that
+	// produced the speckles, which is precisely the question being asked right now.
+	// v8: GT7PreCompress's residual amplitude is now bounded by comp/base, not just its
+	// output by zero. v7 shipped the output clamp, which was the wrong guard: the operator
+	// is keep*x + (comp - keep*base), so a deep compression leaves a large NEGATIVE
+	// CONSTANT and crushes every pixel below ~73 nits toward black, not merely the ones
+	// that cross it. Found because disabling softKnee removed the speckles on v7 — which
+	// could only be true if the compressor itself, not its floor, was the cause.
+	static constexpr const wchar_t* kLookStamp = L"v8-residual-amplitude";
 	// Content RECT in the DELIVERED (window-sized) caches — pillarbox columns from
 	// m_videoRect plus the film's own letterbox rows mapped through it. Logged with
 	// every line so the crop is auditable rather than assumed.
@@ -501,6 +520,11 @@ private:
 	float m_fMLChromaKnee = 0.55f;
 	bool  m_bMLChromaSkinEnabled = true;
 	float m_fMLChromaSkinProtect = 0.95f;
+	// Post-curve highlight desaturation, fed to MLParams_t::MLHiDesat and read by
+	// ps_ml_chroma. 0 = the pass behaves exactly as it did before this existed.
+	// The slot itself is old — it used to receive a hardcoded 0.25 that no shader
+	// read; the value was in the buffer, the behaviour was not.
+	float m_fMLHiDesat = 0.0f;
 	float m_fSkinLUTCR0 = -0.2009f, m_fSkinLUTCR1 = 0.3295f;
 	float m_fSkinLUTCB0 = -0.2494f, m_fSkinLUTCB1 = 0.1967f;
 	CComPtr<ID3D11Texture2D> m_SkinLUT;
@@ -747,6 +771,24 @@ private:
 	float m_fRefWhiteTarget  = 0.42f;
 	float m_fRefWhiteAuto    = 0.0f;   // solved per scene, 0 = not yet
 	float m_fEffRefWhite     = 0.0f;   // what the gain actually divides by
+	// The shoulder's own bound on refWhite, and the reason m_fEffRefWhite may not equal
+	// whatever the dial asked for. Logged next to it so a saturating control reads as a
+	// guard working rather than a setting that stopped responding.
+	float m_fRefWhiteCeil    = 0.0f;
+	// The highlight ceiling the Unplugged (Hable) curve divides by: the master's MaxCLL
+	// when the signal carries one, else upstream's fixed 4.8 x sdrNits. Published because
+	// the fallback chain leaves `cll` holding the Title-peak dial (floor 100) on a
+	// metadata-free source while the shader uses 610 — six times apart, and the CPU model
+	// has to use the number the shader used.
+	float m_fHableCeilNits   = 0.0f;
+
+	// The delivered level for a SOURCE luminance under the curve ACTUALLY RUNNING,
+	// as a fraction of display white (linear), and the same encoded for gamma 2.2.
+	// The band controller's relative anchors and the auto mid-tone solve consume
+	// these. They used to call the GT7 model unconditionally, so on the Unplugged
+	// curve the controller was predicting a shoulder that was never drawn.
+	float PredictDeliveredRelLinear(float srcNits) const;
+	float PredictDeliveredEncoded(float srcNits) const;
 	// How much of the shoulder's luminance compression is passed on to chroma.
 	// 0 = none (previous picture), 1 = chroma compresses as hard as luminance.
 	// cbuffer[26].
@@ -935,7 +977,11 @@ private:
 
 	HRESULT CreatePShaderFromResource(ID3D11PixelShader** ppPixelShader, UINT resid);
 	void SetShaderConvertColorParams();
-	void SetShaderLuminanceParams();
+	// perFramePush marks a re-send driven by a per-frame measurement (the auto
+	// reference white, the Hable scene peak) rather than by a settings change. The
+	// [SHADER-CB] readout follows it: a settings push is worth seeing in a user's
+	// quiet trace, a push that fires every frame is debug-flag material.
+	void SetShaderLuminanceParams(bool perFramePush = false);
 
 	// Display calibration 3D LUT (.cube, ArgyllCMS/DisplayCAL/Resolve format).
 	// Loaded into a TEXTURE3D and sampled in the final pass — the last stage

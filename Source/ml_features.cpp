@@ -354,7 +354,7 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 					static LONG s_badPx = 0;
 					const LONG n = InterlockedIncrement(&s_badPx);
 					if (n == 1 || (n % 1000) == 0)
-						DLog(L"[ML] BuildMLFeatures: luma %.6f out of [0,1] at y=%d x=%d (badPx=%ld) — clamped",
+						DLog(L"[ML] BuildMLFeatures: luma {:.6} out of [0,1] at y={} x={} (badPx={}) — clamped",
 							(double)l, y, x, (long)n);
 				}
 				anchorHist[bin]++;

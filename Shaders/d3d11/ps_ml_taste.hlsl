@@ -104,7 +104,11 @@ float3 Taste(float3 code)
 	// coming out brighter than mid shadows.)
 	const float q = exp2(shadowLift * 0.6);               // -1..1 -> 0.66..1.52
 	if (y < kShadowKnee) {
-		y = kShadowKnee * (1.0 - pow(1.0 - y / kShadowKnee, q));
+		// saturate() is not a clamp for correctness here -- the guard above already
+		// puts y/k in [0,1) -- it is how the compiler is told so. Without it fxc emits
+		// X3571 (pow with a possibly-negative base), and a warning that outlives its
+		// cause gets "fixed" by someone who cannot tell it was already impossible.
+		y = kShadowKnee * (1.0 - pow(saturate(1.0 - y / kShadowKnee), q));
 	}
 
 	// Punch: contrast about mid grey. s<1 (positive) drives both arms away from the

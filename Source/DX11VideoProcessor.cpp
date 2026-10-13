@@ -425,6 +425,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_fMLGammaTopUp         = config.fMLGammaTopUp;
 	m_bMLDebugCopy          = config.bMLDebugCopy;
 	m_bMLDebug              = config.bMLDebugLog;
+	mpcvr::SetTraceVerbose(m_bMLDebug);   // ONE flag: the CSV and the per-frame trace
 	if (m_pFaceDetect) m_pFaceDetect->SetLogEnabled(m_bMLDebug);   // per-frame face lines follow the flag
 	if (m_pSkySeg)     m_pSkySeg->SetLogEnabled(m_bMLDebug);       // .. and sky seg
 	m_bMLShadowDebugVis    = config.bMLShadowDebugVis;
@@ -450,9 +451,13 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_fMLChromaFire         = config.fMLChromaFire;
 	m_fMLChromaKnee         = config.fMLChromaKnee;
 	m_fMLChromaSkinProtect  = config.fMLChromaSkinProtect;
+	m_fMLHiDesat            = std::clamp(config.fMLHiDesat, 0.0f, 1.0f);
 	m_bMLBarsEnabled        = config.bMLBars;
 	m_bMLBarsHighlight      = config.bMLBarsHighlight;
-	DLog(L"CDX11VideoProcessor() BARS init: bMLBars=%d bMLBarsHighlight=%d sizeof(Settings_t)=%zu",
+	// {} not %d: printf specifiers are literal text to std::format, and the three values
+	// this line exists to report (including sizeof(Settings_t), the ABI-parity check) were
+	// never being printed. See Configure() for the same defect and why it matters.
+	DLog(L"CDX11VideoProcessor() BARS init: bMLBars={} bMLBarsHighlight={} sizeof(Settings_t)={}",
 		(int)config.bMLBars, (int)config.bMLBarsHighlight, sizeof(Settings_t));
 
 	m_nCurrentAdapter = -1;
@@ -1410,7 +1415,22 @@ void CDX11VideoProcessor::UpdateCorrectionShader()
 	}
 }
 
-void CDX11VideoProcessor::SetShaderLuminanceParams()
+// The exposure trim as one quantity, defined once: cbuffer[36] (what the shader divides
+// its placement by), the GT7 fade reference, and PredictGt7* (the CPU model that must
+// "stay in step with the shader") are all the same 2^(trim/3), thirds of a stop over
+// -3..+3. A copy that drifts is exactly how the fade reference came to model a curve that
+// was not the one running — and the visible result was the chroma fade eating the
+// highlight cores.
+static float Gt7TrimGain(int trimSteps)
+{
+	return powf(2.0f, (float)trimSteps / 3.0f);
+}
+
+// Defined with the CPU curve model below; needed here because the shoulder ceiling now
+// bounds the MANUAL refWhite too, not only the solved one.
+static float Gt7Reach(float alpha);
+
+void CDX11VideoProcessor::SetShaderLuminanceParams(bool perFramePush)
 {
 	// [0] LuminanceScale — PQ decode scale, 10000/sdrNits, so 1.0 == sdrNits nits
 	// [1] displayMinNits — the display's measured black. Was an unused zero; the
@@ -1501,6 +1521,15 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		if (mMax <= 10.0f) mMax = titlePeak;
 		if (cll <= 10.0f)  cll = mMax;
 		if (fall <= 1.0f)  fall = cll;
+		// IS cll METADATA OR THE DIAL IN DISGUISE? The raw snapshots are written only
+		// when the sample carries the field (see above), so zero means absent
+		// unambiguously. After the fallback chain that distinction is GONE from cll,
+		// and a ceiling derived from the Title-peak dial would clip a live DV signal
+		// at 100 nits. Publish the ceiling only when it is a mastered claim; the
+		// shader falls back to upstream's fixed 4.8 otherwise, i.e. today's picture
+		// exactly, on every source without metadata.
+		const bool cllIsMetadata = (m_hdr10Cll != 0)
+			|| (m_lastHdr10.hdr10.MaxContentLightLevel != 0);
 
 		// IS THE CONTENT PEAK ACTUALLY KNOWN?
 		//
@@ -1614,10 +1643,42 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// the dial: the dial becomes the override. Hable keeps the dial, because its
 		// normalisation is different and inheriting a per-scene exposure would make it
 		// breathe.
-		m_fEffRefWhite = (m_bAutoRefWhite && m_fRefWhiteAuto > 0.0f &&
-		                  (m_iHdrLocalToneMappingType == TONE_CURVE_GT7 ||
-		                   m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT))
+		const bool bGt7Family = (m_iHdrLocalToneMappingType == TONE_CURVE_GT7 ||
+		                         m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT);
+		m_fEffRefWhite = (m_bAutoRefWhite && m_fRefWhiteAuto > 0.0f && bGt7Family)
 		               ? m_fRefWhiteAuto : m_fHdrRefWhiteNits;
+
+		// THE SHOULDER CEILING, APPLIED TO BOTH PATHS.
+		//
+		// refWhite is the shoulder workload: 2.2*refWhite of source nits is where the
+		// master's peak is PLACED on the curve (peak cancels out of 2.2*refWhite/peak x
+		// peak, so that top is a property of the dial, not of the content). GT7's
+		// shoulder reaches Gt7Reach(alpha) x the ceiling and then min(blended, ceiling)
+		// flattens everything above — so a refWhite past the reach does not brighten the
+		// picture, it deletes the highlights. Measured at the user's settings
+		// (refWhite 203.8, sdrNits 127, alpha 0.10): placement top 448 adapted nits
+		// against a wall at 237, which is why only explosions show it — they are the only
+		// content that lives where the curve has stopped.
+		//
+		// The auto solver already refused to demand more than the reach allows (see the
+		// maxRef at the ref-white solve). The MANUAL dial bypassed that entirely, so the
+		// one setting a user is most likely to move by mistake was the one with no guard.
+		// Same bound, both paths, divided by the trim too: exposure is multiplied into
+		// the same placement gain, so a trim of +2 stops +1 from being safe.
+		//
+		// Deliberately NOT relaxed by the pre-compressor's authority, even though at
+		// softKnee 0.21 / ratio 2.0 it pulls that 448 down to ~240. The compressor is a
+		// dial (softKnee <= 0 disables it — a trap this project has already documented),
+		// so a bound that relies on it is not a bound.
+		if (bGt7Family) {
+			m_fRefWhiteCeil = Gt7Reach(m_fHdrGt7Alpha) * (float)m_iSDRDisplayNits
+			                  / (2.2f * Gt7TrimGain(m_iExposureTrim));
+			if (m_fEffRefWhite > m_fRefWhiteCeil) {
+				m_fEffRefWhite = m_fRefWhiteCeil;
+			}
+		} else {
+			m_fRefWhiteCeil = 0.0f;   // Hable/Unplugged normalise by the MaxCLL ceiling, not by refWhite
+		}
 		cbuffer[19] = m_fEffRefWhite;
 		// [20] the nonlinear chroma compensation exponent (1.0 = none).
 		cbuffer[20] = m_fHdrChromaExp;
@@ -1664,10 +1725,26 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// external player or from a file. The user's A/B across DV content settled it;
 		// d96afab retains the transfer if it is ever wanted back.)
 		// Precomputed 2^(trim/3) so the shader does one multiply, not a pow per pixel.
-		cbuffer[36] = powf(2.0f, (float)m_iExposureTrim / 3.0f);
+		cbuffer[36] = Gt7TrimGain(m_iExposureTrim);
 		// S-curve taste, normalised to -1..1; the shader shapes in sRGB code space.
 		cbuffer[37] = (float)m_iShadowLift / 5.0f;
 		cbuffer[38] = (float)m_iPunch / 5.0f;
+		// [39] the highlight CEILING in nits, from the master's own MaxCLL, or 0 when
+		// the signal carries no static metadata (DV over HDMI, capture). The shader
+		// turns 0 into upstream's fixed 4.8 x sdrNits, so metadata-free sources keep
+		// today's picture exactly. Was padding; the buffer stays 40 floats / 160 B.
+		cbuffer[39] = cllIsMetadata ? cll : 0.0f;
+		// The ceiling the Unplugged curve will ACTUALLY divide by, published for every
+		// CPU-side prediction. The shader's expression is
+		//     ceilNits = (hableCeilNits > 10.0) ? hableCeilNits : (4.8 * sdrNits)
+		// and on a metadata-free source those two differ by 6x: cll has already fallen
+		// back through mMax to the Title-peak dial (floor 100), while the shader uses
+		// 4.8 x sdrNits — 610 at a 127-nit target. Feeding the fallback to the model made
+		// the band controller normalise its relative anchors by 100 nits while the curve
+		// spread the range across 610, which is the disagreement the GT7 peak publish
+		// above exists to prevent, arriving on the other curve.
+		m_fHableCeilNits = (cbuffer[39] > 10.0f) ? cbuffer[39]
+		                                         : 4.8f * (float)m_iSDRDisplayNits;
 		// [32] GT7 debug view (0 = off). Slots 34, 35 and 39 are padding; the array is
 		// FLOAT[40] and every CreateBuffer below sizes itself from sizeof(cbuffer), so
 		// there is no second copy of this layout to keep in step. The shader's cbuffer
@@ -1696,22 +1773,28 @@ void CDX11VideoProcessor::SetShaderLuminanceParams()
 		// cost a debugging session. tr/sh/pu print the raw dial and the normalised
 		// value the shader receives, so "the value never arrived" is separable from
 		// "the value arrived and did nothing".
-		DLog(L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} ad={:.2f} refW={:.1f} sPk={:.1f} avgN={:.1f} dyn={} g={:.3f} k={:.3f} x0={:.1f} p={:.3f} look={} tr={} gain={:.3f} sh={} shN={:.2f} pu={} puN={:.2f} dbg={:.0f}",
+		TLog(perFramePush, L"renderer: [SHADER-CB] push buf=0x{:x} LuminanceScale={:.4f} sdrNits={} hlN={:.2f} clE={:.2f} curve={} gtB={:.2f} ad={:.2f} refW={:.1f} refCap={:.1f} sPk={:.1f} avgN={:.1f} dyn={} g={:.3f} k={:.3f} x0={:.1f} p={:.3f} look={} tr={} gain={:.3f} sh={} shN={:.2f} pu={} puN={:.2f} dbg={:.0f} ceil={:.0f}",
 			(uintptr_t)m_pCorrectionConstants.p, 10000.0f / m_iSDRDisplayNits, m_iSDRDisplayNits,
 			m_fHdrHighlightNeutral, m_fHdrChromaExp,
 			discard<int>(m_iHdrLocalToneMappingType, TONE_CURVE_HABLE, 0, TONE_CURVE_DYNAMIC_AUTO),
 			m_fHdrGt7Blend, m_fHdrGt7Adapt,
-			m_fEffRefWhite, m_HableScenePeakNits, m_MeanNitsSmooth,
+			m_fEffRefWhite, m_fRefWhiteCeil, m_HableScenePeakNits, m_MeanNitsSmooth,
 			// The solved curve, so "did the solver run and with what" is one field
 			// rather than an inference from the picture.
 			(int)m_bDynValid, m_fDynG, m_fDynK, m_fDynX0, m_fDynP,
 			kLookStamp, m_iExposureTrim, cbuffer[36], m_iShadowLift, cbuffer[37],
-			m_iPunch, cbuffer[38], m_fHdrGt7Dbg);
+			m_iPunch, cbuffer[38], m_fHdrGt7Dbg, cbuffer[39]);
 		m_pDeviceContext->UpdateSubresource(m_pCorrectionConstants, 0, nullptr, &cbuffer, 0, 0);
 		// Arm the read-back: the next few correction draws report the buffer they
 		// ACTUALLY had bound at b0 and its float values. [CBPROBE] absent after this
 		// line = the correction draw is not running at all.
-		InterlockedExchange(&m_iCbProbeTicks, 5);
+		// Not armed for a per-frame push with the debug flag closed: the auto
+		// reference white and the Hable scene peak can re-push every frame, and each
+		// arm is five trace lines plus a GPU sync -- that is 80 MB of "useful" log and
+		// a self-inflicted stall. Settings pushes always arm it.
+		if (!(perFramePush && !mpcvr::TraceVerbose())) {
+			InterlockedExchange(&m_iCbProbeTicks, 5);
+		}
 	}
 	else {
 		D3D11_BUFFER_DESC BufferDesc = {
@@ -2435,7 +2518,7 @@ static void SolveGrade(const float wAnchor[3], const float wTarget[3],
 // or kGT7RangeFit changes there, this stops predicting and the mid-tone target goes
 // quietly wrong, so they are named here rather than folded into one expression.
 static float PredictGt7RelLinear(float srcNits, float refWhiteNits, float peakNits, float ceilingNits,
-                                 float alpha)
+                                 float alpha, float trimGain = 1.0f)
 {
 	if (srcNits <= 0.0f || peakNits <= 0.0f || ceilingNits <= 0.0f) {
 		return 0.0f;
@@ -2448,7 +2531,14 @@ static float PredictGt7RelLinear(float srcNits, float refWhiteNits, float peakNi
 	// gamma for a curve that is not running.
 	const float kGT7Alpha      = (alpha > 0.001f) ? alpha : 0.25f;
 
-	const float gain = kGT7RangeFit * refWhiteNits / peakNits;
+	// trimGain is the exposure trim, and it belongs in the gain for the same reason it
+	// belongs in the shader's: the placement IS the gain. Left out, this model would
+	// predict the curve without the lift the curve is actually applying, and the
+	// mid-tone solve that consumes it would push gamma to correct an error that is not
+	// on screen — fighting the user's exposure dial by a factor that scales with trim.
+	// The comment above ("the constants MUST stay in step with the shader") is the same
+	// rule, and the fade reference in the shader is the first casualty of ignoring it.
+	const float gain = kGT7RangeFit * refWhiteNits / peakNits * trimGain;
 	const float x    = srcNits * gain;                 // the operator's own units
 
 	const float k    = (kGT7LinearSec - 1.0f) / (kGT7Alpha - 1.0f);
@@ -2468,12 +2558,56 @@ static float PredictGt7RelLinear(float srcNits, float refWhiteNits, float peakNi
 	return fmaxf(out / ceilingNits, 0.0f);             // linear fraction of white
 }
 
-// The same prediction, encoded (gamma 2.2) — what the panel/PNG comparisons use.
-static float PredictGt7Encoded(float srcNits, float refWhiteNits, float peakNits, float ceilingNits,
-                               float alpha)
+// CPU mirror of hable() / ToneMappingHablePeak (Shaders/convert/hdr_tone_mapping.hlsl).
+// The constants are copied rather than re-derived: this is the
+// Unplugged curve, and a model that disagrees with the shader is the exact failure the
+// GT7 peak publish above was introduced to prevent.
+static float HableCurve(float x)
 {
-	return powf(PredictGt7RelLinear(srcNits, refWhiteNits, peakNits, ceilingNits, alpha), 1.0f / 2.2f);
+	const float A = 0.15f, B = 0.50f, C = 0.10f, D = 0.20f, E = 0.02f, F = 0.30f;
+	return ((x * (A * x + (C * B)) + (D * E)) / (x * (A * x + B) + (D * F))) - E / F;
 }
+
+float CDX11VideoProcessor::PredictDeliveredRelLinear(float srcNits) const
+{
+	if (srcNits <= 0.0f || m_iSDRDisplayNits <= 0) {
+		return 0.0f;
+	}
+	const float sdrN  = (float)m_iSDRDisplayNits;
+	const float trimG = Gt7TrimGain(m_iExposureTrim);
+
+	switch (m_iHdrLocalToneMappingType) {
+	case TONE_CURVE_REFERENCE:
+		// Exactly the shader's order: the trim multiplies the input BEFORE the curve
+		// (a display-referred Hable absorbs it in the shoulder), and the divisor is the
+		// ceiling the shader will use — m_fHableCeilNits, not the raw metadata value.
+		// Clamped to 1.0 because that is what the shader's own headroom fit plus
+		// saturate() do to anything above the ceiling.
+		{
+			const float div = fmaxf(HableCurve(fmaxf(m_fHableCeilNits, 1.0f) / sdrN), 1e-4f);
+			return std::clamp(HableCurve((srcNits / sdrN) * trimG) / div, 0.0f, 1.0f);
+		}
+	case TONE_CURVE_GT7:
+	case TONE_CURVE_GT7_ADAPT:
+		return PredictGt7RelLinear(srcNits, m_fEffRefWhite, m_fCurvePeakNits, sdrN,
+		                           m_fHdrGt7Alpha, trimG);
+	default:
+		// ACES / Reinhard / Mobius / BT.2390 / ST.2094 / spline / dynamic have no CPU
+		// model. Returning 0 would pin every band target to white and hand the controller
+		// full authority over a picture it cannot see, so the GT7 shape is used as the
+		// reference model on those curves. They are not supported shipping surfaces —
+		// the rail offers Unplugged and GT7 Adapt — and this is where to look first if
+		// one of them ever starts behaving oddly with the grade on.
+		return PredictGt7RelLinear(srcNits, m_fEffRefWhite, m_fCurvePeakNits, sdrN,
+		                           m_fHdrGt7Alpha, trimG);
+	}
+}
+
+float CDX11VideoProcessor::PredictDeliveredEncoded(float srcNits) const
+{
+	return powf(PredictDeliveredRelLinear(srcNits), 1.0f / 2.2f);
+}
+
 
 // Where GT7's shoulder lands on the ceiling, as a multiple of it — the CPU mirror of
 // the algebra in gt7_tonemap.hlsl (solve shoulder(x) = peak for x/peak). 1.47 at
@@ -2791,9 +2925,10 @@ void CDX11VideoProcessor::SetMLParams()
 			     m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT) &&
 			    m_iSDRDisplayNits > 0 && m_fCurvePeakNits > 10.0f) {
 				const float srcAvgNits = exptm::PqToLinearNits(m_MLFeatures[1]);
-				const float cur = PredictGt7Encoded(srcAvgNits, m_fEffRefWhite,
-				                                    m_fCurvePeakNits, (float)m_iSDRDisplayNits,
-				                                    m_fHdrGt7Alpha);
+				// The curve AS RUN, including the exposure trim: omit it and the solver
+				// compensates for a lift it cannot see, i.e. pushes gamma against the
+				// user's own exposure dial.
+				const float cur = PredictDeliveredEncoded(srcAvgNits);
 				if (cur > 0.001f && cur < 0.999f) {
 					autoTopUp = logf(cur) / logf(m_fMLTargetMid) - gamma;
 				}
@@ -3016,7 +3151,13 @@ void CDX11VideoProcessor::SetMLParams()
 		float wA[3], wT[3];
 		for (int i = 0; i < 3; i++) {
 			const float nits = exptm::PqToLinearNits(bandPq[i]);
-			wA[i] = PredictGt7RelLinear(nits, m_fEffRefWhite, m_fCurvePeakNits, sdrN, m_fHdrGt7Alpha);
+			// Same term as above: these are anchors measured on the DELIVERED picture, so
+			// the prediction must be the curve that is actually drawing it. This call was
+			// the GT7 model unconditionally — inside `if (ctl)`, which runs on every curve
+			// — so on the Unplugged curve the controller solved its targets against a
+			// shoulder (and a refWhite, and a reach) that was never applied, and then
+			// lifted or held the grade to chase a level the picture already had.
+			wA[i] = PredictDeliveredRelLinear(nits);
 			// RELATIVE to the scene's own range, not absolute nits and not a constant.
 			//
 			// An absolute law (1 - exp(-nits/W)) told a 0.25-nit source to deliver
@@ -3137,7 +3278,11 @@ void CDX11VideoProcessor::SetMLParams()
 		guard,
 		hunt,                                             // hunt compensation
 		l1max,
-		0.25f,                                            // highlight desaturation
+		// Highlight desaturation, delivered-level referenced. This slot used to carry a
+		// hardcoded 0.25 that no shader read -- the value was in the buffer for months
+		// while the behaviour was nowhere. Now it is the hdr.hiDesat dial (see
+		// ps_ml_chroma.hlsl for why the term lives in that pass and not in the curve).
+		std::clamp(m_fMLHiDesat, 0.0f, 1.0f),
 		// The domain of the texture the ML passes actually read — NOT the swap
 		// chain's. On an SDR display the swap chain is G22 whether or not the
 		// correction ran, so the old test told ps_ml_gamma to decode PQ with
@@ -5947,7 +6092,12 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 	const REFERENCE_TIME rtFrameDur = m_pFilter->m_FrameStats.GetAverageFrameDuration();
 	rtEnd = rtStart + rtFrameDur;
 
-	DLog(L"[RT] ProcessSample #{} ENTER (rtStart={})", seq, (long long)rtStart);
+	// These four [RT] lines are the whole frame path in the trace and they are the
+	// bulk of its size: 4 lines x 24 fps = 96 lines a second. They exist for the
+	// hang/AV hunts, so they follow the debug flag (VLog) instead of running always:
+	// off = a user can send a readable trace; on = the frame-by-frame account is
+	// still there, timestamped on the same clock as ml_debug.csv.
+	VLog(L"[RT] ProcessSample #{} ENTER (rtStart={})", seq, (long long)rtStart);
 
 	if (m_bMLDebug && m_pMLDebugFile) {
 		fwprintf(m_pMLDebugFile, L"PS,%lld,%d\n", (long long)rtStart, (m_bMLActive ? 1 : 0));
@@ -5957,14 +6107,14 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 	m_rtStart = rtStart;
 	CRefTime rtClock(rtStart);
 
-	DLog(L"[RT] ProcessSample #{} CopySample ENTER (rtStart={})", seq, (long long)rtStart);
+	VLog(L"[RT] ProcessSample #{} CopySample ENTER (rtStart={})", seq, (long long)rtStart);
 	HRESULT hr = CopySample(pSample);
 	if (FAILED(hr)) {
 		DLog(L"[RT] ProcessSample #{} CopySample FAILED hr=0x{:08X}", seq, (unsigned)hr);
 		m_RenderStats.failed++;
 		return hr;
 	}
-	DLog(L"[RT] ProcessSample #{} CopySample done — Render ENTER", seq);
+	VLog(L"[RT] ProcessSample #{} CopySample done — Render ENTER", seq);
 
 	// The experimental tone mapper is driven by the same per-frame statistics, so it
 	// keeps them fresh on its own — see the extraction gate in Process().
@@ -5974,7 +6124,7 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 
 	// always Render(1) a frame after CopySample()
 	hr = Render(1, rtStart);
-	DLog(L"[RT] ProcessSample #{} Render returned hr=0x{:08X} — draw stats", seq, (unsigned)hr);
+	VLog(L"[RT] ProcessSample #{} Render returned hr=0x{:08X} — draw stats", seq, (unsigned)hr);
 	m_pFilter->m_DrawStats.Add(GetPreciseTick());
 	if (m_pFilter->m_filterState == State_Running) {
 		m_pFilter->StreamTime(rtClock);
@@ -7168,7 +7318,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 						}
 						if (fabsf(want - m_fRefWhiteAuto) > 0.5f) {
 							m_fRefWhiteAuto = want;
-							SetShaderLuminanceParams();
+							SetShaderLuminanceParams(true);   // driven by a per-frame measurement
 						}
 					}
 				}
@@ -7176,7 +7326,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				const float chg = m_HableScenePeakNits - m_HableScenePeakApplied;
 				if (m_HableScenePeakApplied < 0.0f || chg > 1.0f || chg < -1.0f) {
 					m_HableScenePeakApplied = m_HableScenePeakNits;
-					SetShaderLuminanceParams();   // per-frame push; the cbuffer is
+					SetShaderLuminanceParams(true);   // per-frame push; the cbuffer is
 					                              // otherwise only sent on settings changes
 					// Logged on PUSH so the filter can be watched: filt_pq is what the
 					// curve normalises by, raw is the frame's own measurement, and mix
@@ -8320,11 +8470,19 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 		// intent.
 		if (m_pPSTaste && m_pTasteParams) {
 			StepSetting();
-			// Semantics preserved from the converter: taste applies to the Unplugged
-			// (Reference) curve only. GT7 and the solved curves keep their own
-			// validated shapes, and an extra S-curve on top of GT7's shoulder is a
-			// different picture than anyone has agreed to.
+			// Which curves the SHAPE dials run on. They were locked to the Unplugged
+			// (Reference) curve — inherited from when the operators lived in the
+			// converter — and that lock is what made "exposure / shadow detail / punch do
+			// nothing" a reported symptom on GT7 Adapt: the dials were real, the values
+			// reached the cbuffer, and this stage simply refused to draw. A control the
+			// user can see and move has to behave the same on every curve that delivers
+			// SDR; a curve-conditional dial is precisely the convoluted thing that stops
+			// people trusting the rail.
 			const bool bRefCurve = (m_iHdrLocalToneMappingType == TONE_CURVE_REFERENCE);
+			const bool bToneMappedSdr =
+				bRefCurve
+				|| m_iHdrLocalToneMappingType == TONE_CURVE_GT7
+				|| m_iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT;
 			// Exposure trim is deliberately NOT in this test: trim is a LIGHT change
 			// and is applied before the curve, where the shoulder absorbs it. Only the
 			// SHAPE dials run here, so a trim-only setting must not cost a full-screen
@@ -8336,7 +8494,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			// a wrong curve quietly; raw HDR/DV passthrough is bypassed too, since
 			// nothing has been tone-mapped at that point.
 			const bool bPqOut = (m_currentSwapChainColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-			const bool bApply = bAnyDial && bRefCurve && !bPqOut && !m_bHDRPassthroughRaw;
+			const bool bApply = bAnyDial && bToneMappedSdr && !bPqOut && !m_bHDRPassthroughRaw;
 
 			struct { float lift, punch, reserved0, active, dbg, p0, p1, p2; } tp = {};
 			tp.lift     = (float)m_iShadowLift / 5.0f;
@@ -8348,7 +8506,12 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 			// window mask). They only mean that here when the reference curve is up --
 			// under GT7 the same values are its own debug views, and GT7 draws earlier,
 			// so claiming them unconditionally would overwrite a view someone asked for.
-			tp.dbg    = (bApply && m_fHdrGt7Dbg > 0.5f && m_fHdrGt7Dbg < 2.5f) ? m_fHdrGt7Dbg : 0.0f;
+			// Deliberately still Reference-only now that the SHAPE dials run under GT7:
+			// the operators and the views share one field, and view 1/2 under GT7 means
+			// GT7's own chroma-fade/knee readout, which the converter draws. Letting the
+			// taste pass claim it here would silently replace a view someone asked for
+			// with a picture they did not.
+			tp.dbg    = (bApply && bRefCurve && m_fHdrGt7Dbg > 0.5f && m_fHdrGt7Dbg < 2.5f) ? m_fHdrGt7Dbg : 0.0f;
 
 			D3D11_MAPPED_SUBRESOURCE mr = {};
 			if (SUCCEEDED(m_pDeviceContext->Map(m_pTasteParams, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr))) {
@@ -8357,10 +8520,13 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				hr = TextureCopyRect(*pInputTexture, pRT, rect, rect, m_pPSTaste.p, m_pTasteParams, 0, false);
 				if (m_bMLDebug && m_pMLDebugFile && m_MLDebugFrame % 60 == 0) {
 					fwprintf(m_pMLDebugFile,
+						// gate= reports the curve test ACTUALLY used, not the reference
+						// flag — otherwise a dial failing under GT7 looks like a dial
+						// failing for a different reason.
 						L"TASTE_DRAW step=%u hr=%x apply=%d lift=%.2f punch=%.2f dbg=%.0f trim=%d(pre-curve) "
-						L"curveOk=%d anyDial=%d pqOut=%d raw=%d\n",
+						L"gate=%d anyDial=%d pqOut=%d raw=%d\n",
 						(unsigned)step, (unsigned)hr, (int)bApply, (double)tp.lift, (double)tp.punch,
-						(double)tp.dbg, m_iExposureTrim, (int)bRefCurve, (int)bAnyDial, (int)bPqOut,
+						(double)tp.dbg, m_iExposureTrim, (int)bToneMappedSdr, (int)bAnyDial, (int)bPqOut,
 						(int)m_bHDRPassthroughRaw);
 					fflush(m_pMLDebugFile);
 				}
@@ -9276,6 +9442,11 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			config.fMLChromaKnee != m_fMLChromaKnee ||
 			config.bMLChromaSkinEnabled != m_bMLChromaSkinEnabled ||
 			config.fMLChromaSkinProtect != m_fMLChromaSkinProtect ||
+			// clamped on BOTH sides of this test: the stored value is clamped where it
+			// is assigned, so comparing it against the raw incoming float re-arms the
+			// block on every push once the dial leaves 0..1 and re-pushes the whole
+			// grade chain each frame.
+			std::clamp(config.fMLHiDesat, 0.0f, 1.0f) != m_fMLHiDesat ||
 			config.bMLBars != m_bMLBarsEnabled ||
 			config.bMLBarsHighlight != m_bMLBarsHighlight ||
 			config.bMLFaceProtectEnabled != m_bFaceProtectEnabled ||
@@ -9301,6 +9472,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_bMLHighlightEnabled = config.bMLHighlightEnabled;
 		m_bMLDebugCopy = config.bMLDebugCopy;
 		m_bMLDebug     = config.bMLDebugLog;
+		mpcvr::SetTraceVerbose(m_bMLDebug);   // ONE flag: the CSV and the per-frame trace
 		if (m_pFaceDetect) m_pFaceDetect->SetLogEnabled(m_bMLDebug);
 		if (m_pSkySeg) m_pSkySeg->SetLogEnabled(m_bMLDebug);
 		m_bMLShadowDebugVis = config.bMLShadowDebugVis;
@@ -9331,6 +9503,7 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_fMLChromaKnee    = config.fMLChromaKnee;
 		m_bMLChromaSkinEnabled = config.bMLChromaSkinEnabled;
 		m_fMLChromaSkinProtect = config.fMLChromaSkinProtect;
+		m_fMLHiDesat = std::clamp(config.fMLHiDesat, 0.0f, 1.0f);
 		m_bMLBarsEnabled   = config.bMLBars;
 		m_bMLBarsHighlight = config.bMLBarsHighlight;
 		m_bFaceProtectEnabled = config.bMLFaceProtectEnabled;
@@ -9338,14 +9511,23 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_fFaceFeather     = config.fMLFaceFeather;
 		m_fFaceExpand      = config.fMLFaceExpand;
 		m_bFaceDebugVis    = config.bMLFaceDebugVis;
-		DLog(L"CDX11VideoProcessor::Configure() configSeq=%u ML: enable=%d mode=%d toneCurve=%d gamma=%.3f(en=%d) shadow=%.3f(en=%d) "
-			L"highlight=%.3f(en=%d) chroma=%d hunt=%.2f(en=%d) chN=%.2f(en=%d) chF=%.2f(en=%d) "
-			L"knee=%.2f skin=%.2f bars=%d barsHL=%d debugLog=%d debugCopy=%d sizeof(Settings_t)=%zu",
+		// std::format, NOT printf. This line used to carry %u/%d/%.3f specifiers, which
+		// std::format treats as LITERAL TEXT -- it silently dropped all 25 arguments and
+		// printed the specifiers, because extra args are legal while missing ones are not.
+		// So the one line meant to prove "what the renderer actually received" proved
+		// nothing, and the hiDesat delivery check built on it was dead on arrival. Using
+		// {} makes a mismatched argument list a COMPILE error instead of a quiet lie.
+		// gamutCap was added here for the same reason: it is the dial under investigation
+		// and the only place it was readable is a cbuffer slot the probe cannot confirm.
+		DLog(L"CDX11VideoProcessor::Configure() configSeq={} ML: enable={} mode={} toneCurve={} gamma={:.3}(en={}) shadow={:.3}(en={}) "
+			L"highlight={:.3}(en={}) chroma={} hunt={:.2}(en={}) chN={:.2}(en={}) chF={:.2}(en={}) "
+			L"knee={:.2} skin={:.2} hiDesat={:.2} gamutCap={:.2} bars={} barsHL={} debugLog={} debugCopy={} sizeof(Settings_t)={}",
 			config.configSeq, (int)config.bMLEnabled, config.iMLMode, (int)config.bMLToneCurveEnabled,
 			config.fMLGamma, (int)config.bMLGammaEnabled, config.fMLShadow, (int)config.bMLShadowEnabled,
 			config.fMLHighlight, (int)config.bMLHighlightEnabled, (int)config.bMLChromaEnabled,
 			config.fMLHunt, (int)config.bMLHuntEnabled, config.fMLChromaNeutral, (int)config.bMLChromaNeutralEnabled,
 			config.fMLChromaFire, (int)config.bMLChromaFireEnabled, config.fMLChromaKnee, config.fMLChromaSkinProtect,
+			config.fMLHiDesat, config.fGamutCap,
 			(int)config.bMLBars, (int)config.bMLBarsHighlight,
 			(int)config.bMLDebugLog, (int)config.bMLDebugCopy, sizeof(Settings_t));
 		UpdateMLActive();

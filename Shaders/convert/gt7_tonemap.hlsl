@@ -260,7 +260,38 @@ float3 GT7PreCompress(float3 x, float3 base, float knee, float ratio, float widt
     // the clip point (artificial white peaking). Gate on base level via knee/width.
     const float3 keep = 1.0 - (1.0 - 1.0 / max(ratio, 1e-3))
                         * smoothstep(knee + w, knee + 3.0 * w, base);
-    return min(base, comp) + (x - base) * keep;
+    // THE RESIDUAL MUST NOT CROSS BLACK. `base` is a LOCAL average, so inside an
+    // explosion a dark fleck sits far below its own neighbourhood: (x - base) is a large
+    // negative, restored at nearly full amplitude, and min(base,comp) is not enough to
+    // absorb it. The sum goes negative and the saturate() downstream turns it into a
+    // BLACK PIXEL — clipping reported as "black pixels in the clipped portions", which is
+    // not clipping at all but this inversion. Measured at the user's settings
+    // (sdrNits 127, softKnee 0.21/2.0/1.0): with the placement top at 237 adapted nits,
+    // comp=143 and keep=0.87, so any pixel below ~73 nits in that neighbourhood inverts —
+    // a 3.2:1 local range, and an explosion has those everywhere.
+    //
+    // But bounding the OUTPUT at zero is not enough, and that first attempt was the
+    // wrong fix. The operator is  result = comp + (x - base)*keep , i.e.
+    //     result = keep*x + (comp - keep*base)
+    // — a gain plus a CONSTANT, and when the compression is deep that constant is
+    // strongly negative. Measured at the user's settings (base 237, comp 143, keep 0.87):
+    //     result = 0.87x - 63
+    // so it is not only pixels below zero that break — every pixel under ~73 nits lands at
+    // or near black, and 100 nits becomes 24. Clamping at zero hides the wraparound and
+    // leaves the crush, which is what was still visible on the explosion.
+    //
+    // The amplitude is the thing that must be bounded. keep <= comp/base makes
+    // result(0) = comp - keep*base >= 0, which turns the offset into a proportional gain
+    // (0.603x in the example above): the mapping stays increasing, non-negative for every
+    // x >= 0, and the detail is restored at exactly the amplitude the compressed base can
+    // carry. Where compression is shallow, comp/base ~ 1 and nothing changes at all.
+    //
+    // This is also why disabling softKnee "fixed" it: with the compressor off, base never
+    // separates from comp, the constant is zero, and there is nothing to crush.
+    const float3 down = min(base, comp);
+    const float3 room = comp / max(base, 1e-4f);
+    const float3 amp  = min(keep, room);
+    return down + max((x - base) * amp, -down);
 }
 
 #endif // GT7_TONEMAP_HLSL_INCLUDED

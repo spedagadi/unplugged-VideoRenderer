@@ -13,8 +13,13 @@
 //      .ax, so a standalone run under another player still has a trace.
 // Plus OutputDebugString, for DebugView.
 //
-// Deliberately independent of ml_debug.csv: that file is the image-quality log
-// and is not routed through here.
+// ONE switch for both channels (changed 2026-10-11, was "deliberately
+// independent"). Per-frame trace lines are now VLog, gated by the same flag that
+// lights ml_debug.csv -- because an ALWAYS-ON per-frame trace is not a log a user
+// can attach to a bug report: the Dune session wrote 87 MB in three hours, and
+// four [RT] ProcessSample lines per frame (96 lines/second) were almost all of
+// it. Default = off, so a shared trace is lifecycle only; flip the debug flag and
+// BOTH the CSV and the per-frame lines appear, on the same clock, for one session.
 
 #pragma once
 
@@ -22,6 +27,11 @@ namespace mpcvr {
     // One complete line, no trailing newline; UTF-8. Host sink receives the RAW
     // line (un-stamped) so it can add its own timestamp prefix.
     void TraceLog(const char* line);
+
+    // The per-frame gate. Set from the renderer's own debug setting (bMLDebugLog)
+    // so trace verbosity and the CSV can never disagree about what is on.
+    void SetTraceVerbose(bool verbose);
+    bool TraceVerbose();
 
     // Install the host sink (per process — the renderer is single-instance).
     void SetTraceSink(void* ctx, void(__cdecl* fn)(void*, const char*));

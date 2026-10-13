@@ -135,7 +135,10 @@ cbuffer PS_PARAMETERS : register(b0)
     // eye and every measurement of "punch" live in. Slots 37/38.
     float shadowLift;
     float punch;
-    float _padE3;
+    // Highlight CEILING in nits, from the master's MaxCLL; 0 = the signal carries no
+    // static metadata (DV over HDMI, capture) and the curve falls back to upstream's
+    // fixed 4.8 x sdrNits. Was padding; buffer stays 40 floats / 160 bytes.
+    float hableCeilNits;
 };
 
 #include "../convert/conv_matrix.hlsl"
@@ -322,7 +325,20 @@ float4 main(PS_INPUT input) : SV_Target
         // changes LIGHT belongs before the curve; a dial that changes SHAPE belongs
         // after it. shadowLift and punch are still declared in this cbuffer (the
         // layout is shared with the C++ side) but are read by ps_ml_taste.hlsl.
-        color.rgb = ToneMappingHable(color.rgb * expTrimGain);
+        //
+        // CEILING FROM THE MASTER'S OWN CLAIM. hable(x)/hable(4.8) reaches 1.0 at
+        // 4.8 x sdrNits and CLIPS above it -- at sdrNits=127 that is 610 nits, so a
+        // 787-nit master loses 177 nits of highlight range to one flat white and a
+        // 4000-nit master loses 3400. When the signal carries MaxCLL, divide by
+        // hable(peak/sdrNits) instead (ToneMappingHablePeak, already in this tree)
+        // so the ceiling sits where the master says it sits and the range between
+        // white and ceiling becomes a shoulder. With no metadata the ceiling is the
+        // old 4.8 and the picture is byte-identical to before this change.
+        // Declared here, not borrowed from the GT7/Dynamic branches below: each
+        // branch owns its own, and this one had none until the ceiling needed it.
+        const float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
+        const float ceilNits = (hableCeilNits > 10.0) ? hableCeilNits : (4.8 * sdrNits);
+        color.rgb = ToneMappingHablePeak(color.rgb * expTrimGain, ceilNits / sdrNits);
 
         if (outputGamut < 0.5) {
             color.rgb = Colorspace_Gamut_Conversion_2020_to_709(color.rgb);
@@ -461,7 +477,24 @@ float4 main(PS_INPUT input) : SV_Target
             // only a genuine excursion above it buys compression.
             gtScenePeak = lerp(maxCLL, max(maxCLL, hableScenePeakNits), saturate(gt7Adapt));
         }
-        const float gtGain = kGT7RangeFit * refNits / max(gtScenePeak, 1.0f);
+        // EXPOSURE TRIM rides the PLACEMENT gain, not the pixel. gtGain is what puts the
+        // master's range onto this curve, so scaling it by 2^(trim/3) lifts the whole
+        // signal while the display-side thresholds — ceiling = sdrNits, the
+        // pre-compressor knee at softKnee*sdrNits — stay where they are, which is exactly
+        // the rule that put trim before the curve in the Reference branch: brighten and
+        // let the shoulder absorb it, never clip after it.
+        //
+        // Folded in HERE rather than multiplied onto `adapted` alone, because `base` (the
+        // local average the pre-compressor divides the pixel against) is built from this
+        // same gain. Scaling one and not the other would move the residual — the DETAIL —
+        // as a side effect of a brightness dial.
+        //
+        // Must stay sdrNits-free: expTrimGain is dimensionless, so it cannot re-open the
+        // gain/ceiling cancellation that once made this branch independent of sdrNits.
+        // GT7 (8) and GT7-Adapt (10) share this branch, so trim now works on both — a
+        // dial that answers on one sibling and not the other is the inconsistency this
+        // fix exists to remove, not to reintroduce.
+        const float gtGain = kGT7RangeFit * refNits / max(gtScenePeak, 1.0f) * expTrimGain;
         // gtScenePeak MUST carry the fast running-max guard. A placement/protection split
         // that divided the gain by the scene-locked anchor alone was tried and reverted
         // 2026-10-04: it blew the highlights completely, because the pre-compressor knee
@@ -497,9 +530,25 @@ float4 main(PS_INPUT input) : SV_Target
                                    (gt7FadeEnd > gt7FadeStart) ? gt7FadeEnd   : GT7_FADE_END,
                                    (gt7Alpha > 0.001f) ? gt7Alpha : GT7_ALPHA,
                                    // The fade window is keyed to the CONTENT peak, not
-                                   // the ceiling: see gt7_tonemap.hlsl. This is the same
-                                   // quantity the gain lands on the curve.
-                                   kGT7RangeFit * refNits,
+                                   // the ceiling: see gt7_tonemap.hlsl. It must be the
+                                   // quantity the gain ACTUALLY lands on the curve, so it
+                                   // is derived from the gain instead of restating it.
+                                   //
+                                   // Restating it was the bug: writing `kGT7RangeFit *
+                                   // refNits` held while the gain was exactly that over the
+                                   // peak, but exposure trim multiplies the gain, so the
+                                   // peak moved and the window did not. fadeRatio inflated
+                                   // by the trim factor, crossed fadeEnd, and
+                                   // chromaScale went to zero across the whole lit band —
+                                   // colour deleted, white cores, a seam on the lighting
+                                   // contour, which is precisely the failure the comment at
+                                   // gt7_tonemap.hlsl:172 exists to prevent.
+                                   //
+                                   // gtScenePeak * gtGain is algebraically the old literal
+                                   // at trim = 0 (peak · kGT7RangeFit·refNits/peak), so this
+                                   // is byte-identical when the dial is at rest, and it
+                                   // tracks every future term added to the gain.
+                                   gtScenePeak * gtGain,
                                    gt7dbg);
 
         // Debug view: replace the picture with one of the operator's internal

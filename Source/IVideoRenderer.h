@@ -323,10 +323,16 @@ struct Settings_t {
 	// strength (verified on Everest vs madVR 2026-09-23; 0.9 matched madVR's
 	// own warm head). 0 disables — byte-identical to before the feature.
 	float fHdrHighlightNeutral = 0.9f;
-	// User-configured chroma compensation exponent (STAGE 1: DELIVERY ONLY).
-	// The value is stored and reported (pipeline dump clE=) but NOT applied in
-	// any shader yet — the application lands in a later stage, once delivery is
-	// proven in the log. 1.0 = none (semantics for the future stage).
+	// User-configured chroma compensation exponent. cbuffer[20] (hableChromaExp);
+	// the converter applies it as pow(gGain, chromaExp-1), where gGain is the CURVE's
+	// compression of that pixel. 1.0 = none, >1 desaturates compressed highlights,
+	// <1 re-saturates. Range -1..3.5.
+	//
+	// The comment here used to read "stored and reported but NOT applied in any shader
+	// yet" (a stage-1 note that outlived stage 2) — it is applied, and carrying that
+	// claim forward is how a control gets re-invented on top of itself. Note that the
+	// exponent is curve-referenced, not delivered-referenced: the grade changes
+	// luminance afterwards and is not in it. That gap is fMLHiDesat below.
 	float fHdrChromaExp = 1.35f;
 	bool  bMLHighlightEnabled = true;
 	float fMLHighlight = 0.0f;   // manual highlight roll-off [-0.3, 0.4]
@@ -571,6 +577,29 @@ struct Settings_t {
 	// taste measured on Everest/Furiosa. APPENDED (binary boundary).
 	float fCtlWhiteNits = 203.0f;
 
+	// POST-CURVE highlight desaturation (the Zion chroma pass).
+	//
+	// The tone curve already desaturates: chroma scales by pow(gGain, chromaExp-1),
+	// where gGain is the CURVE's own compression of that pixel. But the grade runs
+	// afterwards and moves luminance in ICtCp while holding Ct/Cp ABSOLUTE
+	// (ps_ml_gamma.hlsl:6) — constant chroma magnitude on a changed intensity, which
+	// by definition changes RELATIVE saturation. A band lift washes colour out, a band
+	// crush pushes it up, and the curve's exponent never sees either. So the picture's
+	// colour budget is set against a luminance that then moves under it.
+	//
+	// This dial is the term that reads the DELIVERED level instead of the curve's
+	// intent: chroma pulled toward neutral for pixels sitting above the grade's own
+	// highlight knee, inside ps_ml_chroma — the pass the converter itself names as
+	// "the last stage that can change chroma". Outcome-referenced, so the curve, the
+	// bands and micro-contrast are all accounted for without any of them being
+	// modelled on the CPU.
+	//
+	// 0 = off, byte-identical to the current picture. Skin-gated by the pass's own
+	// P(skin) weight, so faces keep their colour at any setting. APPENDED (binary
+	// boundary). The MLParams_t slot it feeds (MLHiDesat) already existed and was
+	// already being pushed — with a hardcoded 0.25 that no shader read.
+	float fMLHiDesat = 0.0f;
+
 	Settings_t() {
 		SetDefault();
 	}
@@ -702,6 +731,7 @@ struct Settings_t {
 		iHdrExposureTrim                = 0;
 		iHdrShadowLift                  = 0;
 		iHdrPunch                       = 0;
+		fMLHiDesat                      = 0.0f;
 	}
 };
 

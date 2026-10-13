@@ -65,6 +65,55 @@ inline void DLog(std::format_string<Args...> fmt, Args&&... args)
 
 #define DLogIf(f,...) {if (f) DLog(__VA_ARGS__);}
 
+// ─ VLog: the same trace, gated ──────────────────────────────────────────────
+// For lines written once (or more) PER FRAME. DLog is unconditional by design —
+// the crash that made this module exist had no voice in Release — but four [RT]
+// lines per frame is 96 lines a second, 87 MB over a three-hour session, and a
+// log that size cannot be attached to a bug report.
+//
+// VLog returns before std::format runs when the gate is closed, so the hot path
+// costs one relaxed atomic load, not a format plus a file write. The gate is
+// m_bMLDebug, i.e. the renderer's own debug setting (registry "MLDebugLog", the
+// property-page checkbox) — the flag that already opens ml_debug.csv. One switch,
+// both channels, same clock.
+inline void VLog(std::wstring_view str)
+{
+    if (!mpcvr::TraceVerbose()) return;
+    DLog(str);
+}
+
+inline void VLog(std::string_view str)
+{
+    if (!mpcvr::TraceVerbose()) return;
+    DLog(str);
+}
+
+template <typename... Args>
+inline void VLog(std::wformat_string<Args...> fmt, Args&&... args)
+{
+    if (!mpcvr::TraceVerbose()) return;
+    DLog(fmt, std::forward<Args>(args)...);
+}
+
+template <typename... Args>
+inline void VLog(std::format_string<Args...> fmt, Args&&... args)
+{
+    if (!mpcvr::TraceVerbose()) return;
+    DLog(fmt, std::forward<Args>(args)...);
+}
+
+// TLog: a line whose rank depends on WHY it fired. `conditional` = "this call was
+// triggered by a per-frame measurement, so it is debug-flag traffic"; called from
+// a settings change it stays unconditional. Exists so a log line that one caller
+// treats as lifecycle and another treats as per-frame needs one call site, not two
+// copies of a 25-argument format string.
+template <typename... Args>
+inline void TLog(bool conditional, std::wformat_string<Args...> fmt, Args&&... args)
+{
+    if (conditional && !mpcvr::TraceVerbose()) return;
+    DLog(fmt, std::forward<Args>(args)...);
+}
+
 #define SAFE_RELEASE(p)      { if (p) { (p)->Release(); (p) = nullptr; } }
 #define SAFE_CLOSE_HANDLE(p) { if (p) { if ((p) != INVALID_HANDLE_VALUE) ASSERT(CloseHandle(p)); (p) = nullptr; } }
 #define SAFE_DELETE(p)       { if (p) { delete (p); (p) = nullptr; } }
