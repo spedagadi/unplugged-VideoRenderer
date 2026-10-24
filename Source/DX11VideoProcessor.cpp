@@ -1366,12 +1366,22 @@ bool CDX11VideoProcessor::MLInputIsPq() const
 void CDX11VideoProcessor::UpdateCorrectionShader()
 {
 	m_pCorrectionConstants.Release();
-	if (!m_D3D11VP.IsReady()) {
-		// Nothing to correct through: the Tex VP path builds its converter instead
-		// (see UpdateConvertColorShader), and the correction pass would be skipped.
-		m_pPSCorrection.Release();
-		m_strCorrection = nullptr;
-		return;
+	{
+		const bool bHdrSrc = m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084
+			|| m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG;
+		const bool bToSdrIntent = m_bConvertToSdr
+			&& !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping));
+		const bool bTexVpToneMaps = !m_D3D11VP.IsReady() && bHdrSrc && bToSdrIntent;
+		if (!m_D3D11VP.IsReady() && !bTexVpToneMaps) {
+			// The Tex VP path converts the HDR transfer itself (passthrough
+			// cases), or the source is SDR: no correction pass. When the Tex VP
+			// path defers tone mapping to us (convertType forced to NONE in
+			// UpdateConvertColorShader), the correction shader MUST exist or
+			// every tone dial is inert.
+			m_pPSCorrection.Release();
+			m_strCorrection = nullptr;
+			return;
+		}
 	}
 
 	UINT resId = 0;
@@ -1380,7 +1390,15 @@ void CDX11VideoProcessor::UpdateCorrectionShader()
 							|| m_srcExFmt.VideoTransferFunction == DXVA2_VideoTransFunc_240M;
 
 	if (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084 && !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) && m_bConvertToSdr) {
-		resId = m_D3D11VP.IsPqSupported() ? IDF_PS_11_CONVERT_PQ_TO_SDR : IDF_PS_11_FIXCONVERT_PQ_TO_SDR;
+		// IsPqSupported() asks whether the HARDWARE VP can emit PQ — which decides
+		// the correction shader's INPUT on the VP path. On the TexVP path (no VP:
+		// P210 and friends) the converter override in UpdateConvertColorShader
+		// hands over raw PQ codes regardless, so the full fork converter (curve
+		// selection, exposure trim, GT7 — everything the fixconvert variant lacks)
+		// is the matching shader; picking fixconvert there left sdrNits working
+		// and every other dial inert (measured 2026-10-24).
+		const bool bInputIsPqCodes = !m_D3D11VP.IsReady() || m_D3D11VP.IsPqSupported();
+		resId = bInputIsPqCodes ? IDF_PS_11_CONVERT_PQ_TO_SDR : IDF_PS_11_FIXCONVERT_PQ_TO_SDR;
 		m_strCorrection = L"PQ to SDR";
 	}
 	else if (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG) {
@@ -5867,6 +5885,10 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 		m_bVPUseRTXVideoHDR = false;
 		hr = InitializeTexVP(FmtParams, origW, origH);
 		if (SUCCEEDED(hr)) {
+			// The VP branch above creates the correction shader on VP success;
+			// the Tex VP branch needs the same call or the tone-map stack never
+			// exists on formats without a hardware-VP input (P210).
+			UpdateCorrectionShader();
 			SetShaderConvertColorParams();
 			SetShaderLuminanceParams();
 		}
@@ -7718,6 +7740,24 @@ HRESULT CDX11VideoProcessor::UpdateConvertColorShader()
 	int convertType = (m_bConvertToSdr && !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping))) ? SHADER_CONVERT_TO_SDR
 		: (m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping) && m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG) ? SHADER_CONVERT_TO_PQ
 		: SHADER_CONVERT_NONE;
+
+	// On the shader-conversion path (no hardware VP — e.g. P210 10-bit 4:2:2,
+	// which has no D3D11 VP input format) the generated TO_SDR converter runs
+	// upstream's fixed curve and NONE of the fork's dials reach it: measured
+	// 2026-10-24, every [SHADER-CB] push landed in a buffer nothing sampled.
+	// Leave the HDR transfer in the converter output and let the correction
+	// pass — the fork's curve stack, same constant buffer the VP path uses —
+	// do the tone mapping. Chroma upsampling (KrigBilateral 4:2:2) stays in the
+	// converter, where it belongs.
+	{
+		const bool bHdrSrc = m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084
+			|| m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG;
+		const bool bToSdrIntent = m_bConvertToSdr
+			&& !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping));
+		if (!m_D3D11VP.IsReady() && bHdrSrc && bToSdrIntent) {
+			convertType = SHADER_CONVERT_NONE;
+		}
+	}
 
 	MediaSideDataDOVIMetadata* pDOVIMetadata = m_Dovi.bValid ? &m_Dovi.msd : nullptr;
 
