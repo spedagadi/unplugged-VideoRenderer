@@ -6,6 +6,10 @@
 #define IDD_INFOPROPPAGE                103
 #define IDS_MAINPROPPAGE_TITLE          104
 #define IDS_INFOPROPPAGE_TITLE          105
+#define IDD_HDRPROPPAGE                 106
+#define IDD_ZIONPROPPAGE                107
+#define IDS_HDRPROPPAGE_TITLE           108
+#define IDS_ZIONPROPPAGE_TITLE          109
 #define IDI_MPCVR_TRAY                  106
 #define IDF_DITHER_32X32_FLOAT16        401
 #define IDF_SKIN_LUT                    402
@@ -273,6 +277,7 @@
 #define IDC_STATIC132                   1210
 #define IDC_STATIC133                   1211
 #define IDC_STATIC134                   1212
+#define IDC_COMBO14                     1213
 
 // Next default values for new objects
 // 

@@ -48,8 +48,6 @@ public:
 private:
 	void SetControls();
 	void EnableControls();
-	void InitMLSliders();
-	void SetMLSliders();
 
 	HRESULT OnConnect(IUnknown* pUnknown) override;
 	HRESULT OnDisconnect() override;
@@ -67,6 +65,92 @@ private:
 
 	HWND CreateHintWindow(HWND parent, int timePop = 1700, int timeInit = 70, int timeReshow = 7);
 	void AddHint(int id, const LPCWSTR text);
+};
+
+// CVRHdrPPage — the HDR tab: HDR delivery / Trims / GT7 Adapt.
+// Owns the curve-parameter fields it shows; every write into the filter is
+// field-grafted (read current settings, copy own fields, write) so this page
+// can never clobber a field belonging to the Settings or Zion tab — the
+// frame applies pages in order and a full-struct write from a stale page
+// snapshot would silently undo another tab's live edits.
+
+class __declspec(uuid("370C7CDB-131B-48F7-8DB5-928531C69BE0"))
+	CVRHdrPPage : public CBasePropertyPage, public CWindow
+{
+	CComQIPtr<IVideoRenderer> m_pVideoRenderer;
+
+	Settings_t m_SetsPP;
+	bool m_bActivated = false;
+	HWND m_hHint = nullptr;
+
+	void SetControls();
+	void EnableControls();
+	void InitSliders();
+	void SetSliders();
+	void ApplyOwn();            // graft own fields into the filter's settings
+	void Graft(Settings_t& dst) const;
+
+	HRESULT OnConnect(IUnknown* pUnknown) override;
+	HRESULT OnDisconnect() override;
+	HRESULT OnActivate() override;
+	void SetDirty() {
+		if (m_bActivated && !m_bDirty) {
+			m_bDirty = TRUE;
+			if (m_pPageSite) {
+				m_pPageSite->OnStatusChange(PROPPAGESTATUS_DIRTY);
+			}
+		}
+	}
+	INT_PTR OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) override;
+	HRESULT OnApplyChanges() override;
+
+	HWND CreateHintWindow(HWND parent, int timePop = 1700, int timeInit = 70, int timeReshow = 7);
+	void AddHint(int id, const LPCWSTR text);
+
+public:
+	CVRHdrPPage(LPUNKNOWN lpunk, HRESULT* phr);
+	~CVRHdrPPage();
+};
+
+// CVRZionPPage — the Zion tab: tone-engine selector, ML grade, Grade,
+// Micro contrast, Bars & segments, debug rows, live stats box.
+
+class __declspec(uuid("25C394F5-94F1-4A54-AFB3-C4169CAFBA11"))
+	CVRZionPPage : public CBasePropertyPage, public CWindow
+{
+	CComQIPtr<IVideoRenderer> m_pVideoRenderer;
+
+	Settings_t m_SetsPP;
+	bool m_bActivated = false;
+	HWND m_hHint = nullptr;
+
+	void SetControls();
+	void EnableControls();
+	void InitSliders();
+	void SetSliders();
+	void ApplyOwn();
+	void Graft(Settings_t& dst) const;
+
+	HRESULT OnConnect(IUnknown* pUnknown) override;
+	HRESULT OnDisconnect() override;
+	HRESULT OnActivate() override;
+	void SetDirty() {
+		if (m_bActivated && !m_bDirty) {
+			m_bDirty = TRUE;
+			if (m_pPageSite) {
+				m_pPageSite->OnStatusChange(PROPPAGESTATUS_DIRTY);
+			}
+		}
+	}
+	INT_PTR OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) override;
+	HRESULT OnApplyChanges() override;
+
+	HWND CreateHintWindow(HWND parent, int timePop = 1700, int timeInit = 70, int timeReshow = 7);
+	void AddHint(int id, const LPCWSTR text);
+
+public:
+	CVRZionPPage(LPUNKNOWN lpunk, HRESULT* phr);
+	~CVRZionPPage();
 };
 
 // CVRInfoPPage

@@ -53,6 +53,8 @@ const AMOVIESETUP_FILTER sudFilter[] = {
 CFactoryTemplate g_Templates[] = {
 	{sudFilter[0].strName, &__uuidof(CMpcVideoRenderer), CreateInstance<CMpcVideoRenderer>, nullptr, &sudFilter[0]},
 	{L"MainProp", &__uuidof(CVRMainPPage), CreateInstance<CVRMainPPage>, nullptr, nullptr},
+	{L"HdrProp", &__uuidof(CVRHdrPPage), CreateInstance<CVRHdrPPage>, nullptr, nullptr},
+	{L"ZionProp", &__uuidof(CVRZionPPage), CreateInstance<CVRZionPPage>, nullptr, nullptr},
 	{L"InfoProp", &__uuidof(CVRInfoPPage), CreateInstance<CVRInfoPPage>, nullptr, nullptr}
 };
 

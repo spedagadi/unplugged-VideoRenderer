@@ -24,6 +24,8 @@
 #include "DisplayConfig.h"
 #include "PropPage.h"
 
+#include <span>
+
 void SetCursor(HWND hWnd, LPCWSTR lpCursorName)
 {
 	SetClassLongPtrW(hWnd, GCLP_HCURSOR, (LONG_PTR)::LoadCursorW(nullptr, lpCursorName));
@@ -101,7 +103,7 @@ const MLSliderRange kMLSliders[] = {
 	{ IDC_SLIDER10, IDC_EDIT11, 0.50f, 1.00f, &Settings_t::fMLChromaSkinProtect },
 };
 
-constexpr int kMLSlideRange(const MLSliderRange& r) { return (int)((r.hi - r.lo) * 100.0f + 0.5f); }
+int kMLSlideRange(const MLSliderRange& r) { return (int)((r.hi - r.lo) * 100.0f + 0.5f); }
 int MLSliderPos(float value, const MLSliderRange& r) { return (int)roundf((value - r.lo) * kMLSlideRange(r) / (r.hi - r.lo)); }
 float MLSliderValue(int pos, const MLSliderRange& r) { return r.lo + (r.hi - r.lo) * ((float)pos / kMLSlideRange(r)); }
 
@@ -120,10 +122,11 @@ std::wstring FmtSlider(float v) {
 	return s;
 }
 
-// Right-column parity sliders — same table-driven mechanism as the ML rows.
-// The fade-window slider writes its START only at apply; the width stays
-// Polyphony's 0.18 (the engine's parser derives the end the same way).
-const MLSliderRange kGradeSliders[] = {
+// Tab-split parity sliders — same table-driven mechanism as the ML rows.
+// The fade-window slider writes its START only; the width stays Polyphony's
+// 0.18 (the engine's parser derives the end the same way).
+// HDR tab owns: title peak / display black / gamut cap / hi-desat + GT7 block.
+const MLSliderRange kHdrSliders[] = {
 	{ IDC_SLIDER14, IDC_EDIT18, 100.0f, 4000.0f, &Settings_t::fHdrTitlePeakNits },
 	{ IDC_SLIDER15, IDC_EDIT19, 0.0f,   2.0f,    &Settings_t::fHdrDisplayMinNits },
 	{ IDC_SLIDER16, IDC_EDIT20, 0.20f,  1.00f,   &Settings_t::fGamutCap },
@@ -134,6 +137,10 @@ const MLSliderRange kGradeSliders[] = {
 	{ IDC_SLIDER24, IDC_EDIT28, 0.0f,   1.0f,    &Settings_t::fHdrGt7Adapt },
 	{ IDC_SLIDER25, IDC_EDIT29, 0.02f,  0.90f,   &Settings_t::fHdrGt7Alpha },
 	{ IDC_SLIDER26, IDC_EDIT30, 0.0f,   1.0f,    &Settings_t::fHdrGt7Desat },
+};
+
+// Zion tab owns: the ML table above plus grade / micro contrast / segments.
+const MLSliderRange kZionSliders[] = {
 	{ IDC_SLIDER27, IDC_EDIT31, 0.0f,   0.95f,   &Settings_t::fMLTargetMid },
 	{ IDC_SLIDER28, IDC_EDIT32, -0.50f, 0.50f,   &Settings_t::fMLGammaTopUp },
 	{ IDC_SLIDER29, IDC_EDIT33, 0.0f,   1.0f,    &Settings_t::fMLShadowDehaze },
@@ -160,48 +167,46 @@ const MLIntSlider kIntSliders[] = {
 	{ IDC_SLIDER20, IDC_EDIT24, -5, 5, &Settings_t::iHdrPunch },
 };
 
+// Table-driven slider setup/readout shared by the pages. Each page calls with
+// the tables its dialog actually contains (the Zion tab calls twice — the ML
+// table and the grade table; those have no integer sliders).
+void InitTableSliders(HWND hDlg, std::span<const MLSliderRange> ranges,
+                      std::span<const MLIntSlider> ints = {})
+{
+	for (const auto& r : ranges) {
+		const int range = kMLSlideRange(r);
+		::SendDlgItemMessageW(hDlg, r.nSlider, TBM_SETRANGE, 1, MAKELONG(0, range));
+		::SendDlgItemMessageW(hDlg, r.nSlider, TBM_SETLINESIZE, 0, 1);
+		::SendDlgItemMessageW(hDlg, r.nSlider, TBM_SETPAGESIZE, 0, (range / 10 > 1) ? range / 10 : 1);
+	}
+	for (const auto& r : ints) {
+		const int range = r.hi - r.lo;
+		::SendDlgItemMessageW(hDlg, r.nSlider, TBM_SETRANGE, 1, MAKELONG(0, range));
+		::SendDlgItemMessageW(hDlg, r.nSlider, TBM_SETLINESIZE, 0, 1);
+		::SendDlgItemMessageW(hDlg, r.nSlider, TBM_SETPAGESIZE, 0, 1);
+	}
+}
+
+void SetTableSliders(HWND hDlg, const Settings_t& sets, std::span<const MLSliderRange> ranges,
+                     std::span<const MLIntSlider> ints = {})
+{
+	for (const auto& r : ranges) {
+		const float v = sets.*(r.pField);
+		::SendDlgItemMessageW(hDlg, r.nSlider, TBM_SETPOS, 1, MLSliderPos(v, r));
+		::SetDlgItemTextW(hDlg, r.nEdit, FmtSlider(v).c_str());
+	}
+	for (const auto& r : ints) {
+		const int v = sets.*(r.pField);
+		::SendDlgItemMessageW(hDlg, r.nSlider, TBM_SETPOS, 1, v - r.lo);
+		::SetDlgItemTextW(hDlg, r.nEdit, std::to_wstring(v).c_str());
+	}
+}
+
 } // namespace
 
-void CVRMainPPage::InitMLSliders()
-{
-	for (const auto& r : kMLSliders) {
-		const int range = kMLSlideRange(r);
-		SendDlgItemMessageW(r.nSlider, TBM_SETRANGE, 1, MAKELONG(0, range));
-		SendDlgItemMessageW(r.nSlider, TBM_SETLINESIZE, 0, 1);
-		SendDlgItemMessageW(r.nSlider, TBM_SETPAGESIZE, 0, (range / 10 > 1) ? range / 10 : 1);
-	}
-	for (const auto& r : kGradeSliders) {
-		const int range = kMLSlideRange(r);
-		SendDlgItemMessageW(r.nSlider, TBM_SETRANGE, 1, MAKELONG(0, range));
-		SendDlgItemMessageW(r.nSlider, TBM_SETLINESIZE, 0, 1);
-		SendDlgItemMessageW(r.nSlider, TBM_SETPAGESIZE, 0, (range / 10 > 1) ? range / 10 : 1);
-	}
-	for (const auto& r : kIntSliders) {
-		const int range = r.hi - r.lo;
-		SendDlgItemMessageW(r.nSlider, TBM_SETRANGE, 1, MAKELONG(0, range));
-		SendDlgItemMessageW(r.nSlider, TBM_SETLINESIZE, 0, 1);
-		SendDlgItemMessageW(r.nSlider, TBM_SETPAGESIZE, 0, 1);
-	}
-}
-
-void CVRMainPPage::SetMLSliders()
-{
-	for (const auto& r : kMLSliders) {
-		const float v = m_SetsPP.*(r.pField);
-		SendDlgItemMessageW(r.nSlider, TBM_SETPOS, 1, MLSliderPos(v, r));
-		SetDlgItemTextW(r.nEdit, std::to_wstring(v).c_str());
-	}
-	for (const auto& r : kGradeSliders) {
-		const float v = m_SetsPP.*(r.pField);
-		SendDlgItemMessageW(r.nSlider, TBM_SETPOS, 1, MLSliderPos(v, r));
-		SetDlgItemTextW(r.nEdit, FmtSlider(v).c_str());
-	}
-	for (const auto& r : kIntSliders) {
-		const int v = m_SetsPP.*(r.pField);
-		SendDlgItemMessageW(r.nSlider, TBM_SETPOS, 1, v - r.lo);
-		SetDlgItemTextW(r.nEdit, std::to_wstring(v).c_str());
-	}
-}
+// The slider machinery moved with the groups: CVRHdrPPage/CVRZionPPage run the
+// table loops through InitTableSliders/SetTableSliders; the Settings tab has no
+// table-driven sliders left.
 
 void CVRMainPPage::SetControls()
 {
@@ -255,34 +260,6 @@ void CVRMainPPage::SetControls()
 
 	m_SetsPP.iHdrDisplayMaxNits = discard<int>(m_SetsPP.iHdrDisplayMaxNits, HDR_NITS_DEF, HDR_NITS_MIN, HDR_NITS_MAX);
 	SetDlgItemTextW(IDC_EDIT_DISPLAYMAX, std::to_wstring(m_SetsPP.iHdrDisplayMaxNits).c_str());
-
-	CheckDlgButton(IDC_CHECK20, m_SetsPP.bMLEnabled ? BST_CHECKED : BST_UNCHECKED);
-	SendDlgItemMessageW(IDC_COMBO11, CB_SETCURSEL, m_SetsPP.iMLMode, 0);
-	SetMLSliders();
-	CheckDlgButton(IDC_CHECK21, m_SetsPP.bMLDebugCopy ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK22, m_SetsPP.bMLDebugLog  ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK35, m_SetsPP.bTrayIcon     ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK23, m_SetsPP.bMLHuntEnabled   ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK24, m_SetsPP.bMLChromaEnabled ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK32, m_SetsPP.bMLToneCurveEnabled   ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK25, m_SetsPP.bMLGammaEnabled       ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK26, m_SetsPP.bMLShadowEnabled      ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK27, m_SetsPP.bMLHighlightEnabled   ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK28, m_SetsPP.bMLChromaNeutralEnabled ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK29, m_SetsPP.bMLChromaFireEnabled   ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK30, m_SetsPP.bMLChromaKneeEnabled   ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK31, m_SetsPP.bMLChromaSkinEnabled   ? BST_CHECKED : BST_UNCHECKED);
-
-	// Right column: HDR delivery / GT7 / grade / micro contrast / segments
-	CheckDlgButton(IDC_CHECK33, m_SetsPP.bMLContrastEnabled  ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK36, m_SetsPP.bHdrAutoRefWhite    ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK37, m_SetsPP.bMLController       ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK39, m_SetsPP.bMLBars             ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK40, m_SetsPP.bMLBarsHighlight    ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK41, m_SetsPP.bMLSkyEnabled       ? BST_CHECKED : BST_UNCHECKED);
-	CheckDlgButton(IDC_CHECK42, m_SetsPP.bMLPersonEnabled    ? BST_CHECKED : BST_UNCHECKED);
-	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO12, m_SetsPP.iOutputGamut);
-	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO13, (LONG_PTR)(int)m_SetsPP.fHdrGt7Dbg);
 }
 
 void CVRMainPPage::EnableControls()
@@ -319,141 +296,9 @@ void CVRMainPPage::EnableControls()
 	GetDlgItem(IDC_SLIDER2).EnableWindow(m_SetsPP.bConvertToSdr);
 	GetDlgItem(IDC_EDIT_DISPLAYMAX).EnableWindow(m_SetsPP.bHdrLocalToneMapping);
 
-	// Zion ML
-	const BOOL bMLEnable  = m_SetsPP.bMLEnabled;
-	const BOOL bMLManual  = bMLEnable && m_SetsPP.iMLMode == ML_Manual;
-	GetDlgItem(IDC_STATIC101).EnableWindow(bMLEnable);
-	GetDlgItem(IDC_COMBO11).EnableWindow(bMLEnable);
-	const BOOL bChromaRow  = m_SetsPP.bMLChromaEnabled;
-	const BOOL bToneRow   = m_SetsPP.bMLToneCurveEnabled;
-	GetDlgItem(IDC_CHECK32).EnableWindow(bMLEnable);                       // tone curve master
-	GetDlgItem(IDC_CHECK25).EnableWindow(bMLEnable);                       // gamma row
-	GetDlgItem(IDC_SLIDER3).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLGammaEnabled);
-	GetDlgItem(IDC_EDIT3).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLGammaEnabled);
-	GetDlgItem(IDC_CHECK26).EnableWindow(bMLEnable);                       // shadow row
-	// Band controller ON owns the shadow band: the legacy multiplicative toe
-	// stands down rather than double-acting (same rule the companion rail follows).
-	GetDlgItem(IDC_SLIDER4).EnableWindow(bMLEnable && m_SetsPP.bMLShadowEnabled && !m_SetsPP.bMLController);
-	GetDlgItem(IDC_EDIT4).EnableWindow(bMLEnable && m_SetsPP.bMLShadowEnabled && !m_SetsPP.bMLController);
-	GetDlgItem(IDC_CHECK27).EnableWindow(bMLEnable);                       // highlight row
-	GetDlgItem(IDC_SLIDER5).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLHighlightEnabled);
-	GetDlgItem(IDC_EDIT5).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLHighlightEnabled);
-	GetDlgItem(IDC_CHECK23).EnableWindow(bMLEnable);                       // hunt row
-	GetDlgItem(IDC_SLIDER6).EnableWindow(bMLEnable && m_SetsPP.bMLHuntEnabled);
-	GetDlgItem(IDC_EDIT7).EnableWindow(bMLEnable && m_SetsPP.bMLHuntEnabled);
-	GetDlgItem(IDC_CHECK28).EnableWindow(bMLEnable);                       // ch-neutral row
-	GetDlgItem(IDC_SLIDER7).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaNeutralEnabled);
-	GetDlgItem(IDC_EDIT8).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaNeutralEnabled);
-	GetDlgItem(IDC_CHECK29).EnableWindow(bMLEnable);                       // ch-fire row
-	GetDlgItem(IDC_SLIDER8).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaFireEnabled);
-	GetDlgItem(IDC_EDIT9).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaFireEnabled);
-	GetDlgItem(IDC_CHECK30).EnableWindow(bMLEnable);                       // knee row
-	GetDlgItem(IDC_SLIDER9).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaKneeEnabled);
-	GetDlgItem(IDC_EDIT10).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaKneeEnabled);
-	GetDlgItem(IDC_CHECK31).EnableWindow(bMLEnable);                       // skin row
-	GetDlgItem(IDC_SLIDER10).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaSkinEnabled);
-	GetDlgItem(IDC_EDIT11).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaSkinEnabled);
-	GetDlgItem(IDC_STATIC105).EnableWindow(bMLEnable);
-	GetDlgItem(IDC_CHECK21).EnableWindow(bMLEnable);
-	GetDlgItem(IDC_CHECK22).EnableWindow(bMLEnable);
-	GetDlgItem(IDC_CHECK24).EnableWindow(bMLEnable);                       // chroma master
-
-	// Right column — mirrors the companion rail's exposure rule (CURVES_* sets in
-	// s3shell_panel.py): a dial is only live when the selected curve reads it.
-	const BOOL bHdrOn   = m_SetsPP.bUseD3D11 && IsWindows10OrGreater()
-		&& m_SetsPP.bHdrLocalToneMapping && m_SetsPP.bConvertToSdr;
-	const BOOL bGt7Ad   = bHdrOn && m_SetsPP.iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT;
-	GetDlgItem(IDC_STATIC112).EnableWindow(bGt7Ad);   // title peak: what GT7 Adapt maps FROM
-	GetDlgItem(IDC_SLIDER14).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_EDIT18).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_STATIC113).EnableWindow(bHdrOn);   // display black: destination range floor
-	GetDlgItem(IDC_SLIDER15).EnableWindow(bHdrOn);
-	GetDlgItem(IDC_EDIT19).EnableWindow(bHdrOn);
-	GetDlgItem(IDC_STATIC114).EnableWindow(bHdrOn);   // output gamut
-	GetDlgItem(IDC_COMBO12).EnableWindow(bHdrOn);
-	const BOOL bCap = bHdrOn && m_SetsPP.iOutputGamut == 0;  // capacity acts inside 709 only
-	GetDlgItem(IDC_STATIC115).EnableWindow(bCap);
-	GetDlgItem(IDC_SLIDER16).EnableWindow(bCap);
-	GetDlgItem(IDC_EDIT20).EnableWindow(bCap);
-	const BOOL bHiDesat = bHdrOn && bMLEnable;  // delivered in the grade's chroma pass
-	GetDlgItem(IDC_STATIC116).EnableWindow(bHiDesat);
-	GetDlgItem(IDC_SLIDER17).EnableWindow(bHiDesat);
-	GetDlgItem(IDC_EDIT21).EnableWindow(bHiDesat);
-	GetDlgItem(IDC_STATIC117).EnableWindow(bHdrOn); // exposure trim — both house curves
-	GetDlgItem(IDC_SLIDER18).EnableWindow(bHdrOn);
-	GetDlgItem(IDC_EDIT22).EnableWindow(bHdrOn);
-	GetDlgItem(IDC_STATIC118).EnableWindow(bHdrOn); // shadow detail
-	GetDlgItem(IDC_SLIDER19).EnableWindow(bHdrOn);
-	GetDlgItem(IDC_EDIT23).EnableWindow(bHdrOn);
-	GetDlgItem(IDC_STATIC119).EnableWindow(bHdrOn); // contrast
-	GetDlgItem(IDC_SLIDER20).EnableWindow(bHdrOn);
-	GetDlgItem(IDC_EDIT24).EnableWindow(bHdrOn);
-	GetDlgItem(IDC_CHECK36).EnableWindow(bGt7Ad);   // auto exposure
-	const BOOL bRefTgt = bGt7Ad && m_SetsPP.bHdrAutoRefWhite;
-	GetDlgItem(IDC_STATIC120).EnableWindow(bRefTgt);
-	GetDlgItem(IDC_SLIDER21).EnableWindow(bRefTgt);
-	GetDlgItem(IDC_EDIT25).EnableWindow(bRefTgt);
-	GetDlgItem(IDC_STATIC121).EnableWindow(bGt7Ad); // gt7 blend..desat + debug view
-	GetDlgItem(IDC_SLIDER22).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_EDIT26).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_STATIC122).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_SLIDER23).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_EDIT27).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_STATIC123).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_SLIDER24).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_EDIT28).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_STATIC124).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_SLIDER25).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_EDIT29).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_STATIC125).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_SLIDER26).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_EDIT30).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_STATIC126).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_COMBO13).EnableWindow(bGt7Ad);
-	GetDlgItem(IDC_CHECK37).EnableWindow(bMLEnable); // band controller
-	GetDlgItem(IDC_STATIC127).EnableWindow(bMLEnable); // mid-tone target
-	GetDlgItem(IDC_SLIDER27).EnableWindow(bMLEnable);
-	GetDlgItem(IDC_EDIT31).EnableWindow(bMLEnable);
-	const BOOL bTopUp = bMLEnable && !m_SetsPP.bMLController;  // stands down under the controller
-	GetDlgItem(IDC_STATIC128).EnableWindow(bTopUp);
-	GetDlgItem(IDC_SLIDER28).EnableWindow(bTopUp);
-	GetDlgItem(IDC_EDIT32).EnableWindow(bTopUp);
-	GetDlgItem(IDC_STATIC129).EnableWindow(bMLEnable); // shadow dehaze
-	GetDlgItem(IDC_SLIDER29).EnableWindow(bMLEnable);
-	GetDlgItem(IDC_EDIT33).EnableWindow(bMLEnable);
-	GetDlgItem(IDC_STATIC130).EnableWindow(bMLEnable); // highlight shoulder
-	GetDlgItem(IDC_SLIDER30).EnableWindow(bMLEnable);
-	GetDlgItem(IDC_EDIT34).EnableWindow(bMLEnable);
-	GetDlgItem(IDC_CHECK33).EnableWindow(bMLEnable);   // micro contrast enable
-	const BOOL bMC = bMLEnable && m_SetsPP.bMLContrastEnabled;
-	GetDlgItem(IDC_STATIC109).EnableWindow(bMC);
-	GetDlgItem(IDC_SLIDER11).EnableWindow(bMC);
-	GetDlgItem(IDC_EDIT15).EnableWindow(bMC);
-	GetDlgItem(IDC_STATIC131).EnableWindow(bMC);
-	GetDlgItem(IDC_SLIDER31).EnableWindow(bMC);
-	GetDlgItem(IDC_EDIT35).EnableWindow(bMC);
-	GetDlgItem(IDC_STATIC132).EnableWindow(bMC);
-	GetDlgItem(IDC_SLIDER32).EnableWindow(bMC);
-	GetDlgItem(IDC_EDIT36).EnableWindow(bMC);
-	GetDlgItem(IDC_STATIC133).EnableWindow(bMC);
-	GetDlgItem(IDC_SLIDER33).EnableWindow(bMC);
-	GetDlgItem(IDC_EDIT37).EnableWindow(bMC);
-	GetDlgItem(IDC_CHECK39).EnableWindow(bMLEnable);   // repaint bars
-	GetDlgItem(IDC_CHECK40).EnableWindow(bMLEnable);   // highlight bars
-	GetDlgItem(IDC_CHECK41).EnableWindow(bMLEnable);   // sky seg
-	const BOOL bSky = bMLEnable && m_SetsPP.bMLSkyEnabled;
-	GetDlgItem(IDC_SLIDER34).EnableWindow(bSky);
-	GetDlgItem(IDC_EDIT38).EnableWindow(bSky);
-	GetDlgItem(IDC_CHECK42).EnableWindow(bMLEnable);   // person skin
-	const BOOL bPerson = bMLEnable && m_SetsPP.bMLPersonEnabled;
-	GetDlgItem(IDC_SLIDER35).EnableWindow(bPerson);
-	GetDlgItem(IDC_EDIT39).EnableWindow(bPerson);
-	GetDlgItem(IDC_STATIC134).EnableWindow(bPerson);   // tone preserve
-	GetDlgItem(IDC_SLIDER36).EnableWindow(bPerson);
-	GetDlgItem(IDC_EDIT40).EnableWindow(bPerson);
-
-	// Tray icon is renderer-wide, not ML-gated
-	GetDlgItem(IDC_CHECK35).EnableWindow(TRUE);
+	// The ML/right-column gating moved with the groups: the HDR tab recomputes
+	// the curve-dependent block, the Zion tab the ML block (CVRHdrPPage::
+	// EnableControls / CVRZionPPage::EnableControls).
 }
 
 HRESULT CVRMainPPage::OnConnect(IUnknown *pUnk)
@@ -601,19 +446,6 @@ HRESULT CVRMainPPage::OnActivate()
 		}
 	}
 
-	ComboBox_AddStringData(m_hWnd, IDC_COMBO12, L"BT.709 (standard)", 0);
-	ComboBox_AddStringData(m_hWnd, IDC_COMBO12, L"BT.2020 (wide)", 1);
-
-	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Off", 0);
-	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Chroma scale", 1);
-	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Fade ratio", 2);
-	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Knee crossing", 3);
-	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Ceiling crossing", 4);
-
-	SendDlgItemMessageW(IDC_COMBO11, CB_ADDSTRING, 0, (LPARAM)L"Disable");
-	SendDlgItemMessageW(IDC_COMBO11, CB_ADDSTRING, 0, (LPARAM)L"Manual");
-	SendDlgItemMessageW(IDC_COMBO11, CB_ADDSTRING, 0, (LPARAM)L"Auto");
-
 	SetControls();
 
 	SetCursor(m_hWnd, IDC_ARROW);
@@ -647,60 +479,15 @@ HRESULT CVRMainPPage::OnActivate()
 	AddHint(IDC_COMBO10,
 		L"Unplugged - the house curve; respects Dolby Vision mastering.\n"
 		"GT7 Adapt - for HDR10/HLG; blends the declared peak with what\n"
-		"each scene measures. The trims below work on both curves.");
-	AddHint(IDC_SLIDER14,
-		L"The content peak the curve maps FROM. Leave 1000 unless the\n"
-		"disc's MaxCLL is known.");
-	AddHint(IDC_SLIDER15,
-		L"Measured black of the display. At 0 the curve assumes perfect\n"
-		"black and wastes shadow detail on range the panel cannot show.");
-	AddHint(IDC_SLIDER16,
-		L"Pulls colors crowded against the BT.709 edge inward.\n"
-		"1.00 = off; ~0.55 measures like reference software on deep skies.");
-	AddHint(IDC_SLIDER17,
-		L"Highlight desaturation linked to the delivered level.\n"
-		"Runs inside the grade, so it needs Enable ML grade. 0 = off.");
-	AddHint(IDC_SLIDER18,
-		L"Input gain in thirds of a stop (+3 = one stop), absorbed by the\n"
-		"shoulder - brightness without spending the highlights.");
-	AddHint(IDC_SLIDER19,
-		L"Positive spreads dark values apart and reveals their texture\n"
-		"(detail, not a lift); negative densifies the black end.");
-	AddHint(IDC_SLIDER20,
-		L"Symmetric S-curve around mid grey: black, mid and white stay put.");
-	AddHint(IDC_SLIDER25,
-		L"LOWER = longer shoulder = more headroom before bright detail\n"
-		"merges to white. The first dial to turn down if explosions clip.");
-	AddHint(IDC_CHECK37,
-		L"Solves shadow, gamma and highlight together onto fixed house\n"
-		"levels each frame. While on, the legacy Shadow band and the\n"
-		"Gamma top-up stand down - the controller owns those actuators.");
-	AddHint(IDC_SLIDER27,
-		L"Where the scene average should land (0 = off). The brightness\n"
-		"dial that does not cost the clouds.");
+		"each scene measures. The trims work on both curves.");
 
 	m_bActivated = true;
-
-	// poll the live Zion ML state for the stats box
-	SetTimer(1001, 500);
-
-	InitMLSliders();
 
 	return S_OK;
 }
 
 INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
-	if (uMsg == WM_TIMER && wParam == 1001) {
-		// refresh live Zion ML values
-		if (m_pVideoRenderer) {
-			std::wstring str;
-			m_pVideoRenderer->GetMLStats(str);
-			GetDlgItem(IDC_EDIT6).SetWindowTextW(str.c_str());
-		}
-		return (LRESULT)1;
-	}
-
 	if (uMsg == WM_COMMAND) {
 		LRESULT lValue;
 		const int nID = LOWORD(wParam);
@@ -801,93 +588,16 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 				SetDirty();
 				return (LRESULT)1;
 			}
-			if (nID == IDC_CHECK20) {
-				m_SetsPP.bMLEnabled = IsDlgButtonChecked(IDC_CHECK20) == BST_CHECKED;
-				EnableControls();
-				m_pVideoRenderer->SetSettings(m_SetsPP); // live: apply immediately
-				SetDirty();
-				return (LRESULT)1;
-			}
-			if (nID == IDC_CHECK21) {
-				m_SetsPP.bMLDebugCopy = IsDlgButtonChecked(IDC_CHECK21) == BST_CHECKED;
-				m_pVideoRenderer->SetSettings(m_SetsPP);
-				SetDirty();
-				return (LRESULT)1;
-			}
-			if (nID == IDC_CHECK22) {
-				m_SetsPP.bMLDebugLog = IsDlgButtonChecked(IDC_CHECK22) == BST_CHECKED;
-				m_pVideoRenderer->SetSettings(m_SetsPP);
-				SetDirty();
-				return (LRESULT)1;
-			}
-			if (nID == IDC_CHECK35) {
-				m_SetsPP.bTrayIcon = IsDlgButtonChecked(IDC_CHECK35) == BST_CHECKED;
-				m_pVideoRenderer->SetSettings(m_SetsPP);
-				SetDirty();
-				return (LRESULT)1;
-			}
-			if (nID == IDC_CHECK23) {
-				m_SetsPP.bMLHuntEnabled = IsDlgButtonChecked(IDC_CHECK23) == BST_CHECKED;
-				EnableControls();
-				m_pVideoRenderer->SetSettings(m_SetsPP);
-				SetDirty();
-				return (LRESULT)1;
-			}
-			if (nID == IDC_CHECK24) {
-				m_SetsPP.bMLChromaEnabled = IsDlgButtonChecked(IDC_CHECK24) == BST_CHECKED;
-				EnableControls();
-				m_pVideoRenderer->SetSettings(m_SetsPP);
-				SetDirty();
-				return (LRESULT)1;
-			}
-			if (nID == IDC_CHECK32) {
-				m_SetsPP.bMLToneCurveEnabled = IsDlgButtonChecked(IDC_CHECK32) == BST_CHECKED;
-				EnableControls();
-				m_pVideoRenderer->SetSettings(m_SetsPP);
-				SetDirty();
-				return (LRESULT)1;
-			}
-			if (nID == IDC_CHECK25 || nID == IDC_CHECK26 || nID == IDC_CHECK27 ||
-				nID == IDC_CHECK28 || nID == IDC_CHECK29 || nID == IDC_CHECK30 || nID == IDC_CHECK31) {
-				const bool bChecked = IsDlgButtonChecked(nID) == BST_CHECKED;
-				switch (nID) {
-				case IDC_CHECK25: m_SetsPP.bMLGammaEnabled       = bChecked; break;
-				case IDC_CHECK26: m_SetsPP.bMLShadowEnabled      = bChecked; break;
-				case IDC_CHECK27: m_SetsPP.bMLHighlightEnabled   = bChecked; break;
-				case IDC_CHECK28: m_SetsPP.bMLChromaNeutralEnabled = bChecked; break;
-				case IDC_CHECK29: m_SetsPP.bMLChromaFireEnabled   = bChecked; break;
-				case IDC_CHECK30: m_SetsPP.bMLChromaKneeEnabled   = bChecked; break;
-				case IDC_CHECK31: m_SetsPP.bMLChromaSkinEnabled   = bChecked; break;
-				}
-				EnableControls();
-				m_pVideoRenderer->SetSettings(m_SetsPP);
-				SetDirty();
-				return (LRESULT)1;
-			}
-
-			if (nID == IDC_CHECK33 || nID == IDC_CHECK36 || nID == IDC_CHECK37 ||
-				nID == IDC_CHECK39 || nID == IDC_CHECK40 || nID == IDC_CHECK41 ||
-				nID == IDC_CHECK42) {
-				const bool bChecked = IsDlgButtonChecked(nID) == BST_CHECKED;
-				switch (nID) {
-				case IDC_CHECK33: m_SetsPP.bMLContrastEnabled = bChecked; break; // micro contrast
-				case IDC_CHECK36: m_SetsPP.bHdrAutoRefWhite   = bChecked; break; // auto exposure
-				case IDC_CHECK37: m_SetsPP.bMLController      = bChecked; break; // band controller
-				case IDC_CHECK39: m_SetsPP.bMLBars            = bChecked; break; // repaint bars
-				case IDC_CHECK40: m_SetsPP.bMLBarsHighlight   = bChecked; break; // highlight bars
-				case IDC_CHECK41: m_SetsPP.bMLSkyEnabled      = bChecked; break; // sky seg
-				case IDC_CHECK42: m_SetsPP.bMLPersonEnabled   = bChecked; break; // person skin
-				}
-				EnableControls();
-				m_pVideoRenderer->SetSettings(m_SetsPP); // live: gate changes show at once
-				SetDirty();
-				return (LRESULT)1;
-			}
 
 			if (nID == IDC_BUTTON1) {
+				// Default resets the whole engine, not just this tab: write the
+				// full reset to the filter at once, so the HDR and Zion tabs
+				// reload defaults the next time they are activated.
 				m_SetsPP.SetDefault();
 				SetControls();
 				EnableControls();
+				m_pVideoRenderer->SetSettings(m_SetsPP);
+				m_pVideoRenderer->SaveSettings();
 				SetDirty();
 				return (LRESULT)1;
 			}
@@ -980,69 +690,24 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 					if (lValue > 0) {
 						m_SetsPP.iHdrLocalToneMappingType = (int)lValue;
 					}
+					// Live-apply the curve trio: the GT7 group on the HDR tab is
+					// gated on this value and reloads from the FILTER at activation.
+					Settings_t cur;
+					m_pVideoRenderer->GetSettings(cur);
+					cur.bHdrPassthrough      = m_SetsPP.bHdrPassthrough;
+					cur.bHdrLocalToneMapping = m_SetsPP.bHdrLocalToneMapping;
+					if (lValue > 0) {
+						cur.iHdrLocalToneMappingType = m_SetsPP.iHdrLocalToneMappingType;
+					}
+					m_pVideoRenderer->SetSettings(cur);
 					SetDirty();
 					EnableControls();
-				}
-				return (LRESULT)1;
-			}
-			if (nID == IDC_COMBO12) {
-				lValue = ComboBox_GetCurItemData(m_hWnd, IDC_COMBO12);
-				if (lValue != m_SetsPP.iOutputGamut) {
-					m_SetsPP.iOutputGamut = (int)lValue;
-					SetDirty();
-					EnableControls(); // gamut capacity acts only inside BT.709
-				}
-				return (LRESULT)1;
-			}
-			if (nID == IDC_COMBO13) {
-				lValue = ComboBox_GetCurItemData(m_hWnd, IDC_COMBO13);
-				if ((float)lValue != m_SetsPP.fHdrGt7Dbg) {
-					// A debug view is for looking at - it must apply without Apply.
-					m_SetsPP.fHdrGt7Dbg = (float)lValue;
-					m_pVideoRenderer->SetSettings(m_SetsPP); // live
-					SetDirty();
-				}
-				return (LRESULT)1;
-			}
-			if (nID == IDC_COMBO11) {
-				lValue = SendDlgItemMessageW(IDC_COMBO11, CB_GETCURSEL, 0, 0);
-				if (lValue != m_SetsPP.iMLMode) {
-					m_SetsPP.iMLMode = lValue;
-					EnableControls();
-					m_pVideoRenderer->SetSettings(m_SetsPP); // live: apply immediately
-					SetDirty();
 				}
 				return (LRESULT)1;
 			}
 		}
 		if (action == EN_CHANGE) {
 			if (nID == IDC_EDIT_DISPLAYMAX) {
-				SetDirty();
-			}
-			if (nID == IDC_EDIT3 || nID == IDC_EDIT4 || nID == IDC_EDIT5 ||
-				nID == IDC_EDIT7 || nID == IDC_EDIT8 || nID == IDC_EDIT9 ||
-				nID == IDC_EDIT10 || nID == IDC_EDIT11) {
-				// Zion ML value edits: live-apply on every keystroke, clamping
-				// out-of-range entries to the valid range instead of rejecting
-				// them (so typing "3" visibly applies 1.5 rather than doing
-				// nothing).
-				float* pDst = nullptr;
-				float def = 0.f, lo = 0.f, hi = 0.f;
-				if (nID == IDC_EDIT3) { pDst = &m_SetsPP.fMLGamma; def = 1.0f; lo = 0.5f;  hi = 1.5f; }
-				if (nID == IDC_EDIT4) { pDst = &m_SetsPP.fMLShadow; def = 2.0f; lo = 0.0f;  hi = 5.0f; }
-				if (nID == IDC_EDIT5) { pDst = &m_SetsPP.fMLHighlight; def = 0.0f; lo = -0.3f; hi = 0.4f; }
-				if (nID == IDC_EDIT7) { pDst = &m_SetsPP.fMLHunt; def = 0.80f; lo = 0.0f; hi = 1.0f; }
-				if (nID == IDC_EDIT8) { pDst = &m_SetsPP.fMLChromaNeutral; def = 1.20f; lo = 1.0f; hi = 1.5f; }
-				if (nID == IDC_EDIT9) { pDst = &m_SetsPP.fMLChromaFire; def = 1.35f; lo = 1.0f; hi = 1.5f; }
-				if (nID == IDC_EDIT10) { pDst = &m_SetsPP.fMLChromaKnee; def = 0.55f; lo = 0.1f; hi = 0.9f; }
-				if (nID == IDC_EDIT11) { pDst = &m_SetsPP.fMLChromaSkinProtect; def = 0.95f; lo = 0.5f; hi = 1.0f; }
-				WCHAR buffer[32];
-				::GetDlgItemTextW(m_hWnd, nID, buffer, _countof(buffer));
-				const float v = (float)_wtof(buffer);
-				if (pDst && buffer[0]) {
-					*pDst = discard<float>(v, def, lo, hi);
-					m_pVideoRenderer->SetSettings(m_SetsPP); // live: apply immediately
-				}
 				SetDirty();
 			}
 		}
@@ -1074,43 +739,8 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 			return (LRESULT)1;
 		}
 
-		// Zion ML sliders — live-apply on every move
-		for (const auto& r : kMLSliders) {
-			if ((HWND)lParam == GetDlgItem(r.nSlider)) {
-				const float v = MLSliderValue((int)SendDlgItemMessageW(r.nSlider, TBM_GETPOS, 0, 0), r);
-				m_SetsPP.*(r.pField) = v;
-				SetDlgItemTextW(r.nEdit, std::to_wstring(v).c_str());
-				m_pVideoRenderer->SetSettings(m_SetsPP);
-				SetDirty();
-				return (LRESULT)1;
-			}
-		}
-		// Right-column sliders — same live-apply grammar
-		for (const auto& r : kGradeSliders) {
-			if ((HWND)lParam == GetDlgItem(r.nSlider)) {
-				const float v = MLSliderValue((int)SendDlgItemMessageW(r.nSlider, TBM_GETPOS, 0, 0), r);
-				m_SetsPP.*(r.pField) = v;
-				if (r.nSlider == IDC_SLIDER23) {
-					// One control for the fade window: the width stays 0.18, as the
-					// engine's own parser derives it — no inverted pairs by hand.
-					m_SetsPP.fHdrGt7FadeEnd = v + 0.18f;
-				}
-				SetDlgItemTextW(r.nEdit, FmtSlider(v).c_str());
-				m_pVideoRenderer->SetSettings(m_SetsPP);
-				SetDirty();
-				return (LRESULT)1;
-			}
-		}
-		for (const auto& r : kIntSliders) {
-			if ((HWND)lParam == GetDlgItem(r.nSlider)) {
-				const int v = (int)SendDlgItemMessageW(r.nSlider, TBM_GETPOS, 0, 0) + r.lo;
-				m_SetsPP.*(r.pField) = v;
-				SetDlgItemTextW(r.nEdit, std::to_wstring(v).c_str());
-				m_pVideoRenderer->SetSettings(m_SetsPP);
-				SetDirty();
-				return (LRESULT)1;
-			}
-		}
+		// Table-driven sliders live on the HDR and Zion tabs now
+		// (CVRHdrPPage::OnReceiveMessage / CVRZionPPage::OnReceiveMessage).
 	}
 
 	// Let the parent class handle the message.
@@ -1131,19 +761,43 @@ HRESULT CVRMainPPage::OnApplyChanges()
 		m_SetsPP.iHdrDisplayMaxNits = displayMaxNits;
 	}
 
-	// Zion ML manual values
-	auto readFloat = [](HWND hWnd, int idEdit, float& dst, float def, float lo, float hi) {
-		WCHAR buffer[32];
-		::GetDlgItemTextW(hWnd, idEdit, buffer, _countof(buffer));
-		if (buffer[0]) {
-			dst = discard<float>((float)_wtof(buffer), def, lo, hi);
-		}
-	};
-	readFloat(m_hWnd, IDC_EDIT3, m_SetsPP.fMLGamma, 1.0f, 0.5f, 1.5f);
-	readFloat(m_hWnd, IDC_EDIT4, m_SetsPP.fMLShadow, 2.0f, 0.0f, 5.0f);
-	readFloat(m_hWnd, IDC_EDIT5, m_SetsPP.fMLHighlight, 0.0f, -0.3f, 0.4f);
-
-	m_pVideoRenderer->SetSettings(m_SetsPP);
+	// Field-graft: take the filter's CURRENT settings and overwrite only the
+	// fields this tab shows. A full-struct write from this page's snapshot
+	// would undo HDR/Zion-tab edits that landed after the snapshot (the frame
+	// applies every dirty page on OK, in tab order).
+	Settings_t cur;
+	m_pVideoRenderer->GetSettings(cur);
+	cur.bUseD3D11             = m_SetsPP.bUseD3D11;
+	cur.bShowStats            = m_SetsPP.bShowStats;
+	cur.iTexFormat            = m_SetsPP.iTexFormat;
+	cur.VPFmts                = m_SetsPP.VPFmts;
+	cur.iVPDeinterlacing      = m_SetsPP.iVPDeinterlacing;
+	cur.bDeintDouble          = m_SetsPP.bDeintDouble;
+	cur.bVPScaling            = m_SetsPP.bVPScaling;
+	cur.iVPSuperRes           = m_SetsPP.iVPSuperRes;
+	cur.bVPRTXVideoHDR        = m_SetsPP.bVPRTXVideoHDR;
+	cur.bHdrPreferDoVi        = m_SetsPP.bHdrPreferDoVi;
+	cur.bConvertToSdr         = m_SetsPP.bConvertToSdr;
+	cur.iHdrToggleDisplay     = m_SetsPP.iHdrToggleDisplay;
+	cur.iHdrOsdBrightness     = m_SetsPP.iHdrOsdBrightness;
+	cur.iSDRDisplayNits       = m_SetsPP.iSDRDisplayNits;
+	cur.bInterpolateAt50pct   = m_SetsPP.bInterpolateAt50pct;
+	cur.bUseDither            = m_SetsPP.bUseDither;
+	cur.bDeintBlend           = m_SetsPP.bDeintBlend;
+	cur.bExclusiveFS          = m_SetsPP.bExclusiveFS;
+	cur.bVBlankBeforePresent  = m_SetsPP.bVBlankBeforePresent;
+	cur.bAdjustPresentTime    = m_SetsPP.bAdjustPresentTime;
+	cur.bReinitByDisplay      = m_SetsPP.bReinitByDisplay;
+	cur.iResizeStats          = m_SetsPP.iResizeStats;
+	cur.iChromaScaling        = m_SetsPP.iChromaScaling;
+	cur.iUpscaling            = m_SetsPP.iUpscaling;
+	cur.iDownscaling          = m_SetsPP.iDownscaling;
+	cur.iSwapEffect           = m_SetsPP.iSwapEffect;
+	cur.iHdrDisplayMaxNits    = m_SetsPP.iHdrDisplayMaxNits;
+	cur.bHdrPassthrough       = m_SetsPP.bHdrPassthrough;
+	cur.bHdrLocalToneMapping  = m_SetsPP.bHdrLocalToneMapping;
+	cur.iHdrLocalToneMappingType = m_SetsPP.iHdrLocalToneMappingType;
+	m_pVideoRenderer->SetSettings(cur);
 	m_pVideoRenderer->SaveSettings();
 
 	m_oldSDRDisplayNits = m_SetsPP.iSDRDisplayNits;
@@ -1166,6 +820,787 @@ HWND CVRMainPPage::CreateHintWindow(HWND parent, int timePop, int timeInit, int 
 }
 
 void CVRMainPPage::AddHint(int id, const LPCWSTR text)
+{
+	if (!m_hHint) {
+		m_hHint = CreateHintWindow(m_Dlg, 15000);
+	}
+	TOOLINFOW ti;
+	ti.cbSize = sizeof(TOOLINFOW);
+	ti.uFlags = TTF_SUBCLASS | TTF_IDISHWND;
+	ti.hwnd = m_Dlg;
+	ti.uId = (LPARAM)GetDlgItem(id).m_hWnd;
+	ti.lpszText = const_cast<LPWSTR>(text);
+	SendMessageW(m_hHint, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
+// CVRHdrPPage — the HDR tab
+
+CVRHdrPPage::CVRHdrPPage(LPUNKNOWN lpunk, HRESULT* phr) :
+	CBasePropertyPage(L"HdrProp", lpunk, IDD_HDRPROPPAGE, IDS_HDRPROPPAGE_TITLE)
+{
+	DLog(L"CVRHdrPPage()");
+}
+
+CVRHdrPPage::~CVRHdrPPage()
+{
+	DLog(L"~CVRHdrPPage()");
+}
+
+void CVRHdrPPage::InitSliders()
+{
+	InitTableSliders(m_hWnd, kHdrSliders, kIntSliders);
+}
+
+void CVRHdrPPage::SetSliders()
+{
+	SetTableSliders(m_hWnd, m_SetsPP, kHdrSliders, kIntSliders);
+}
+
+void CVRHdrPPage::SetControls()
+{
+	CheckDlgButton(IDC_CHECK36, m_SetsPP.bHdrAutoRefWhite ? BST_CHECKED : BST_UNCHECKED);
+	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO12, m_SetsPP.iOutputGamut);
+	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO13, (LONG_PTR)(int)m_SetsPP.fHdrGt7Dbg);
+
+	// Curve selection state. Ignore/Passthrough are flag-only states (the stored
+	// type keeps whatever curve was last chosen), so item data encodes them as
+	// 0/1 and real curves by their engine type.
+	LONG_PTR sel;
+	if (!m_SetsPP.bHdrLocalToneMapping) {
+		sel = m_SetsPP.bHdrPassthrough ? 0 : 1;
+	} else {
+		sel = (LONG_PTR)m_SetsPP.iHdrLocalToneMappingType;
+	}
+	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO14, sel);
+	if (SendDlgItemMessageW(IDC_COMBO14, CB_GETCURSEL, 0, 0) == CB_ERR) {
+		ComboBox_SelectByItemData(m_hWnd, IDC_COMBO14, (LONG_PTR)TONE_CURVE_REFERENCE);
+	}
+	SetSliders();
+}
+
+void CVRHdrPPage::EnableControls()
+{
+	// Gate semantics (revised with the tab split): the trims and the delivery
+	// block are ALWAYS interactive — they store instantly and are read by
+	// whichever engine reaches them, so greying them because the engine is
+	// momentarily elsewhere only hides settings the user is entitled to set
+	// ahead of time. What IS gated is per-curve machinery: the GT7 block is
+	// live exactly when the selected curve is GT7 Adapt (the user's rule),
+	// and the two dials that only some paths read keep state gates:
+	//   gamut capacity - inside BT.709 only;   highlight desat - needs the grade.
+	const BOOL bGt7Sel = m_SetsPP.bHdrLocalToneMapping
+		&& m_SetsPP.iHdrLocalToneMappingType == TONE_CURVE_GT7_ADAPT;
+	const BOOL bCap = m_SetsPP.iOutputGamut == 0;      // capacity acts inside 709 only
+	const BOOL bHiDesat = m_SetsPP.bMLEnabled;         // delivered in the grade's chroma pass
+	GetDlgItem(IDC_STATIC115).EnableWindow(bCap);
+	GetDlgItem(IDC_SLIDER16).EnableWindow(bCap);
+	GetDlgItem(IDC_EDIT20).EnableWindow(bCap);
+	GetDlgItem(IDC_STATIC116).EnableWindow(bHiDesat);
+	GetDlgItem(IDC_SLIDER17).EnableWindow(bHiDesat);
+	GetDlgItem(IDC_EDIT21).EnableWindow(bHiDesat);
+	GetDlgItem(IDC_CHECK36).EnableWindow(bGt7Sel);     // auto exposure
+	const BOOL bRefTgt = bGt7Sel && m_SetsPP.bHdrAutoRefWhite;
+	GetDlgItem(IDC_STATIC120).EnableWindow(bRefTgt);
+	GetDlgItem(IDC_SLIDER21).EnableWindow(bRefTgt);
+	GetDlgItem(IDC_EDIT25).EnableWindow(bRefTgt);
+	GetDlgItem(IDC_STATIC121).EnableWindow(bGt7Sel);   // gt7 blend..desat + debug view
+	GetDlgItem(IDC_SLIDER22).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_EDIT26).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_STATIC122).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_SLIDER23).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_EDIT27).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_STATIC123).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_SLIDER24).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_EDIT28).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_STATIC124).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_SLIDER25).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_EDIT29).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_STATIC125).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_SLIDER26).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_EDIT30).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_STATIC126).EnableWindow(bGt7Sel);
+	GetDlgItem(IDC_COMBO13).EnableWindow(bGt7Sel);
+}
+
+void CVRHdrPPage::Graft(Settings_t& dst) const
+{
+	dst.fHdrTitlePeakNits        = m_SetsPP.fHdrTitlePeakNits;
+	dst.fHdrDisplayMinNits       = m_SetsPP.fHdrDisplayMinNits;
+	dst.iOutputGamut             = m_SetsPP.iOutputGamut;
+	dst.fGamutCap                = m_SetsPP.fGamutCap;
+	dst.fMLHiDesat               = m_SetsPP.fMLHiDesat;
+	dst.iHdrExposureTrim         = m_SetsPP.iHdrExposureTrim;
+	dst.iHdrShadowLift           = m_SetsPP.iHdrShadowLift;
+	dst.iHdrPunch                = m_SetsPP.iHdrPunch;
+	dst.bHdrAutoRefWhite         = m_SetsPP.bHdrAutoRefWhite;
+	dst.fHdrRefWhiteTarget       = m_SetsPP.fHdrRefWhiteTarget;
+	dst.fHdrGt7Blend             = m_SetsPP.fHdrGt7Blend;
+	dst.fHdrGt7FadeStart         = m_SetsPP.fHdrGt7FadeStart;
+	dst.fHdrGt7FadeEnd           = m_SetsPP.fHdrGt7FadeEnd;
+	dst.fHdrGt7Adapt             = m_SetsPP.fHdrGt7Adapt;
+	dst.fHdrGt7Alpha             = m_SetsPP.fHdrGt7Alpha;
+	dst.fHdrGt7Desat             = m_SetsPP.fHdrGt7Desat;
+	dst.fHdrGt7Dbg               = m_SetsPP.fHdrGt7Dbg;
+	// The curve selector on this tab owns the trio (the Settings tab's device
+	// combo writes the same three; both live-apply, and each tab resyncs from
+	// the filter on activation).
+	dst.bHdrPassthrough          = m_SetsPP.bHdrPassthrough;
+	dst.bHdrLocalToneMapping     = m_SetsPP.bHdrLocalToneMapping;
+	dst.iHdrLocalToneMappingType = m_SetsPP.iHdrLocalToneMappingType;
+}
+
+void CVRHdrPPage::ApplyOwn()
+{
+	Settings_t cur;
+	m_pVideoRenderer->GetSettings(cur);
+	Graft(cur);
+	m_pVideoRenderer->SetSettings(cur);
+}
+
+HRESULT CVRHdrPPage::OnConnect(IUnknown *pUnk)
+{
+	if (pUnk == nullptr) return E_POINTER;
+	m_pVideoRenderer = pUnk;
+	if (!m_pVideoRenderer) {
+		return E_NOINTERFACE;
+	}
+	return S_OK;
+}
+
+HRESULT CVRHdrPPage::OnDisconnect()
+{
+	if (m_pVideoRenderer == nullptr) return E_UNEXPECTED;
+	m_pVideoRenderer.Release();
+	return S_OK;
+}
+
+HRESULT CVRHdrPPage::OnActivate()
+{
+	m_hWnd = m_hwnd;
+	m_pVideoRenderer->GetSettings(m_SetsPP);
+
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO12, L"BT.709 (standard)", 0);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO12, L"BT.2020 (wide)", 1);
+
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Off", 0);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Chroma scale", 1);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Fade ratio", 2);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Knee crossing", 3);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Ceiling crossing", 4);
+
+	// The full curve list lives here now (same engine values as the Settings
+	// tab's device block). Item data is the engine type; 0/1 encode the
+	// flag-only Ignore/Passthrough states.
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO14, L"Ignore", 1);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO14, L"Passthrough", 0);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO14, L"Unplugged", TONE_CURVE_REFERENCE);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO14, L"GT7 Adapt", TONE_CURVE_GT7_ADAPT);
+	if (m_SetsPP.bHdrLocalToneMapping
+		&& m_SetsPP.iHdrLocalToneMappingType != TONE_CURVE_REFERENCE
+		&& m_SetsPP.iHdrLocalToneMappingType != TONE_CURVE_GT7_ADAPT) {
+		ComboBox_AddStringData(m_hWnd, IDC_COMBO14, L"(legacy curve)",
+			(LONG_PTR)m_SetsPP.iHdrLocalToneMappingType);
+	}
+
+	EnableControls();
+	SetControls();
+
+	SetCursor(m_hWnd, IDC_ARROW);
+
+	AddHint(IDC_SLIDER14,
+		L"The content peak the curve maps FROM. Leave 1000 unless the\n"
+		"disc's MaxCLL is known.");
+	AddHint(IDC_SLIDER15,
+		L"Measured black of the display. At 0 the curve assumes perfect\n"
+		"black and wastes shadow detail on range the panel cannot show.");
+	AddHint(IDC_SLIDER16,
+		L"Pulls colors crowded against the BT.709 edge inward.\n"
+		"1.00 = off; ~0.55 measures like reference software on deep skies.");
+	AddHint(IDC_SLIDER17,
+		L"Highlight desaturation linked to the delivered level.\n"
+		"Runs inside the grade, so it needs Enable ML grade. 0 = off.");
+	AddHint(IDC_SLIDER18,
+		L"Input gain in thirds of a stop (+3 = one stop), absorbed by the\n"
+		"shoulder - brightness without spending the highlights.");
+	AddHint(IDC_SLIDER19,
+		L"Positive spreads dark values apart and reveals their texture\n"
+		"(detail, not a lift); negative densifies the black end.");
+	AddHint(IDC_SLIDER20,
+		L"Symmetric S-curve around mid grey: black, mid and white stay put.");
+	AddHint(IDC_SLIDER25,
+		L"LOWER = longer shoulder = more headroom before bright detail\n"
+		"merges to white. The first dial to turn down if explosions clip.");
+	AddHint(IDC_COMBO14,
+		L"Unplugged - the house curve; respects Dolby Vision mastering.\n"
+		"GT7 Adapt - for HDR10/HLG; blends the declared peak with what\n"
+		"each scene measures, and unlocks the GT7 controls beside it.\n"
+		"Passthrough sends the HDR signal to the display untouched;\n"
+		"Ignore applies no HDR processing at all.");
+
+	m_bActivated = true;
+	InitSliders();
+
+	return S_OK;
+}
+
+INT_PTR CVRHdrPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	if (uMsg == WM_COMMAND) {
+		const int nID = LOWORD(wParam);
+		const int action = HIWORD(wParam);
+
+		if (action == BN_CLICKED) {
+			if (nID == IDC_CHECK36) {
+				m_SetsPP.bHdrAutoRefWhite = IsDlgButtonChecked(IDC_CHECK36) == BST_CHECKED;
+				EnableControls();
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+		}
+		if (action == CBN_SELCHANGE) {
+			if (nID == IDC_COMBO12) {
+				const LRESULT lValue = ComboBox_GetCurItemData(m_hWnd, IDC_COMBO12);
+				if (lValue != m_SetsPP.iOutputGamut) {
+					m_SetsPP.iOutputGamut = (int)lValue;
+					SetDirty();
+					EnableControls(); // gamut capacity acts only inside BT.709
+				}
+				return (LRESULT)1;
+			}
+			if (nID == IDC_COMBO13) {
+				const LRESULT lValue = ComboBox_GetCurItemData(m_hWnd, IDC_COMBO13);
+				if ((float)lValue != m_SetsPP.fHdrGt7Dbg) {
+					// A debug view is for looking at - it must apply without Apply.
+					m_SetsPP.fHdrGt7Dbg = (float)lValue;
+					ApplyOwn(); // live
+					SetDirty();
+				}
+				return (LRESULT)1;
+			}
+			if (nID == IDC_COMBO14) {
+				const LRESULT lValue = ComboBox_GetCurItemData(m_hWnd, IDC_COMBO14);
+				if (lValue != CB_ERR) {
+					if (lValue == 0 || lValue == 1) {
+						m_SetsPP.bHdrPassthrough      = (lValue == 0);
+						m_SetsPP.bHdrLocalToneMapping = false;
+					} else {
+						m_SetsPP.bHdrPassthrough      = false;
+						m_SetsPP.bHdrLocalToneMapping = true;
+						m_SetsPP.iHdrLocalToneMappingType = (int)lValue;
+					}
+					ApplyOwn(); // live: the curve decision is felt at once,
+					EnableControls(); // and the GT7 block follows immediately
+					SetDirty();
+				}
+				return (LRESULT)1;
+			}
+		}
+	}
+	else if (uMsg == WM_HSCROLL) {
+		for (const auto& r : kHdrSliders) {
+			if ((HWND)lParam == GetDlgItem(r.nSlider)) {
+				const float v = MLSliderValue((int)SendDlgItemMessageW(r.nSlider, TBM_GETPOS, 0, 0), r);
+				m_SetsPP.*(r.pField) = v;
+				if (r.nSlider == IDC_SLIDER23) {
+					// One control for the fade window: the width stays 0.18, as the
+					// engine's own parser derives it — no inverted pairs by hand.
+					m_SetsPP.fHdrGt7FadeEnd = v + 0.18f;
+				}
+				SetDlgItemTextW(r.nEdit, FmtSlider(v).c_str());
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+		}
+		for (const auto& r : kIntSliders) {
+			if ((HWND)lParam == GetDlgItem(r.nSlider)) {
+				const int v = (int)SendDlgItemMessageW(r.nSlider, TBM_GETPOS, 0, 0) + r.lo;
+				m_SetsPP.*(r.pField) = v;
+				SetDlgItemTextW(r.nEdit, std::to_wstring(v).c_str());
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+		}
+	}
+
+	return CBasePropertyPage::OnReceiveMessage(hwnd, uMsg, wParam, lParam);
+}
+
+HRESULT CVRHdrPPage::OnApplyChanges()
+{
+	ApplyOwn();
+	m_pVideoRenderer->SaveSettings();
+	return S_OK;
+}
+
+HWND CVRHdrPPage::CreateHintWindow(HWND parent, int timePop, int timeInit, int timeReshow)
+{
+	HWND hhint = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASS, nullptr,
+		WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT,
+		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, parent, nullptr, nullptr, nullptr);
+
+	SetWindowPos(hhint, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+	SendMessageW(hhint, TTM_SETDELAYTIME, TTDT_AUTOPOP, MAKELONG(timePop, 0));
+	SendMessageW(hhint, TTM_SETDELAYTIME, TTDT_INITIAL, MAKELONG(timeInit, 0));
+	SendMessageW(hhint, TTM_SETDELAYTIME, TTDT_RESHOW, MAKELONG(timeReshow, 0));
+	SendMessageW(hhint, TTM_SETMAXTIPWIDTH, 0, 470);
+	return hhint;
+}
+
+void CVRHdrPPage::AddHint(int id, const LPCWSTR text)
+{
+	if (!m_hHint) {
+		m_hHint = CreateHintWindow(m_Dlg, 15000);
+	}
+	TOOLINFOW ti;
+	ti.cbSize = sizeof(TOOLINFOW);
+	ti.uFlags = TTF_SUBCLASS | TTF_IDISHWND;
+	ti.hwnd = m_Dlg;
+	ti.uId = (LPARAM)GetDlgItem(id).m_hWnd;
+	ti.lpszText = const_cast<LPWSTR>(text);
+	SendMessageW(m_hHint, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
+// CVRZionPPage — the Zion tab
+
+CVRZionPPage::CVRZionPPage(LPUNKNOWN lpunk, HRESULT* phr) :
+	CBasePropertyPage(L"ZionProp", lpunk, IDD_ZIONPROPPAGE, IDS_ZIONPROPPAGE_TITLE)
+{
+	DLog(L"CVRZionPPage()");
+}
+
+CVRZionPPage::~CVRZionPPage()
+{
+	DLog(L"~CVRZionPPage()");
+}
+
+void CVRZionPPage::InitSliders()
+{
+	InitTableSliders(m_hWnd, kMLSliders);
+	InitTableSliders(m_hWnd, kZionSliders);
+}
+
+void CVRZionPPage::SetSliders()
+{
+	SetTableSliders(m_hWnd, m_SetsPP, kMLSliders);
+	SetTableSliders(m_hWnd, m_SetsPP, kZionSliders);
+}
+
+void CVRZionPPage::SetControls()
+{
+	CheckDlgButton(IDC_CHECK20, m_SetsPP.bMLEnabled ? BST_CHECKED : BST_UNCHECKED);
+	SendDlgItemMessageW(IDC_COMBO11, CB_SETCURSEL, m_SetsPP.iMLMode, 0);
+	CheckDlgButton(IDC_CHECK21, m_SetsPP.bMLDebugCopy ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK22, m_SetsPP.bMLDebugLog  ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK35, m_SetsPP.bTrayIcon     ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK23, m_SetsPP.bMLHuntEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK24, m_SetsPP.bMLChromaEnabled ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK32, m_SetsPP.bMLToneCurveEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK25, m_SetsPP.bMLGammaEnabled       ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK26, m_SetsPP.bMLShadowEnabled      ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK27, m_SetsPP.bMLHighlightEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK28, m_SetsPP.bMLChromaNeutralEnabled ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK29, m_SetsPP.bMLChromaFireEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK30, m_SetsPP.bMLChromaKneeEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK31, m_SetsPP.bMLChromaSkinEnabled   ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK33, m_SetsPP.bMLContrastEnabled  ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK37, m_SetsPP.bMLController       ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK39, m_SetsPP.bMLBars             ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK40, m_SetsPP.bMLBarsHighlight    ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK41, m_SetsPP.bMLSkyEnabled       ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK42, m_SetsPP.bMLPersonEnabled    ? BST_CHECKED : BST_UNCHECKED);
+
+	SetSliders();
+}
+
+void CVRZionPPage::EnableControls()
+{
+	const BOOL bMLEnable  = m_SetsPP.bMLEnabled;
+	GetDlgItem(IDC_STATIC101).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_COMBO11).EnableWindow(bMLEnable);
+	const BOOL bChromaRow = m_SetsPP.bMLChromaEnabled;
+	const BOOL bToneRow   = m_SetsPP.bMLToneCurveEnabled;
+	GetDlgItem(IDC_CHECK32).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_CHECK25).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_SLIDER3).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLGammaEnabled);
+	GetDlgItem(IDC_EDIT3).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLGammaEnabled);
+	GetDlgItem(IDC_CHECK26).EnableWindow(bMLEnable);
+	// Band controller ON owns the shadow band: the legacy multiplicative toe
+	// stands down rather than double-acting (same rule the companion rail follows).
+	GetDlgItem(IDC_SLIDER4).EnableWindow(bMLEnable && m_SetsPP.bMLShadowEnabled && !m_SetsPP.bMLController);
+	GetDlgItem(IDC_EDIT4).EnableWindow(bMLEnable && m_SetsPP.bMLShadowEnabled && !m_SetsPP.bMLController);
+	GetDlgItem(IDC_CHECK27).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_SLIDER5).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLHighlightEnabled);
+	GetDlgItem(IDC_EDIT5).EnableWindow(bMLEnable && bToneRow && m_SetsPP.bMLHighlightEnabled);
+	GetDlgItem(IDC_CHECK23).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_SLIDER6).EnableWindow(bMLEnable && m_SetsPP.bMLHuntEnabled);
+	GetDlgItem(IDC_EDIT7).EnableWindow(bMLEnable && m_SetsPP.bMLHuntEnabled);
+	GetDlgItem(IDC_CHECK28).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_SLIDER7).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaNeutralEnabled);
+	GetDlgItem(IDC_EDIT8).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaNeutralEnabled);
+	GetDlgItem(IDC_CHECK29).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_SLIDER8).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaFireEnabled);
+	GetDlgItem(IDC_EDIT9).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaFireEnabled);
+	GetDlgItem(IDC_CHECK30).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_SLIDER9).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaKneeEnabled);
+	GetDlgItem(IDC_EDIT10).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaKneeEnabled);
+	GetDlgItem(IDC_CHECK31).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_SLIDER10).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaSkinEnabled);
+	GetDlgItem(IDC_EDIT11).EnableWindow(bMLEnable && bChromaRow && m_SetsPP.bMLChromaSkinEnabled);
+	GetDlgItem(IDC_STATIC105).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_CHECK21).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_CHECK22).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_CHECK24).EnableWindow(bMLEnable);
+
+	GetDlgItem(IDC_CHECK37).EnableWindow(bMLEnable); // band controller
+	GetDlgItem(IDC_STATIC127).EnableWindow(bMLEnable); // mid-tone target
+	GetDlgItem(IDC_SLIDER27).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_EDIT31).EnableWindow(bMLEnable);
+	const BOOL bTopUp = bMLEnable && !m_SetsPP.bMLController;  // stands down under the controller
+	GetDlgItem(IDC_STATIC128).EnableWindow(bTopUp);
+	GetDlgItem(IDC_SLIDER28).EnableWindow(bTopUp);
+	GetDlgItem(IDC_EDIT32).EnableWindow(bTopUp);
+	GetDlgItem(IDC_STATIC129).EnableWindow(bMLEnable); // shadow dehaze
+	GetDlgItem(IDC_SLIDER29).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_EDIT33).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_STATIC130).EnableWindow(bMLEnable); // highlight shoulder
+	GetDlgItem(IDC_SLIDER30).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_EDIT34).EnableWindow(bMLEnable);
+	GetDlgItem(IDC_CHECK33).EnableWindow(bMLEnable);   // micro contrast enable
+	const BOOL bMC = bMLEnable && m_SetsPP.bMLContrastEnabled;
+	GetDlgItem(IDC_STATIC109).EnableWindow(bMC);
+	GetDlgItem(IDC_SLIDER11).EnableWindow(bMC);
+	GetDlgItem(IDC_EDIT15).EnableWindow(bMC);
+	GetDlgItem(IDC_STATIC131).EnableWindow(bMC);
+	GetDlgItem(IDC_SLIDER31).EnableWindow(bMC);
+	GetDlgItem(IDC_EDIT35).EnableWindow(bMC);
+	GetDlgItem(IDC_STATIC132).EnableWindow(bMC);
+	GetDlgItem(IDC_SLIDER32).EnableWindow(bMC);
+	GetDlgItem(IDC_EDIT36).EnableWindow(bMC);
+	GetDlgItem(IDC_STATIC133).EnableWindow(bMC);
+	GetDlgItem(IDC_SLIDER33).EnableWindow(bMC);
+	GetDlgItem(IDC_EDIT37).EnableWindow(bMC);
+	GetDlgItem(IDC_CHECK39).EnableWindow(bMLEnable);   // repaint bars
+	GetDlgItem(IDC_CHECK40).EnableWindow(bMLEnable);   // highlight bars
+	GetDlgItem(IDC_CHECK41).EnableWindow(bMLEnable);   // sky seg
+	const BOOL bSky = bMLEnable && m_SetsPP.bMLSkyEnabled;
+	GetDlgItem(IDC_SLIDER34).EnableWindow(bSky);
+	GetDlgItem(IDC_EDIT38).EnableWindow(bSky);
+	GetDlgItem(IDC_CHECK42).EnableWindow(bMLEnable);   // person skin
+	const BOOL bPerson = bMLEnable && m_SetsPP.bMLPersonEnabled;
+	GetDlgItem(IDC_SLIDER35).EnableWindow(bPerson);
+	GetDlgItem(IDC_EDIT39).EnableWindow(bPerson);
+	GetDlgItem(IDC_STATIC134).EnableWindow(bPerson);   // tone preserve
+	GetDlgItem(IDC_SLIDER36).EnableWindow(bPerson);
+	GetDlgItem(IDC_EDIT40).EnableWindow(bPerson);
+
+	// Tray icon is renderer-wide, not ML-gated
+	GetDlgItem(IDC_CHECK35).EnableWindow(TRUE);
+}
+
+void CVRZionPPage::Graft(Settings_t& dst) const
+{
+	dst.bMLEnabled            = m_SetsPP.bMLEnabled;
+	dst.iMLMode               = m_SetsPP.iMLMode;
+	dst.bMLToneCurveEnabled   = m_SetsPP.bMLToneCurveEnabled;
+	dst.bMLGammaEnabled       = m_SetsPP.bMLGammaEnabled;
+	dst.bMLShadowEnabled      = m_SetsPP.bMLShadowEnabled;
+	dst.bMLHighlightEnabled   = m_SetsPP.bMLHighlightEnabled;
+	dst.bMLHuntEnabled        = m_SetsPP.bMLHuntEnabled;
+	dst.bMLChromaEnabled      = m_SetsPP.bMLChromaEnabled;
+	dst.bMLChromaNeutralEnabled = m_SetsPP.bMLChromaNeutralEnabled;
+	dst.bMLChromaFireEnabled  = m_SetsPP.bMLChromaFireEnabled;
+	dst.bMLChromaKneeEnabled  = m_SetsPP.bMLChromaKneeEnabled;
+	dst.bMLChromaSkinEnabled  = m_SetsPP.bMLChromaSkinEnabled;
+	dst.bMLContrastEnabled    = m_SetsPP.bMLContrastEnabled;
+	dst.bMLController         = m_SetsPP.bMLController;
+	dst.bMLBars               = m_SetsPP.bMLBars;
+	dst.bMLBarsHighlight      = m_SetsPP.bMLBarsHighlight;
+	dst.bMLSkyEnabled         = m_SetsPP.bMLSkyEnabled;
+	dst.bMLPersonEnabled      = m_SetsPP.bMLPersonEnabled;
+	dst.bMLDebugCopy          = m_SetsPP.bMLDebugCopy;
+	dst.bMLDebugLog           = m_SetsPP.bMLDebugLog;
+	dst.bTrayIcon             = m_SetsPP.bTrayIcon;
+	dst.fMLGamma              = m_SetsPP.fMLGamma;
+	dst.fMLShadow             = m_SetsPP.fMLShadow;
+	dst.fMLHighlight          = m_SetsPP.fMLHighlight;
+	dst.fMLHunt               = m_SetsPP.fMLHunt;
+	dst.fMLChromaNeutral      = m_SetsPP.fMLChromaNeutral;
+	dst.fMLChromaFire         = m_SetsPP.fMLChromaFire;
+	dst.fMLChromaKnee         = m_SetsPP.fMLChromaKnee;
+	dst.fMLChromaSkinProtect  = m_SetsPP.fMLChromaSkinProtect;
+	dst.fMLTargetMid          = m_SetsPP.fMLTargetMid;
+	dst.fMLGammaTopUp         = m_SetsPP.fMLGammaTopUp;
+	dst.fMLShadowDehaze       = m_SetsPP.fMLShadowDehaze;
+	dst.fMLHighlightRolloffCtrl = m_SetsPP.fMLHighlightRolloffCtrl;
+	dst.fMLContrast           = m_SetsPP.fMLContrast;
+	dst.fMLContrastZoneLo     = m_SetsPP.fMLContrastZoneLo;
+	dst.fMLContrastRatioCap   = m_SetsPP.fMLContrastRatioCap;
+	dst.fMLContrastSkinProtect = m_SetsPP.fMLContrastSkinProtect;
+	dst.fMLSkyStrength        = m_SetsPP.fMLSkyStrength;
+	dst.fMLPersonStrength     = m_SetsPP.fMLPersonStrength;
+	dst.fMLSkinPreserve       = m_SetsPP.fMLSkinPreserve;
+}
+
+void CVRZionPPage::ApplyOwn()
+{
+	Settings_t cur;
+	m_pVideoRenderer->GetSettings(cur);
+	Graft(cur);
+	m_pVideoRenderer->SetSettings(cur);
+}
+
+HRESULT CVRZionPPage::OnConnect(IUnknown *pUnk)
+{
+	if (pUnk == nullptr) return E_POINTER;
+	m_pVideoRenderer = pUnk;
+	if (!m_pVideoRenderer) {
+		return E_NOINTERFACE;
+	}
+	return S_OK;
+}
+
+HRESULT CVRZionPPage::OnDisconnect()
+{
+	if (m_pVideoRenderer == nullptr) return E_UNEXPECTED;
+	KillTimer(1001);
+	m_pVideoRenderer.Release();
+	return S_OK;
+}
+
+HRESULT CVRZionPPage::OnActivate()
+{
+	m_hWnd = m_hwnd;
+	m_pVideoRenderer->GetSettings(m_SetsPP);
+
+	SendDlgItemMessageW(IDC_COMBO11, CB_ADDSTRING, 0, (LPARAM)L"Disable");
+	SendDlgItemMessageW(IDC_COMBO11, CB_ADDSTRING, 0, (LPARAM)L"Manual");
+	SendDlgItemMessageW(IDC_COMBO11, CB_ADDSTRING, 0, (LPARAM)L"Auto");
+
+	EnableControls();
+	SetControls();
+
+	SetCursor(m_hWnd, IDC_ARROW);
+
+	AddHint(IDC_CHECK37,
+		L"Solves shadow, gamma and highlight together onto fixed house\n"
+		"levels each frame. While on, the legacy Shadow band and the\n"
+		"Gamma top-up stand down - the controller owns those actuators.");
+	AddHint(IDC_SLIDER27,
+		L"Where the scene average should land (0 = off). The brightness\n"
+		"dial that does not cost the clouds.");
+
+	m_bActivated = true;
+
+	// poll the live Zion ML state for the stats box
+	SetTimer(1001, 500);
+
+	InitSliders();
+
+	return S_OK;
+}
+
+INT_PTR CVRZionPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	if (uMsg == WM_TIMER && wParam == 1001) {
+		// refresh live Zion ML values
+		if (m_pVideoRenderer) {
+			std::wstring str;
+			m_pVideoRenderer->GetMLStats(str);
+			GetDlgItem(IDC_EDIT6).SetWindowTextW(str.c_str());
+		}
+		return (LRESULT)1;
+	}
+
+	if (uMsg == WM_COMMAND) {
+		const int nID = LOWORD(wParam);
+		const int action = HIWORD(wParam);
+
+		if (action == BN_CLICKED) {
+			if (nID == IDC_CHECK20) {
+				m_SetsPP.bMLEnabled = IsDlgButtonChecked(IDC_CHECK20) == BST_CHECKED;
+				EnableControls();
+				ApplyOwn(); // live: apply immediately
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK21) {
+				m_SetsPP.bMLDebugCopy = IsDlgButtonChecked(IDC_CHECK21) == BST_CHECKED;
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK22) {
+				m_SetsPP.bMLDebugLog = IsDlgButtonChecked(IDC_CHECK22) == BST_CHECKED;
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK35) {
+				m_SetsPP.bTrayIcon = IsDlgButtonChecked(IDC_CHECK35) == BST_CHECKED;
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK23) {
+				m_SetsPP.bMLHuntEnabled = IsDlgButtonChecked(IDC_CHECK23) == BST_CHECKED;
+				EnableControls();
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK24) {
+				m_SetsPP.bMLChromaEnabled = IsDlgButtonChecked(IDC_CHECK24) == BST_CHECKED;
+				EnableControls();
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK32) {
+				m_SetsPP.bMLToneCurveEnabled = IsDlgButtonChecked(IDC_CHECK32) == BST_CHECKED;
+				EnableControls();
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK25 || nID == IDC_CHECK26 || nID == IDC_CHECK27 ||
+				nID == IDC_CHECK28 || nID == IDC_CHECK29 || nID == IDC_CHECK30 || nID == IDC_CHECK31) {
+				const bool bChecked = IsDlgButtonChecked(nID) == BST_CHECKED;
+				switch (nID) {
+				case IDC_CHECK25: m_SetsPP.bMLGammaEnabled       = bChecked; break;
+				case IDC_CHECK26: m_SetsPP.bMLShadowEnabled      = bChecked; break;
+				case IDC_CHECK27: m_SetsPP.bMLHighlightEnabled   = bChecked; break;
+				case IDC_CHECK28: m_SetsPP.bMLChromaNeutralEnabled = bChecked; break;
+				case IDC_CHECK29: m_SetsPP.bMLChromaFireEnabled   = bChecked; break;
+				case IDC_CHECK30: m_SetsPP.bMLChromaKneeEnabled   = bChecked; break;
+				case IDC_CHECK31: m_SetsPP.bMLChromaSkinEnabled   = bChecked; break;
+				}
+				EnableControls();
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK33 || nID == IDC_CHECK37 ||
+				nID == IDC_CHECK39 || nID == IDC_CHECK40 || nID == IDC_CHECK41 ||
+				nID == IDC_CHECK42) {
+				const bool bChecked = IsDlgButtonChecked(nID) == BST_CHECKED;
+				switch (nID) {
+				case IDC_CHECK33: m_SetsPP.bMLContrastEnabled = bChecked; break; // micro contrast
+				case IDC_CHECK37: m_SetsPP.bMLController      = bChecked; break; // band controller
+				case IDC_CHECK39: m_SetsPP.bMLBars            = bChecked; break; // repaint bars
+				case IDC_CHECK40: m_SetsPP.bMLBarsHighlight   = bChecked; break; // highlight bars
+				case IDC_CHECK41: m_SetsPP.bMLSkyEnabled      = bChecked; break; // sky seg
+				case IDC_CHECK42: m_SetsPP.bMLPersonEnabled   = bChecked; break; // person skin
+				}
+				EnableControls();
+				ApplyOwn(); // live: gate changes show at once
+				SetDirty();
+				return (LRESULT)1;
+			}
+		}
+		if (action == CBN_SELCHANGE) {
+			if (nID == IDC_COMBO11) {
+				const LRESULT lValue = SendDlgItemMessageW(IDC_COMBO11, CB_GETCURSEL, 0, 0);
+				if (lValue != m_SetsPP.iMLMode) {
+					m_SetsPP.iMLMode = lValue;
+					EnableControls();
+					ApplyOwn(); // live: apply immediately
+					SetDirty();
+				}
+				return (LRESULT)1;
+			}
+		}
+		if (action == EN_CHANGE) {
+			if (nID == IDC_EDIT3 || nID == IDC_EDIT4 || nID == IDC_EDIT5 ||
+				nID == IDC_EDIT7 || nID == IDC_EDIT8 || nID == IDC_EDIT9 ||
+				nID == IDC_EDIT10 || nID == IDC_EDIT11) {
+				// Zion ML value edits: live-apply on every keystroke, clamping
+				// out-of-range entries to the valid range instead of rejecting
+				// them (so typing "3" visibly applies 1.5 rather than doing
+				// nothing).
+				float* pDst = nullptr;
+				float def = 0.f, lo = 0.f, hi = 0.f;
+				if (nID == IDC_EDIT3) { pDst = &m_SetsPP.fMLGamma; def = 1.0f; lo = 0.5f;  hi = 1.5f; }
+				if (nID == IDC_EDIT4) { pDst = &m_SetsPP.fMLShadow; def = 2.0f; lo = 0.0f;  hi = 5.0f; }
+				if (nID == IDC_EDIT5) { pDst = &m_SetsPP.fMLHighlight; def = 0.0f; lo = -0.3f; hi = 0.4f; }
+				if (nID == IDC_EDIT7) { pDst = &m_SetsPP.fMLHunt; def = 0.80f; lo = 0.0f; hi = 1.0f; }
+				if (nID == IDC_EDIT8) { pDst = &m_SetsPP.fMLChromaNeutral; def = 1.20f; lo = 1.0f; hi = 1.5f; }
+				if (nID == IDC_EDIT9) { pDst = &m_SetsPP.fMLChromaFire; def = 1.35f; lo = 1.0f; hi = 1.5f; }
+				if (nID == IDC_EDIT10) { pDst = &m_SetsPP.fMLChromaKnee; def = 0.55f; lo = 0.1f; hi = 0.9f; }
+				if (nID == IDC_EDIT11) { pDst = &m_SetsPP.fMLChromaSkinProtect; def = 0.95f; lo = 0.5f; hi = 1.0f; }
+				WCHAR buffer[32];
+				::GetDlgItemTextW(m_hWnd, nID, buffer, _countof(buffer));
+				const float v = (float)_wtof(buffer);
+				if (pDst && buffer[0]) {
+					*pDst = discard<float>(v, def, lo, hi);
+					ApplyOwn(); // live: apply immediately
+				}
+				SetDirty();
+			}
+		}
+	}
+	else if (uMsg == WM_HSCROLL) {
+		for (const auto& r : kMLSliders) {
+			if ((HWND)lParam == GetDlgItem(r.nSlider)) {
+				const float v = MLSliderValue((int)SendDlgItemMessageW(r.nSlider, TBM_GETPOS, 0, 0), r);
+				m_SetsPP.*(r.pField) = v;
+				SetDlgItemTextW(r.nEdit, FmtSlider(v).c_str());
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+		}
+		for (const auto& r : kZionSliders) {
+			if ((HWND)lParam == GetDlgItem(r.nSlider)) {
+				const float v = MLSliderValue((int)SendDlgItemMessageW(r.nSlider, TBM_GETPOS, 0, 0), r);
+				m_SetsPP.*(r.pField) = v;
+				SetDlgItemTextW(r.nEdit, FmtSlider(v).c_str());
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+		}
+	}
+
+	return CBasePropertyPage::OnReceiveMessage(hwnd, uMsg, wParam, lParam);
+}
+
+HRESULT CVRZionPPage::OnApplyChanges()
+{
+	// Manual-entry clamp reads from the ML value boxes first (they live here now).
+	auto readFloat = [](HWND hWnd, int idEdit, float& dst, float def, float lo, float hi) {
+		WCHAR buffer[32];
+		::GetDlgItemTextW(hWnd, idEdit, buffer, _countof(buffer));
+		if (buffer[0]) {
+			dst = discard<float>((float)_wtof(buffer), def, lo, hi);
+		}
+	};
+	readFloat(m_hWnd, IDC_EDIT3, m_SetsPP.fMLGamma, 1.0f, 0.5f, 1.5f);
+	readFloat(m_hWnd, IDC_EDIT4, m_SetsPP.fMLShadow, 2.0f, 0.0f, 5.0f);
+	readFloat(m_hWnd, IDC_EDIT5, m_SetsPP.fMLHighlight, 0.0f, -0.3f, 0.4f);
+
+	ApplyOwn();
+	m_pVideoRenderer->SaveSettings();
+	return S_OK;
+}
+
+HWND CVRZionPPage::CreateHintWindow(HWND parent, int timePop, int timeInit, int timeReshow)
+{
+	HWND hhint = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASS, nullptr,
+		WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP, CW_USEDEFAULT,
+		CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, parent, nullptr, nullptr, nullptr);
+
+	SetWindowPos(hhint, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+	SendMessageW(hhint, TTM_SETDELAYTIME, TTDT_AUTOPOP, MAKELONG(timePop, 0));
+	SendMessageW(hhint, TTM_SETDELAYTIME, TTDT_INITIAL, MAKELONG(timeInit, 0));
+	SendMessageW(hhint, TTM_SETDELAYTIME, TTDT_RESHOW, MAKELONG(timeReshow, 0));
+	SendMessageW(hhint, TTM_SETMAXTIPWIDTH, 0, 470);
+	return hhint;
+}
+
+void CVRZionPPage::AddHint(int id, const LPCWSTR text)
 {
 	if (!m_hHint) {
 		m_hHint = CreateHintWindow(m_Dlg, 15000);
