@@ -122,6 +122,38 @@
 #define OPT_MLChromaSkinEnabled            L"MLChromaSkinEnabled"
 #define OPT_MLBars                         L"MLBars"
 #define OPT_MLBarsHighlight                L"MLBarsHighlight"
+// The fork's grading/delivery surface, persisted for standalone use (the property
+// page is the only settings writer when no companion app pushes the engine's INI).
+// Floats stored as strings per the ML convention; the three taste trims are ints
+// stored as DWORD (two's-complement cast on the signed side).
+#define OPT_HdrExposureTrim                L"HdrExposureTrim"
+#define OPT_HdrShadowLift                  L"HdrShadowLift"
+#define OPT_HdrPunch                       L"HdrPunch"
+#define OPT_Gt7Blend                       L"Gt7Blend"
+#define OPT_Gt7FadeStart                   L"Gt7FadeStart"
+#define OPT_Gt7Adapt                       L"Gt7Adapt"
+#define OPT_Gt7Alpha                       L"Gt7Alpha"
+#define OPT_Gt7Desat                       L"Gt7Desat"
+#define OPT_Gt7Dbg                         L"Gt7Dbg"
+#define OPT_HdrAutoRefWhite                L"HdrAutoRefWhite"
+#define OPT_HdrRefWhiteTarget              L"HdrRefWhiteTarget"
+#define OPT_MLController                   L"MLController"
+#define OPT_MLTargetMid                    L"MLTargetMid"
+#define OPT_MLGammaTopUp                   L"MLGammaTopUp"
+#define OPT_MLShadowDehaze                 L"MLShadowDehaze"
+#define OPT_MLHighlightRolloffCtrl         L"MLHighlightRolloffCtrl"
+#define OPT_MLContrastEnabled              L"MLContrastEnabled"
+#define OPT_MLContrast                     L"MLContrast"
+#define OPT_MLContrastZoneLo               L"MLContrastZoneLo"
+#define OPT_MLContrastRatioCap             L"MLContrastRatioCap"
+#define OPT_MLContrastSkinProtect          L"MLContrastSkinProtect"
+#define OPT_GamutCap                       L"GamutCap"
+#define OPT_MLHiDesat                      L"MLHiDesat"
+#define OPT_MLSkyEnabled                   L"MLSkyEnabled"
+#define OPT_MLSkyStrength                  L"MLSkyStrength"
+#define OPT_MLPersonEnabled                L"MLPersonEnabled"
+#define OPT_MLPersonStrength               L"MLPersonStrength"
+#define OPT_MLSkinPreserve                 L"MLSkinPreserve"
 
 static std::atomic_int g_nInstance = 0;
 static const wchar_t g_szClassName[] = L"VRWindow";
@@ -273,7 +305,7 @@ static void MigrateLegacyRendererSettings()
 }
 
 CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
-	: CBaseVideoRenderer2(__uuidof(this), L"Unplugged Renderer", pUnk, phr)
+	: CBaseVideoRenderer2(__uuidof(this), L"Unplugged Video Renderer", pUnk, phr)
 {
 	DLog(L"CMpcVideoRenderer::CMpcVideoRenderer()");
 
@@ -399,7 +431,11 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 			m_Sets.bHdrLocalToneMapping = !!dw;
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrLocaLToneMappingType, dw)) {
-			m_Sets.iHdrLocalToneMappingType = discard<int>(dw, 1, 1, 5);
+			// 1..11: the upstream five plus the fork's curves (7 = Unplugged,
+			// 8 = GT7, 9 = Spline, 10 = GT7 Adapt, 11 = Dynamic & Auto). Clamping
+			// at 5 — as this did — rewrote a stored house curve to ACES on every
+			// load, so the house curves could never survive a player restart.
+			m_Sets.iHdrLocalToneMappingType = discard<int>(dw, 1, 1, 11);
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrDisplayNits, dw)) {
 			m_Sets.iHdrDisplayMaxNits = discard<int>(dw, HDR_NITS_DEF, HDR_NITS_MIN, HDR_NITS_MAX);
@@ -499,7 +535,105 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLChromaSkinProtect, str, &nChars)) {
 				m_Sets.fMLChromaSkinProtect = discard<float>((float)_wtof(str), 0.95f, 0.5f, 1.0f);
 			}
+			// Fork grading/delivery floats (property-page parity set)
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_Gt7Blend, str, &nChars)) {
+				m_Sets.fHdrGt7Blend = discard<float>((float)_wtof(str), 0.6f, 0.0f, 1.0f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_Gt7FadeStart, str, &nChars)) {
+				m_Sets.fHdrGt7FadeStart = discard<float>((float)_wtof(str), 0.98f, 0.3f, 2.0f);
+				// One control for the fade window, as the engine's parser does:
+				// the start is stored, the width stays Polyphony's 0.18.
+				m_Sets.fHdrGt7FadeEnd = m_Sets.fHdrGt7FadeStart + 0.18f;
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_Gt7Adapt, str, &nChars)) {
+				m_Sets.fHdrGt7Adapt = discard<float>((float)_wtof(str), 0.25f, 0.0f, 1.0f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_Gt7Alpha, str, &nChars)) {
+				m_Sets.fHdrGt7Alpha = discard<float>((float)_wtof(str), 0.25f, 0.02f, 0.9f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_Gt7Desat, str, &nChars)) {
+				m_Sets.fHdrGt7Desat = discard<float>((float)_wtof(str), 0.0f, 0.0f, 1.0f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_HdrRefWhiteTarget, str, &nChars)) {
+				m_Sets.fHdrRefWhiteTarget = discard<float>((float)_wtof(str), 0.42f, 0.2f, 0.7f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLTargetMid, str, &nChars)) {
+				m_Sets.fMLTargetMid = discard<float>((float)_wtof(str), 0.0f, 0.0f, 0.95f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLGammaTopUp, str, &nChars)) {
+				m_Sets.fMLGammaTopUp = discard<float>((float)_wtof(str), 0.0f, -0.5f, 0.5f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLShadowDehaze, str, &nChars)) {
+				m_Sets.fMLShadowDehaze = discard<float>((float)_wtof(str), 0.0f, 0.0f, 1.0f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLHighlightRolloffCtrl, str, &nChars)) {
+				m_Sets.fMLHighlightRolloffCtrl = discard<float>((float)_wtof(str), 0.0f, -0.2f, 0.2f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLContrast, str, &nChars)) {
+				m_Sets.fMLContrast = discard<float>((float)_wtof(str), 0.15f, 0.0f, 0.5f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLContrastZoneLo, str, &nChars)) {
+				m_Sets.fMLContrastZoneLo = discard<float>((float)_wtof(str), 0.15f, 0.0f, 0.6f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLContrastRatioCap, str, &nChars)) {
+				m_Sets.fMLContrastRatioCap = discard<float>((float)_wtof(str), 1.40f, 1.0f, 2.0f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLContrastSkinProtect, str, &nChars)) {
+				m_Sets.fMLContrastSkinProtect = discard<float>((float)_wtof(str), 0.65f, 0.0f, 1.0f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_GamutCap, str, &nChars)) {
+				m_Sets.fGamutCap = discard<float>((float)_wtof(str), 1.0f, 0.2f, 1.0f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLHiDesat, str, &nChars)) {
+				m_Sets.fMLHiDesat = discard<float>((float)_wtof(str), 0.0f, 0.0f, 1.0f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLSkyStrength, str, &nChars)) {
+				m_Sets.fMLSkyStrength = discard<float>((float)_wtof(str), 0.6f, 0.0f, 1.0f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLPersonStrength, str, &nChars)) {
+				m_Sets.fMLPersonStrength = discard<float>((float)_wtof(str), 1.0f, 0.0f, 1.0f);
+			}
+			nChars = _countof(str);
+			if (ERROR_SUCCESS == key.QueryStringValue(OPT_MLSkinPreserve, str, &nChars)) {
+				m_Sets.fMLSkinPreserve = discard<float>((float)_wtof(str), 0.0f, 0.0f, 1.0f);
+			}
 		}
+		// Fork grading/delivery ints and flags (defaults come from SetDefault())
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrExposureTrim, dw)) {
+			m_Sets.iHdrExposureTrim = discard<int>((int)dw, 0, -5, 5);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrShadowLift, dw)) {
+			m_Sets.iHdrShadowLift = discard<int>((int)dw, 0, -5, 5);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrPunch, dw)) {
+			m_Sets.iHdrPunch = discard<int>((int)dw, 0, -5, 5);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_Gt7Dbg, dw)) {
+			m_Sets.fHdrGt7Dbg = discard<float>((float)dw, 0.0f, 0.0f, 4.0f);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrAutoRefWhite, dw)) m_Sets.bHdrAutoRefWhite = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLController, dw)) m_Sets.bMLController = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLContrastEnabled, dw)) m_Sets.bMLContrastEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLSkyEnabled, dw)) m_Sets.bMLSkyEnabled = !!dw;
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_MLPersonEnabled, dw)) m_Sets.bMLPersonEnabled = !!dw;
 	}
 
 	if (!IsWindows10OrGreater()) {
@@ -565,6 +699,13 @@ CMpcVideoRenderer::~CMpcVideoRenderer()
 
 	if (m_hWndWindow) {
 		::SendMessageW(m_hWndWindow, WM_CLOSE, 0, 0);
+	}
+
+	// The dialog thread holds its own reference to this filter, so reaching the
+	// destructor means the dialog is already gone — just release the handle.
+	if (m_hConfigDialogThread) {
+		CloseHandle(m_hConfigDialogThread);
+		m_hConfigDialogThread = nullptr;
 	}
 
 	g_nInstance--; // always decrement g_nInstance in the destructor
@@ -764,6 +905,20 @@ HRESULT CMpcVideoRenderer::Receive(IMediaSample* pSample)
 	}
 
 	ASSERT(pSample);
+
+	// [VP-DBG] delivery census: proves whether the host graph actually feeds us
+	// samples. First, 60th, then every 300th -- cheap, lifecycle-level, no flag needed.
+	{
+		static long long s_nReceived = 0;
+		const long long n = ++s_nReceived;
+		if (n == 1 || n == 60 || n % 300 == 0) {
+			REFERENCE_TIME rtStart = 0, rtStop = 0;
+			pSample->GetTime(&rtStart, &rtStop);
+			const LONG cb = pSample->GetActualDataLength();
+			DLog(L"[VP-DBG] Receive #{} - {} bytes, start {:.1f} ms, state {}",
+				n, cb, (double)rtStart / 10000.0, (int)m_State);
+		}
+	}
 
 	// It may return VFW_E_SAMPLE_REJECTED code to say don't bother
 
@@ -1154,6 +1309,7 @@ STDMETHODIMP CMpcVideoRenderer::GetSourcePosition(long *pLeft, long *pTop, long 
 
 STDMETHODIMP CMpcVideoRenderer::SetDestinationPosition(long Left, long Top, long Width, long Height)
 {
+	DLog(L"[VP-DBG] IBasicVideo::SetDestinationPosition({}x{} @{},{}))", Width, Height, Left, Top);
 	const CRect videoRect(Left, Top, Left + Width, Top + Height);
 	if (videoRect.IsRectNull()) {
 		return S_OK;
@@ -1381,6 +1537,7 @@ HRESULT CMpcVideoRenderer::Init(const bool bCreateWindow/* = false*/)
 // IVideoWindow
 STDMETHODIMP CMpcVideoRenderer::put_Owner(OAHWND Owner)
 {
+	DLog(L"[VP-DBG] IVideoWindow::put_Owner({}) - cur parent={}", (void*)(HWND)Owner, (void*)m_hWndParent);
 	if (Owner && m_hWndParent != (HWND)Owner) {
 		m_hWndParent = (HWND)Owner;
 		return Init(true);
@@ -1415,10 +1572,164 @@ STDMETHODIMP CMpcVideoRenderer::get_MessageDrain(OAHWND* Drain)
 	return S_OK;
 }
 
+// Generic DirectShow hosts (VideoProcessor and friends) embed the renderer
+// through the IVideoWindow window-management calls and treat failure as fatal;
+// MPC-HC/MPC-BE own the window themselves and never route these, which is why
+// they were unimplemented until a host needed them. Semantics: the swap-chain
+// window is always our child under the put_Owner parent, so the child bit is
+// fixed and the host's clip bits are honored; position/visibility reflect the
+// state SetWindowPosition already owns.
+
+STDMETHODIMP CMpcVideoRenderer::put_WindowStyle(long WindowStyle)
+{
+	DLog(L"[VP-DBG] IVideoWindow::put_WindowStyle(0x{:X}) - hWndWindow={}", WindowStyle, (void*)m_hWndWindow);
+	CAutoLock cAutoLock(&m_RendererLock);
+	m_windowStyle = WindowStyle;
+	if (m_hWndWindow && !m_bIsD3DFullscreen && !m_bExclusiveScreen) {
+		const LONG managed = WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+		const LONG style = GetWindowLongW(m_hWndWindow, GWL_STYLE);
+		SetWindowLongW(m_hWndWindow, GWL_STYLE, (style & ~managed) | (WindowStyle & managed));
+	}
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::get_WindowStyle(long* WindowStyle)
+{
+	CheckPointer(WindowStyle, E_POINTER);
+	CAutoLock cAutoLock(&m_RendererLock);
+	*WindowStyle = m_hWndWindow ? GetWindowLongW(m_hWndWindow, GWL_STYLE) : m_windowStyle;
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::put_Visible(long Visible)
+{
+	DLog(L"[VP-DBG] IVideoWindow::put_Visible({}) - hWndWindow={}", (int)Visible, (void*)m_hWndWindow);
+	CAutoLock cAutoLock(&m_RendererLock);
+	if (m_hWndWindow && !m_bIsD3DFullscreen && !m_bExclusiveScreen) {
+		::ShowWindow(m_hWndWindow, Visible ? SW_SHOW : SW_HIDE);
+	}
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::get_Visible(long* pVisible)
+{
+	CheckPointer(pVisible, E_POINTER);
+	CAutoLock cAutoLock(&m_RendererLock);
+	*pVisible = (m_hWndWindow && IsWindowVisible(m_hWndWindow)) ? OATRUE : OAFALSE;
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::ShowWindow(long WindowStyle)
+{
+	DLog(L"[VP-DBG] IVideoWindow::ShowWindow({}) - hWndWindow={}", (int)WindowStyle, (void*)m_hWndWindow);
+	CAutoLock cAutoLock(&m_RendererLock);
+	if (m_hWndWindow && !m_bIsD3DFullscreen && !m_bExclusiveScreen && WindowStyle != SW_HIDE) {
+		::ShowWindow(m_hWndWindow, SW_SHOW);
+	}
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::put_WindowState(long WindowState)
+{
+	CAutoLock cAutoLock(&m_RendererLock);
+	if (m_hWndWindow && !m_bIsD3DFullscreen && !m_bExclusiveScreen) {
+		switch (WindowState) {
+			case SW_HIDE:
+				::ShowWindow(m_hWndWindow, SW_HIDE);
+				break;
+			case SW_SHOWMINIMIZED:
+			case SW_MINIMIZE:
+				::ShowWindow(m_hWndWindow, SW_MINIMIZE);
+				break;
+			case SW_SHOWMAXIMIZED:	// == SW_MAXIMIZE
+				::ShowWindow(m_hWndWindow, SW_MAXIMIZE);
+				break;
+			default: // SW_SHOW, SW_SHOWNORMAL, SW_RESTORE and friends
+				::ShowWindow(m_hWndWindow, WindowState == SW_RESTORE ? SW_RESTORE : SW_SHOW);
+				break;
+		}
+	}
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::get_WindowState(long* WindowState)
+{
+	CheckPointer(WindowState, E_POINTER);
+	CAutoLock cAutoLock(&m_RendererLock);
+	*WindowState = SW_HIDE;
+	if (m_hWndWindow) {
+		if (IsIconic(m_hWndWindow)) {
+			*WindowState = SW_SHOWMINNOACTIVE;
+		} else if (IsZoomed(m_hWndWindow)) {
+			*WindowState = SW_SHOWMAXIMIZED;
+		} else if (IsWindowVisible(m_hWndWindow)) {
+			*WindowState = SW_SHOWNOACTIVATE;
+		}
+	}
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::get_Left(long* pLeft)
+{
+	CheckPointer(pLeft, E_POINTER);
+	CAutoLock cAutoLock(&m_RendererLock);
+	*pLeft = m_windowRect.left;
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::get_Top(long* pTop)
+{
+	CheckPointer(pTop, E_POINTER);
+	CAutoLock cAutoLock(&m_RendererLock);
+	*pTop = m_windowRect.top;
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::get_Width(long* pWidth)
+{
+	CheckPointer(pWidth, E_POINTER);
+	CAutoLock cAutoLock(&m_RendererLock);
+	*pWidth = m_windowRect.Width();
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::get_Height(long* pHeight)
+{
+	CheckPointer(pHeight, E_POINTER);
+	CAutoLock cAutoLock(&m_RendererLock);
+	*pHeight = m_windowRect.Height();
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::HideCursor(long HideCursor)
+{
+	CAutoLock cAutoLock(&m_RendererLock);
+	const bool hide = (HideCursor != 0);
+	if (hide != m_hideCursor) {
+		m_hideCursor = hide;
+		::ShowCursor(hide ? FALSE : TRUE);
+	}
+	return S_OK;
+}
+
+STDMETHODIMP CMpcVideoRenderer::IsCursorHidden(long* CursorHidden)
+{
+	CheckPointer(CursorHidden, E_POINTER);
+	CAutoLock cAutoLock(&m_RendererLock);
+	*CursorHidden = m_hideCursor ? OATRUE : OAFALSE;
+	return S_OK;
+}
+
 STDMETHODIMP CMpcVideoRenderer::SetWindowPosition(long Left, long Top, long Width, long Height)
 {
+	DLog(L"[VP-DBG] IVideoWindow::SetWindowPosition({}x{} @{},{}): hWndWindow={}, curRect=({},{},{},{})",
+		Width, Height, Left, Top, (void*)m_hWndWindow,
+		m_windowRect.left, m_windowRect.top, m_windowRect.right, m_windowRect.bottom);
+	LogLine("renderer: [VP-DBG] SetWindowPosition %ldx%ld@%ld,%ld hWndWindow=%d",
+		Width, Height, Left, Top, m_hWndWindow ? 1 : 0);
 	const CRect windowRect(Left, Top, Left + Width, Top + Height);
 	if (windowRect == m_windowRect) {
+		DLog(L"[VP-DBG] SetWindowPosition - rect unchanged, EARLY RETURN (no resize attempt)");
 		return S_OK;
 	}
 
@@ -1473,7 +1784,9 @@ STDMETHODIMP CMpcVideoRenderer::SetWindowPosition(long Left, long Top, long Widt
 		}
 	}
 
-	m_VideoProcessor->SetWindowRect(m_windowRect);
+	const HRESULT hrSWR = m_VideoProcessor->SetWindowRect(m_windowRect);
+	DLog(L"[VP-DBG] SetWindowPosition - SetWindowRect({}x{}) returned {}",
+		m_windowRect.Width(), m_windowRect.Height(), HR2Str(hrSWR));
 
 	m_windowRect = windowRect;
 
@@ -1613,9 +1926,24 @@ void CMpcVideoRenderer::DestroyTrayWindow()
 	}
 }
 
+// Per-instance tray opt-out for host-side probes. VideoProcessor briefly
+// instantiates registered renderers to detect the MPC presentation contract;
+// a throwaway probe must not take over (or flicker) the tray icon. The
+// variable is set only around the probe's CoCreateInstance, so the real
+// instance — created afterwards, on the same thread — is unaffected.
+static bool TrayIconSuppressedByHost()
+{
+	char b[4] = {};
+	return GetEnvironmentVariableA("MPCVR_SUPPRESS_TRAY", b, sizeof(b)) > 0;
+}
+
 void CMpcVideoRenderer::AddTrayIcon()
 {
 	TrayTrace(L"AddTrayIcon entered");
+	if (TrayIconSuppressedByHost()) {
+		TrayTrace(L"AddTrayIcon: suppressed by MPCVR_SUPPRESS_TRAY (host probe)");
+		return;
+	}
 	if (m_bTrayIconVisible) {
 		TrayTrace(L"AddTrayIcon already visible");
 		return;
@@ -1629,10 +1957,28 @@ void CMpcVideoRenderer::AddTrayIcon()
 	nid.cbSize = sizeof(nid);
 	nid.hWnd = m_hTrayWnd;
 	nid.uID = MPCVR_TRAY_ICON_ID;
-	nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+	nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
 	nid.uCallbackMessage = WM_MPCVR_TRAY_MSG;
-	wcscpy_s(nid.szTip, L"Unplugged Renderer");
-	nid.hIcon = (HICON)::LoadImageW(g_hInst, MAKEINTRESOURCE(IDI_MPCVR_TRAY), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+	// The pid is part of the tooltip on purpose: Explorer keeps showing icons
+	// whose owner was killed (task-manager deaths skip NIM_DELETE), so in a
+	// test loop several "Unplugged" icons can pile up and only the one whose
+	// pid matches the running host responds to clicks. Ghosts vanish the next
+	// time Explorer refreshes that tray slot; the marker makes which-is-live
+	// checkable at a glance.
+	swprintf_s(nid.szTip, ARRAYSIZE(nid.szTip), L"Unplugged Video Renderer [%X]",
+		(unsigned)GetCurrentProcessId());
+	HICON hIcon = (HICON)::LoadImageW(g_hInst, MAKEINTRESOURCE(IDI_MPCVR_TRAY), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+	// DEBUG LOOP ONLY: hosts that were force-killed leave ghost icons behind
+	// (their owners skipped NIM_DELETE), and every copy looks identical. The
+	// env var swaps a unmistakable system icon into the LIVE registration —
+	// clicking the blue one either produces an "OnTrayMessage RAW" line in
+	// mpcvr_tray.log (event reached us) or nothing at all (a ghost was
+	// clicked). Remove once the physical-click path is verified.
+	if (GetEnvironmentVariableA("MPCVR_TRAY_DEBUG_ICON", nullptr, 0) > 0) {
+		hIcon = ::LoadIconW(nullptr, IDI_INFORMATION);
+		TrayTrace(L"AddTrayIcon: DEBUG blue icon (live registration marker)");
+	}
+	nid.hIcon = hIcon;
 
 	if (!Shell_NotifyIconW(NIM_ADD, &nid)) {
 		TrayTrace(L"AddTrayIcon: Shell_NotifyIcon NIM_ADD FAILED", (HRESULT)GetLastError());
@@ -1667,14 +2013,46 @@ void CMpcVideoRenderer::RemoveTrayIcon()
 
 LRESULT CMpcVideoRenderer::OnTrayMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
-	if (uMsg == WM_MPCVR_TRAY_MSG && wParam == MPCVR_TRAY_ICON_ID) {
-		switch (lParam) {
-			case WM_LBUTTONDBLCLK:
-			case WM_LBUTTONUP:
-			case WM_RBUTTONUP:
-			case WM_CONTEXTMENU:
-				ShowConfigDialog();
-				return 0L;
+	// NOTIFYICON_VERSION_4 notifications — the only form Windows 11 24H2+
+	// delivers mouse events in — pack the icon id in LOWORD(wParam) with the
+	// version in HIWORD, and the event (NIN_SELECT/NIN_KEYSELECT/
+	// WM_CONTEXTMENU) in LOWORD(lParam). The legacy version-0 shape passes
+	// the bare id and raw mouse messages. Accept both: the V4 half is what a
+	// physical click becomes on modern shells, the raw half keeps older
+	// hosts and programmatic notifications working.
+	if (uMsg == WM_MPCVR_TRAY_MSG) {
+		// Explorer's actual notification packing (measured, Windows 11):
+		//   version 0/3: lParam = MAKEWPARAM(mouseMsg, iconId), wParam = cursor XY
+		//   version 4:   wParam = MAKEWPARAM(iconId, version),  lParam = MAKEWPARAM(event, XY)
+		// NIM_SETVERSION is asked for version 4 but events still arrive in the
+		// old packing, so recognise the id in either half and read the event
+		// from the low half of lParam — both shapes carry the event there.
+		const WORD idV4  = LOWORD(wParam);
+		const WORD idOld = HIWORD(lParam);
+		const WORD event = LOWORD(lParam);
+		const bool ourId = (idV4 == MPCVR_TRAY_ICON_ID) || (idOld == MPCVR_TRAY_ICON_ID);
+
+		// Receipt log for every non-move event, in raw form: without it,
+		// "icon unresponsive" cannot be told apart from "handler dropped it".
+		if (event != WM_MOUSEMOVE) {
+			wchar_t buf[128];
+			swprintf_s(buf, ARRAYSIZE(buf),
+				L"OnTrayMessage RAW wParam=0x%08X lParam=0x%08X ourId=%d event=0x%04X",
+				(unsigned)wParam, (unsigned)lParam, (int)ourId, (unsigned)event);
+			TrayTrace(buf);
+		}
+
+		if (ourId) {
+			switch (event) {
+				case NIN_SELECT:        // version-4 click
+				case NIN_KEYSELECT:
+				case WM_CONTEXTMENU:
+				case WM_LBUTTONDBLCLK:  // version-0/3 raw mouse messages
+				case WM_LBUTTONUP:
+				case WM_RBUTTONUP:
+					ShowConfigDialog();
+					return 0L;
+			}
 		}
 		return 0L;
 	}
@@ -1687,45 +2065,98 @@ LRESULT CMpcVideoRenderer::OnTrayMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LP
 	return ::DefWindowProcW(hwnd, uMsg, wParam, lParam);
 }
 
+struct ConfigDialogArgs {
+	IUnknown* pUnk;      // filter unknown; the reference is owned by the dialog thread
+	CAUUID    pages;     // resolved on the calling thread (cheap, lock-guarded)
+	wchar_t   title[128];
+};
+
+static DWORD WINAPI ConfigDialogThread(LPVOID pv)
+{
+	auto* a = static_cast<ConfigDialogArgs*>(pv);
+	CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	OleCreatePropertyFrame(
+		nullptr, 0, 0,
+		a->title,
+		1, &a->pUnk,
+		a->pages.cElems, a->pages.pElems,
+		0,                    // Locale identifier
+		0, nullptr            // Reserved
+	);
+	CoTaskMemFree(a->pages.pElems);
+	a->pUnk->Release();
+	CoUninitialize();
+	delete a;
+	return 0;
+}
+
 void CMpcVideoRenderer::ShowConfigDialog()
 {
 	// Reuses the same property-frame dialog the players show via Filters->Configure,
 	// but bound to this (live) instance so changes apply to the running graph.
 	TrayTrace(L"ShowConfigDialog entered");
 
+	// The frame is modal and pumps messages on whatever thread shows it. The
+	// tray window belongs to the thread that instantiated the filter — in a
+	// DirectShow host (VideoProcessor) that is the graph/streaming thread, and
+	// a modal there halts presentation for the dialog's whole lifetime
+	// (measured: ProcessSample froze from the first click until the close).
+	// MPC-HC's own UI thread never had that problem, which is why this ran
+	// synchronously until a capture host needed it. Show it on a dedicated
+	// thread: everything the frame calls back into the filter (page bodies,
+	// Get/SetSettings) is lock-guarded by design.
+	if (m_hConfigDialogThread &&
+		WaitForSingleObject(m_hConfigDialogThread, 0) == WAIT_OBJECT_0) {
+		CloseHandle(m_hConfigDialogThread);
+		m_hConfigDialogThread = nullptr;
+	}
+	if (m_hConfigDialogThread) {
+		TrayTrace(L"ShowConfigDialog: dialog already open");
+		return;
+	}
+
 	IUnknown* pFilterUnk = nullptr;
 	if (FAILED(NonDelegatingQueryInterface(IID_IUnknown, (void**)&pFilterUnk)) || !pFilterUnk) {
 		return;
 	}
 
+	auto* a = new ConfigDialogArgs{};
+	a->pUnk = pFilterUnk;   // ownership moves to the dialog thread
+
 	ISpecifyPropertyPages* pProp = nullptr;
-	HRESULT hr = pFilterUnk->QueryInterface(IID_ISpecifyPropertyPages, (void**)&pProp);
-	if (SUCCEEDED(hr) && pProp) {
-		CAUUID caGUID;
-		FILTER_INFO fi = {};
-		hr = QueryFilterInfo(&fi); // provides the display name; pGraph is unused/released here
-		if (fi.pGraph) {
-			fi.pGraph->Release();
-			fi.pGraph = nullptr;
-		}
-
-		if (SUCCEEDED(pProp->GetPages(&caGUID))) {
-			OleCreatePropertyFrame(
-				m_hTrayWnd, 0, 0,
-				fi.achName[0] ? fi.achName : L"Unplugged Renderer",
-				1, &pFilterUnk,
-				caGUID.cElems, caGUID.pElems,
-				0,                    // Locale identifier
-				0, nullptr            // Reserved
-			);
-
-			CoTaskMemFree(caGUID.pElems);
-		}
-
+	if (SUCCEEDED(pFilterUnk->QueryInterface(IID_ISpecifyPropertyPages, (void**)&pProp)) && pProp) {
+		pProp->GetPages(&a->pages);
 		pProp->Release();
+	} else {
+		a->pages.cElems = 0;
+		a->pages.pElems = nullptr;
+	}
+	if (!a->pages.cElems || !a->pages.pElems) {
+		TrayTrace(L"ShowConfigDialog: no property pages");
+		pFilterUnk->Release();
+		delete a;
+		return;
 	}
 
-	pFilterUnk->Release();
+	FILTER_INFO fi = {};
+	if (SUCCEEDED(QueryFilterInfo(&fi))) {   // provides the display name; pGraph is unused
+		wcsncpy_s(a->title, fi.achName[0] ? fi.achName : L"Unplugged Video Renderer", _TRUNCATE);
+		if (fi.pGraph) {
+			fi.pGraph->Release();
+		}
+	} else {
+		wcscpy_s(a->title, L"Unplugged Video Renderer");
+	}
+
+	m_hConfigDialogThread = CreateThread(nullptr, 0, ConfigDialogThread, a, 0, nullptr);
+	if (!m_hConfigDialogThread) {
+		TrayTrace(L"ShowConfigDialog: CreateThread failed");
+		CoTaskMemFree(a->pages.pElems);
+		pFilterUnk->Release();
+		delete a;
+		return;
+	}
+	TrayTrace(L"ShowConfigDialog: dialog thread started");
 }
 
 STDMETHODIMP_(void) CMpcVideoRenderer::SetSettings(const Settings_t& setings)
@@ -1825,6 +2256,36 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 		key.SetStringValue(OPT_MLChromaFire,       std::to_wstring(m_Sets.fMLChromaFire).c_str());
 		key.SetStringValue(OPT_MLChromaKnee,       std::to_wstring(m_Sets.fMLChromaKnee).c_str());
 		key.SetStringValue(OPT_MLChromaSkinProtect, std::to_wstring(m_Sets.fMLChromaSkinProtect).c_str());
+		// Fork grading/delivery surface — the property page writes these and a
+		// standalone user expects them to survive a player restart.
+		key.SetDWORDValue(OPT_HdrExposureTrim, (DWORD)m_Sets.iHdrExposureTrim);
+		key.SetDWORDValue(OPT_HdrShadowLift,   (DWORD)m_Sets.iHdrShadowLift);
+		key.SetDWORDValue(OPT_HdrPunch,        (DWORD)m_Sets.iHdrPunch);
+		key.SetStringValue(OPT_Gt7Blend,       std::to_wstring(m_Sets.fHdrGt7Blend).c_str());
+		key.SetStringValue(OPT_Gt7FadeStart,   std::to_wstring(m_Sets.fHdrGt7FadeStart).c_str());
+		key.SetStringValue(OPT_Gt7Adapt,       std::to_wstring(m_Sets.fHdrGt7Adapt).c_str());
+		key.SetStringValue(OPT_Gt7Alpha,       std::to_wstring(m_Sets.fHdrGt7Alpha).c_str());
+		key.SetStringValue(OPT_Gt7Desat,       std::to_wstring(m_Sets.fHdrGt7Desat).c_str());
+		key.SetDWORDValue(OPT_Gt7Dbg,          (DWORD)(int)m_Sets.fHdrGt7Dbg);
+		key.SetDWORDValue(OPT_HdrAutoRefWhite, m_Sets.bHdrAutoRefWhite);
+		key.SetStringValue(OPT_HdrRefWhiteTarget, std::to_wstring(m_Sets.fHdrRefWhiteTarget).c_str());
+		key.SetDWORDValue(OPT_MLController,    m_Sets.bMLController);
+		key.SetStringValue(OPT_MLTargetMid,    std::to_wstring(m_Sets.fMLTargetMid).c_str());
+		key.SetStringValue(OPT_MLGammaTopUp,   std::to_wstring(m_Sets.fMLGammaTopUp).c_str());
+		key.SetStringValue(OPT_MLShadowDehaze, std::to_wstring(m_Sets.fMLShadowDehaze).c_str());
+		key.SetStringValue(OPT_MLHighlightRolloffCtrl, std::to_wstring(m_Sets.fMLHighlightRolloffCtrl).c_str());
+		key.SetDWORDValue(OPT_MLContrastEnabled, m_Sets.bMLContrastEnabled);
+		key.SetStringValue(OPT_MLContrast,     std::to_wstring(m_Sets.fMLContrast).c_str());
+		key.SetStringValue(OPT_MLContrastZoneLo,      std::to_wstring(m_Sets.fMLContrastZoneLo).c_str());
+		key.SetStringValue(OPT_MLContrastRatioCap,    std::to_wstring(m_Sets.fMLContrastRatioCap).c_str());
+		key.SetStringValue(OPT_MLContrastSkinProtect, std::to_wstring(m_Sets.fMLContrastSkinProtect).c_str());
+		key.SetStringValue(OPT_GamutCap,       std::to_wstring(m_Sets.fGamutCap).c_str());
+		key.SetStringValue(OPT_MLHiDesat,      std::to_wstring(m_Sets.fMLHiDesat).c_str());
+		key.SetDWORDValue(OPT_MLSkyEnabled,    m_Sets.bMLSkyEnabled);
+		key.SetStringValue(OPT_MLSkyStrength,  std::to_wstring(m_Sets.fMLSkyStrength).c_str());
+		key.SetDWORDValue(OPT_MLPersonEnabled, m_Sets.bMLPersonEnabled);
+		key.SetStringValue(OPT_MLPersonStrength, std::to_wstring(m_Sets.fMLPersonStrength).c_str());
+		key.SetStringValue(OPT_MLSkinPreserve, std::to_wstring(m_Sets.fMLSkinPreserve).c_str());
 	}
 
 	return S_OK;
@@ -2278,7 +2739,7 @@ STDMETHODIMP CMpcVideoRenderer::GetString(LPCSTR field, LPWSTR* value, int* char
 	if (!strcmp(field, "name")) {
 		// Reported to the host (and to the Unplugged app's status panel). The engine
 		// matches on this only for display, never to decide anything.
-		str = L"Unplugged Renderer";
+		str = L"Unplugged Video Renderer";
 	}
 	else if (!strcmp(field, "version")) {
 		str = _CRT_WIDE(VERSION_STR);

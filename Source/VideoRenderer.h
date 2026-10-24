@@ -114,6 +114,8 @@ private:
 	HWND m_hWndWindow     = nullptr;
 	HWND m_hWndParent     = nullptr;
 	HWND m_hWndDrain      = nullptr;
+	long m_windowStyle    = 0;   // host-requested window style (IVideoWindow)
+	bool m_hideCursor     = false;
 	HWND m_hWndParentMain = nullptr;
 
 	// System tray icon (opens the property page; see ShowConfigDialog)
@@ -121,6 +123,11 @@ private:
 	// the video window (m_hWndWindow) and of Init()'s early returns.
 	bool m_bTrayIconVisible = false;
 	HWND m_hTrayWnd        = nullptr;
+	// The property dialog runs on its own thread (see ShowConfigDialog): a
+	// modal frame on the thread that created the filter — the host's
+	// graph/streaming thread in DirectShow hosts — halts delivery for the
+	// dialog's lifetime. Non-null while that thread is alive.
+	HANDLE m_hConfigDialogThread = nullptr;
 
 	void CreateTrayWindow();
 	void DestroyTrayWindow();
@@ -243,26 +250,29 @@ public:
 	// IVideoWindow
 	STDMETHODIMP put_Caption(BSTR strCaption) { return E_NOTIMPL; }
 	STDMETHODIMP get_Caption(BSTR *strCaption) { return E_NOTIMPL; }
-	STDMETHODIMP put_WindowStyle(long WindowStyle) { return E_NOTIMPL; }
-	STDMETHODIMP get_WindowStyle(long *WindowStyle) { return E_NOTIMPL; }
+	// Generic DirectShow hosts (VideoProcessor et al) embed the renderer by
+	// calling put_WindowStyle/HideCursor and treat E_NOTIMPL as fatal. The
+	// renderer creates its child window already styled WS_CHILD|WS_CLIPSIBLINGS,
+	// so these record the host's request and mirror the window/child bits onto
+	// it - and answer honestly rather than refusing the contract.
+	STDMETHODIMP put_WindowStyle(long WindowStyle);
+	STDMETHODIMP get_WindowStyle(long *WindowStyle);
 	STDMETHODIMP put_WindowStyleEx(long WindowStyleEx) { return E_NOTIMPL; }
 	STDMETHODIMP get_WindowStyleEx(long *WindowStyleEx) { return E_NOTIMPL; }
+	STDMETHODIMP put_WindowState(long WindowState);
+	STDMETHODIMP get_WindowState(long *WindowState);
 	STDMETHODIMP put_AutoShow(long AutoShow) { return E_NOTIMPL; }
 	STDMETHODIMP get_AutoShow(long *AutoShow) { return E_NOTIMPL; }
-	STDMETHODIMP put_WindowState(long WindowState) { return E_NOTIMPL; }
-	STDMETHODIMP get_WindowState(long *WindowState) { return E_NOTIMPL; }
 	STDMETHODIMP put_BackgroundPalette(long BackgroundPalette) { return E_NOTIMPL; }
 	STDMETHODIMP get_BackgroundPalette(long *pBackgroundPalette) { return E_NOTIMPL; }
-	STDMETHODIMP put_Visible(long Visible) { return E_NOTIMPL; }
-	STDMETHODIMP get_Visible(long *pVisible) { return E_NOTIMPL; }
 	STDMETHODIMP put_Left(long Left) { return E_NOTIMPL; }
-	STDMETHODIMP get_Left(long *pLeft) { return E_NOTIMPL; }
+	STDMETHODIMP get_Left(long *pLeft);
 	STDMETHODIMP put_Width(long Width) { return E_NOTIMPL; }
-	STDMETHODIMP get_Width(long *pWidth) { return E_NOTIMPL; }
+	STDMETHODIMP get_Width(long *pWidth);
 	STDMETHODIMP put_Top(long Top) { return E_NOTIMPL; }
-	STDMETHODIMP get_Top(long *pTop) { return E_NOTIMPL; }
+	STDMETHODIMP get_Top(long *pTop);
 	STDMETHODIMP put_Height(long Height) { return E_NOTIMPL; }
-	STDMETHODIMP get_Height(long *pHeight) { return E_NOTIMPL; }
+	STDMETHODIMP get_Height(long *pHeight);
 	STDMETHODIMP put_Owner(OAHWND Owner);
 	STDMETHODIMP get_Owner(OAHWND *Owner);
 	STDMETHODIMP put_MessageDrain(OAHWND Drain);
@@ -278,8 +288,14 @@ public:
 	STDMETHODIMP GetMinIdealImageSize(long *pWidth, long *pHeight) { return E_NOTIMPL; }
 	STDMETHODIMP GetMaxIdealImageSize(long *pWidth, long *pHeight) { return E_NOTIMPL; }
 	STDMETHODIMP GetRestorePosition(long *pLeft, long *pTop, long *pWidth, long *pHeight) { return E_NOTIMPL; }
-	STDMETHODIMP HideCursor(long HideCursor) { return E_NOTIMPL; }
-	STDMETHODIMP IsCursorHidden(long *CursorHidden) { return E_NOTIMPL; }
+	// See put_WindowStyle above: generic hosts treat these as the embedding
+	// contract. The child window starts hidden so the first ShowWindow makes
+	// the video appear only once the graph has placed and started it.
+	STDMETHODIMP put_Visible(long Visible);
+	STDMETHODIMP get_Visible(long *pVisible);
+	STDMETHODIMP ShowWindow(long WindowStyle);
+	STDMETHODIMP HideCursor(long HideCursor);
+	STDMETHODIMP IsCursorHidden(long *CursorHidden);
 
 	// ISpecifyPropertyPages
 	STDMETHODIMP GetPages(CAUUID* pPages);

@@ -41,10 +41,13 @@ const AMOVIESETUP_PIN sudpPins[] = {
 };
 
 const AMOVIESETUP_FILTER sudFilter[] = {
-	// "Unplugged Renderer" -- the name graphedit/other hosts show. This one is
-	// presentational: every host that works with this filter does so by CLSID, so
-	// renaming it breaks nothing functional. The GUID above is the load-bearing one.
-	{&__uuidof(CMpcVideoRenderer), L"Unplugged Renderer", MERIT_DO_NOT_USE, (UINT)std::size(sudpPins), sudpPins, CLSID_LegacyAmFilterCategory},
+	// "Unplugged Video Renderer" -- the name graphedit/other hosts show, and the
+	// registered FriendlyName external enumerators match on. Hosts that work with
+	// this filter directly do so by CLSID, so the name is presentational there --
+	// but discovery-based hosts apply name heuristics (e.g. VideoProcessor's
+	// renderer browser requires "Video"+"Render" or "VR" in the friendly name),
+	// so the name must keep those substrings. The GUID above is load-bearing.
+	{&__uuidof(CMpcVideoRenderer), L"Unplugged Video Renderer", MERIT_DO_NOT_USE, (UINT)std::size(sudpPins), sudpPins, CLSID_LegacyAmFilterCategory},
 };
 
 CFactoryTemplate g_Templates[] = {

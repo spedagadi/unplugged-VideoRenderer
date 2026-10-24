@@ -51,7 +51,7 @@ std::wstring GetVersionStr()
 
 LPCWSTR GetNameAndVersion()
 {
-	static std::wstring version = L"Unplugged Renderer " + GetVersionStr();
+	static std::wstring version = L"Unplugged Video Renderer " + GetVersionStr();
 
 	return version.c_str();
 }

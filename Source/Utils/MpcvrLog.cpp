@@ -6,6 +6,9 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <share.h>
+#include <io.h>
 
 namespace mpcvr {
 
@@ -41,6 +44,19 @@ bool TraceVerbose()
     return s_verbose.load(std::memory_order_relaxed);
 }
 
+// Open the trace for append with READ sharing guaranteed, so a debugger-less
+// reader can tail the log while the renderer is still writing it. Plain
+// fopen_s has proven unopenable by other processes on some hosts.
+static FILE* OpenAppendShared(const char* path)
+{
+    int fd = -1;
+    if (_sopen_s(&fd, path, _O_RDWR | _O_CREAT | _O_APPEND, _SH_DENYNO,
+                 _S_IREAD | _S_IWRITE) != 0 || fd < 0) {
+        return nullptr;
+    }
+    return _fdopen(fd, "a");
+}
+
 static void WriteBanner()
 {
     if (!s_file) return;
@@ -73,7 +89,7 @@ static void OpenLocked()
         if (!s_path[0]) strcpy_s(s_path, "mpcvr_trace.log");
     }
 
-    fopen_s(&s_file, s_path, "a");
+    s_file = OpenAppendShared(s_path);
     WriteBanner();
 }
 
@@ -91,7 +107,7 @@ static void RotateLocked()
     MoveFileA(s_path, prev);
 
     s_bytes = 0;
-    fopen_s(&s_file, s_path, "a");
+    s_file = OpenAppendShared(s_path);
     WriteBanner();
     if (s_file) {
         fputs("[TRACE] size cap reached, previous trace moved to mpcvr_trace.prev.log\n", s_file);

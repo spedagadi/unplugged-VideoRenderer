@@ -5404,6 +5404,8 @@ HRESULT CDX11VideoProcessor::InitSwapChain(bool bWindowChanged)
 
 		hr = m_pDXGIFactory2->CreateSwapChainForHwnd(m_pDevice, m_hWnd, &desc1, nullptr, nullptr, &m_pDXGISwapChain1);
 		DLogIf(FAILED(hr), L"CDX11VideoProcessor::InitSwapChain() : CreateSwapChainForHwnd() failed with error {}", HR2Str(hr));
+		DLog(L"[VP-DBG] InitSwapChain created windowed chain {}x{} fmt {}",
+			desc1.Width, desc1.Height, (int)desc1.Format);
 
 		m_lastFullscreenHMonitor = nullptr;
 	}
@@ -6125,6 +6127,23 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 	// always Render(1) a frame after CopySample()
 	hr = Render(1, rtStart);
 	VLog(L"[RT] ProcessSample #{} Render returned hr=0x{:08X} — draw stats", seq, (unsigned)hr);
+
+	// [VP-DBG] present-path census: proves the full chain ran — sample copied,
+	// shader pass executed, rect geometry at draw time. First 3, then every 300th.
+	if (seq <= 3 || seq % 300 == 0) {
+		UINT chainW = 0, chainH = 0;
+		DXGI_SWAP_CHAIN_DESC sd{};
+		if (m_pDXGISwapChain1 && SUCCEEDED(m_pDXGISwapChain1->GetDesc(&sd))) {
+			chainW = sd.BufferDesc.Width;
+			chainH = sd.BufferDesc.Height;
+		}
+		const bool bVidCoversWnd = m_videoRect.PtInRect(CPoint(m_windowRect.Width() / 2, m_windowRect.Height() / 2));
+		DLog(L"[VP-DBG] ProcessSample #{} Render hr=0x{:08X} | wnd {}x{} vidCoversWnd={} chain {}x{} | vidRect ({},{})-({},{}) renderRect {}x{}",
+			seq, (unsigned)hr, m_windowRect.Width(), m_windowRect.Height(),
+			(int)bVidCoversWnd, chainW, chainH,
+			m_videoRect.left, m_videoRect.top, m_videoRect.right, m_videoRect.bottom,
+			m_renderRect.Width(), m_renderRect.Height());
+	}
 	m_pFilter->m_DrawStats.Add(GetPreciseTick());
 	if (m_pFilter->m_filterState == State_Running) {
 		m_pFilter->StreamTime(rtClock);
@@ -8648,6 +8667,8 @@ void CDX11VideoProcessor::SetVideoRect(const CRect& videoRect)
 
 HRESULT CDX11VideoProcessor::SetWindowRect(const CRect& windowRect)
 {
+	DLog(L"[VP-DBG] CDX11VideoProcessor::SetWindowRect({}x{}) - chain={}, exclusive={}",
+		windowRect.Width(), windowRect.Height(), (void*)m_pDXGISwapChain1 ? 1 : 0, (int)m_bExclusiveScreen);
 	m_windowRect = windowRect;
 	UpdateRenderRect();
 
@@ -8657,6 +8678,7 @@ HRESULT CDX11VideoProcessor::SetWindowRect(const CRect& windowRect)
 
 	if (m_pDXGISwapChain1 && !m_bExclusiveScreen) {
 		hr = m_pDXGISwapChain1->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+		DLog(L"[VP-DBG] ResizeBuffers(0, {}, {}) returned {}", w, h, HR2Str(hr));
 	}
 
 	UpdateStatsByWindow();
