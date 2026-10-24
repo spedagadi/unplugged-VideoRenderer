@@ -90,6 +90,26 @@ static void OpenLocked()
     }
 
     s_file = OpenAppendShared(s_path);
+    if (!s_file) {
+        // A read-only module directory (Program Files under a non-elevated host)
+        // must not blind the trace — that is how a whole session of dial pushes
+        // became invisible on 2026-10-24. Fall back to the same per-user folder
+        // the engine uses.
+        wchar_t prof[MAX_PATH] = {};
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", prof, MAX_PATH)) {
+            std::wstring dir = prof;
+            dir += L"\\Unplugged";
+            CreateDirectoryW(dir.c_str(), nullptr);
+            dir += L"\\logs";
+            CreateDirectoryW(dir.c_str(), nullptr);
+            char narrow[MAX_PATH] = {};
+            if (WideCharToMultiByte(CP_ACP, 0, (dir + L"\\mpcvr_trace.log").c_str(), -1,
+                                    narrow, MAX_PATH, nullptr, nullptr)) {
+                strcpy_s(s_path, narrow);
+                s_file = OpenAppendShared(s_path);
+            }
+        }
+    }
     WriteBanner();
 }
 
