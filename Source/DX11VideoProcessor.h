@@ -402,6 +402,7 @@ private:
 	bool m_bMLDebug = false;
 	int   m_mlSessionId = 0;      // playback session counter (media-type changes) for log triage
 	bool m_bMLDebugCopy = false; // bind ps_simple to the grade steps (bisect test)
+	bool m_bMLPostWarpMC = false; // draw the MC step after the custom post-scale chain (NLS on)
 	bool m_bMLShadowDebugVis = false;
 	bool m_bMLContrastDebugVis = false;
 	float m_fMLShadowZoneCeil = 0.20f;
@@ -1146,6 +1147,16 @@ public:
 	HRESULT AddPreScaleShader(const std::wstring& name, const std::string& srcCode) override;
 	HRESULT AddPostScaleShader(const std::wstring& name, const std::string& srcCode) override;
 
+	// Non-linear stretch (engine-owned custom pass) changes the geometry the
+	// micro-contrast step should see. When this is on, MC is drawn AFTER the
+	// custom post-scale chain instead of inside the grade block: its halo radius
+	// then lives in final geometry instead of being magnified by the warp, and it
+	// runs on the cropped picture (no black bands under the kernel). It is DRAWN
+	// ONCE either way - this is a relocation, not a second pass, so the post-scale
+	// ring step count is unchanged.
+	void SetMLPostWarpMC(bool on) override { m_bMLPostWarpMC = on; }
+	bool GetMLPostWarpMC() const { return m_bMLPostWarpMC; }
+
 	ISubPicAllocator* GetSubPicAllocator() override;
 
 	void SwitchFullScreen(bool set) override;
@@ -1166,13 +1177,19 @@ private:
 	void DrawSubtitles(ID3D11Texture2D* pRenderTarget);
 	HRESULT Process(ID3D11Texture2D* pRenderTarget, const CRect& srcRect, const CRect& dstRect, const bool second);
 
+	// One micro-contrast draw, with the skin LUT (t1) and semseg mask (t2) bound
+	// for this pass only. Shared by the in-grade position and the post-warp
+	// position so the two can never drift apart.
+	HRESULT DrawMLMicroContrast(Tex2D_t* pInput, ID3D11Texture2D* pRenderTarget, const CRect& rect);
+
 	HRESULT AlphaBlt(ID3D11ShaderResourceView* pShaderResource, ID3D11Texture2D* pRenderTarget,
 					 ID3D11Buffer* pVertexBuffer, D3D11_VIEWPORT* pViewPort,
 					 ID3D11SamplerState* pSampler);
 	HRESULT TextureCopyRect(const Tex2D_t& Tex, ID3D11Texture2D* pRenderTarget,
 							const CRect& srcRect, const CRect& destRect,
 							ID3D11PixelShader* pPixelShader, ID3D11Buffer* pConstantBuffer,
-							const int iRotation, const bool bFlip);
+							const int iRotation, const bool bFlip,
+							ID3D11SamplerState* pSampler = nullptr);   // null = point (bit-exact copy)
 
 	// DELIVERED-frame instrument: downsample a frame boundary into its 256x144 cache
 	// (draw time, debug-gated), and reduce both caches into [DELIVERED] log lines
