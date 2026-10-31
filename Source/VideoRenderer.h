@@ -153,6 +153,22 @@ private:
 
 	CRect m_windowRect, m_videoRect;
 
+	// DEFERRED DESTINATION RECT.
+	//
+	// IBasicVideo::SetDestinationPosition used to apply the rect inline, under
+	// m_RendererLock. The host shell changes the picture rect when the chrome shows or
+	// hides its panels, and while a capture graph is streaming the streaming thread
+	// holds m_RendererLock inside Present - so that call blocked the caller (the UI)
+	// for tens of seconds and took the whole app with it (Windows AppHangB1).
+	//
+	// Now the setter only STORES the request under its own small lock, and the render
+	// thread applies it at the top of the next sample, where it already owns the
+	// renderer. No caller ever waits on the renderer, and the rect is applied in the
+	// only place where applying it is safe.
+	CCritSec m_destRectLock;
+	CRect m_destRectPending;
+	bool  m_destRectDirty = false;
+
 	bool m_bForceRedrawing = true;
 
 	bool m_bEnableFullscreenControl = false;
@@ -384,5 +400,11 @@ public:
 
 private:
 	HRESULT Redraw();
+	// Apply a destination rect the host set since the last frame. Called from the
+	// render thread per sample AND from Redraw(): a redraw exists precisely to show
+	// the frame the host is holding with the CURRENT settings, so it must not draw
+	// with the rect of the previous one (a paused NLS on/off toggle showed the old
+	// geometry - picture squeezed, label saying otherwise).
+	void ApplyPendingDestRect();
 	void DoAfterChangingDevice();
 };

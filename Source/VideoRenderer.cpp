@@ -872,9 +872,50 @@ HRESULT CMpcVideoRenderer::SetMediaType(const CMediaType *pmt)
 	return S_OK;
 }
 
+// Direct trace for the deferred destination rect. The IMpcvrLogSink bridge is
+// currently disabled in the host (CFG bisect), so renderer LogLine goes nowhere and
+// "did the picture rect actually change?" cannot be answered. This writes to its own
+// small file, independent of the sink, only when the rect is applied.
+static void DestRectTrace(const char* fmt, ...)
+{
+	wchar_t path[MAX_PATH] = {};
+	DWORD n = GetEnvironmentVariableW(L"TEMP", path, MAX_PATH);
+	if (n == 0 || n >= MAX_PATH) return;
+	wcscat_s(path, L"\\mpcvr_destrect.log");
+	FILE* f = nullptr;
+	if (_wfopen_s(&f, path, L"a") != 0 || !f) return;
+	SYSTEMTIME st{};
+	GetLocalTime(&st);
+	fprintf(f, "%02u:%02u:%02u.%03u ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fputc('\n', f);
+	fclose(f);
+}
+
+// Apply any destination rect the host asked for since the last frame. Called from
+// the render thread per sample, and from Redraw() so a paused frame is repainted
+// with the geometry the host has just set instead of the previous one.
+void CMpcVideoRenderer::ApplyPendingDestRect()
+{
+	CAutoLock cDestLock(&m_destRectLock);
+	if (!m_destRectDirty) return;
+	m_destRectDirty = false;
+	if (m_destRectPending.IsRectNull()) return;
+	m_videoRect = m_destRectPending;
+	m_VideoProcessor->SetVideoRect(m_videoRect);
+	DestRectTrace("applied %ldx%ld@%ld,%ld",
+		(long)m_videoRect.Width(), (long)m_videoRect.Height(),
+		(long)m_videoRect.left, (long)m_videoRect.top);
+}
+
 HRESULT CMpcVideoRenderer::DoRenderSample(IMediaSample* pSample)
 {
 	CheckPointer(pSample, E_POINTER);
+
+	ApplyPendingDestRect();
 
 	if (m_bSetNewMediaTypeToInputPin) {
 		auto inputPin = static_cast<CVideoRendererInputPin*>(m_pInputPin);
@@ -1315,16 +1356,15 @@ STDMETHODIMP CMpcVideoRenderer::SetDestinationPosition(long Left, long Top, long
 		return S_OK;
 	}
 
-	if (videoRect != m_videoRect) {
-		m_videoRect = videoRect;
-
-		CAutoLock cRendererLock(&m_RendererLock);
-
-		m_VideoProcessor->SetVideoRect(videoRect);
-	}
-
-	if (m_bForceRedrawing) {
-		Redraw();
+	// STORE ONLY - see the comment on m_destRectPending. This is called from the host's
+	// UI thread whenever the chrome changes the picture's area; taking m_RendererLock
+	// here is what froze the app during live capture. The render thread applies it.
+	{
+		CAutoLock cDestLock(&m_destRectLock);
+		if (videoRect != m_destRectPending) {
+			m_destRectPending = videoRect;
+			m_destRectDirty = true;
+		}
 	}
 
 	return S_OK;
@@ -2419,6 +2459,16 @@ STDMETHODIMP CMpcVideoRenderer::Flt_SetBool(LPCSTR field, bool value)
 		return S_OK;
 	}
 
+	// Non-linear stretch is live: the micro-contrast step must move to the far
+	// side of the warp, and the move has to happen on the same lock as the
+	// post-scale list itself (the engine sets both from one settings push).
+	if (!strcmp(field, "cmd_mlPostWarpMC")) {
+		CAutoLock cRendererLock(&m_RendererLock);
+
+		m_VideoProcessor->SetMLPostWarpMC(value);
+		return S_OK;
+	}
+
 	if (!strcmp(field, "statsEnable")) {
 		m_Sets.bShowStats = value;
 		m_VideoProcessor->SetShowStats(m_Sets.bShowStats);
@@ -2782,6 +2832,12 @@ CComPtr<ISubPic> CMpcVideoRenderer::GetSubPic(REFERENCE_TIME rtStart)
 
 HRESULT CMpcVideoRenderer::Redraw()
 {
+	// A redraw means "show the held frame as it should look NOW": take the
+	// destination rect the host set since the last sample before painting, or a
+	// paused geometry change (NLS on/off) is drawn with the previous rect and the
+	// picture contradicts its own label until playback resumes.
+	ApplyPendingDestRect();
+
 	CAutoLock cRendererLock(&m_RendererLock);
 	const auto bDrawFrame = m_bValidBuffer && m_filterState != State_Stopped;
 
