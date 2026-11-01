@@ -262,6 +262,11 @@ public:
 	virtual HRESULT AddPreScaleShader(const std::wstring& name, const std::string& srcCode) { return E_NOTIMPL; };
 	virtual HRESULT AddPostScaleShader(const std::wstring& name, const std::string& srcCode) { return E_NOTIMPL; };
 
+	// Move the micro-contrast draw to the far side of the custom post-scale
+	// chain (used while non-linear stretch is live). No-op here: only DX11 has
+	// that chain, and the DX9 path has no MC step to move.
+	virtual void SetMLPostWarpMC(bool on) { (void)on; }
+
 	// Display calibration 3D LUT (.cube). Only DX11 has the final-pass stage to
 	// host it; DX9 reports E_NOTIMPL so the command is a harmless no-op there.
 	virtual HRESULT LoadCubeLut(const char* utf8Path) { return E_NOTIMPL; };
