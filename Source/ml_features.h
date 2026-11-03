@@ -34,6 +34,8 @@ enum class MLLumaDomain {
 struct MLBarBounds {
 	int   contentTop = 0;      // first content row (0-based); h if blank
 	int   contentBottom = -1;  // last content row (0-based); -1 if blank
+	int   contentLeft = 0;     // first content column (0-based)
+	int   contentRight = -1;   // last content column (0-based); -1 if blank
 	float threshold = 0.0f;
 };
 

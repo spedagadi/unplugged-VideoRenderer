@@ -332,7 +332,7 @@ void ShaderGetPixels(
 				break;
 			}
 			if (fmtParams.cformat == CF_UYVY) {
-				code.append("if (fmod(input.Tex.x*w, 2) < 1.0) {\n"
+				code.append("if (fmod(input.Tex.x*frameW, 2) < 1.0) {\n"
 					"color = float4(color.yxz, 1);\n"
 					"} else {\n");
 				if (chromaScaling == CHROMA_CatmullRom) {
@@ -349,7 +349,7 @@ void ShaderGetPixels(
 					"}\n");
 			}
 			else if (packed422) {
-				code.append("if (fmod(input.Tex.x*w, 2) < 1.0) {\n"
+				code.append("if (fmod(input.Tex.x*frameW, 2) < 1.0) {\n"
 					"color = float4(color.xyw, 1);\n"
 					"} else {\n");
 				if (chromaScaling == CHROMA_CatmullRom) {
@@ -396,7 +396,7 @@ void ShaderGetPixels(
 			}
 			else if ((chromaScaling == CHROMA_CatmullRom || (chromaScaling == CHROMA_Krig && !bDX11)) && fmtParams.Subsampling == 422) {
 				code.append(
-					"if (fmod(input.Tex.x*w, 2) < 1.0) {\n"
+					"if (fmod(input.Tex.x*frameW, 2) < 1.0) {\n"
 						"colorUV = texUV.Sample(samp, input.Tex).rg;\n"
 					"} else {\n"
 						"input.Tex.x -= dx;\n"
@@ -450,7 +450,7 @@ void ShaderGetPixels(
 			}
 			else if ((chromaScaling == CHROMA_CatmullRom || (chromaScaling == CHROMA_Krig && !bDX11)) && fmtParams.Subsampling == 422) {
 				code.append(
-					"if (fmod(input.Tex.x*w, 2) < 1.0) {\n"
+					"if (fmod(input.Tex.x*frameW, 2) < 1.0) {\n"
 						"colorUV[0] = texU.Sample(samp, input.Tex).r;\n"
 						"colorUV[1] = texV.Sample(samp, input.Tex).r;\n"
 					"} else {\n"
@@ -519,7 +519,7 @@ void ShaderGetPixels(
 				break;
 			}
 			if (fmtParams.cformat == CF_UYVY) {
-				code.append("if (fmod(tex.x*w, 2) < 1.0) {\n"
+				code.append("if (fmod(tex.x*frameW, 2) < 1.0) {\n"
 					"color = float4(color.yzx, 1);\n"
 					"} else {\n");
 				if (chromaScaling == CHROMA_CatmullRom) {
@@ -536,7 +536,7 @@ void ShaderGetPixels(
 					"}\n");
 			}
 			else if (packed422) {
-				code.append("if (fmod(tex.x*w, 2) < 1.0) {\n"
+				code.append("if (fmod(tex.x*frameW, 2) < 1.0) {\n"
 					"color = float4(color.zyw, 1);\n"
 					"} else {\n");
 				if (chromaScaling == CHROMA_CatmullRom) {
@@ -592,7 +592,7 @@ void ShaderGetPixels(
 			}
 			else if (chromaScaling == CHROMA_CatmullRom && fmtParams.Subsampling == 422) {
 				code.append(
-					"if (fmod(t0.x*w, 2) < 1.0) {\n"
+					"if (fmod(t0.x*frameW, 2) < 1.0) {\n"
 						"t0.x += 0.5*dx;\n"
 						"colorUV = tex2D(sUV, t0).rg;\n"
 					"} else {\n"
@@ -649,7 +649,7 @@ void ShaderGetPixels(
 			}
 			else if (chromaScaling == CHROMA_CatmullRom && fmtParams.Subsampling == 422) {
 				code.append(
-					"if (fmod(t0.x*w, 2) < 1.0) {\n"
+					"if (fmod(t0.x*frameW, 2) < 1.0) {\n"
 						"t0.x += 0.5*dx;\n"
 						"colorUV[0] = tex2D(sU, t0).r;\n"
 						"colorUV[1] = tex2D(sV, t0).r;\n"
@@ -814,7 +814,10 @@ HRESULT GetShaderConvertColor(
 		|| fmtParams.cformat == CF_V210);
 	const bool fix422 = (packed422 && texW * 2 == width);
 
-	code += std::format("#define w {}\n", fix422 ? width : texW);
+	// NOT "w": a macro named w collides with the .w swizzle used by the Krig
+	// body and packed-4:2:2 paths, so the preprocessor rewrote "interp.w" into
+	// "interp.3840" and every Krig converter failed to compile (X3000).
+	code += std::format("#define frameW {}\n", fix422 ? width : texW);
 	code += std::format("#define dx (1.0/{})\n", texW);
 	code += std::format("#define dy (1.0/{})\n", texH);
 	code += std::format("static const float2 wh = {{{}, {}}};\n", fix422 ? width : texW, texH);

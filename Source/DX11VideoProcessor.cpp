@@ -3810,7 +3810,7 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 		// band until the window rolls over (seen live: 688/598 of 1436 on a night
 		// scene). A consumer that has to act on the band per frame - NLS - needs
 		// the unsettled value plus its own persistence gate.
-		L"barsNow: top={:.4f} bot={:.4f}\n"
+		L"barsNow: top={:.4f} bot={:.4f} left={:.4f} right={:.4f}\n"
 		// Fraction of cells that contain anything above the crop level. A picture
 		// fills its active rows (â‰ˆ hA); a black title card is nearly all cells off
 		// even though it is the same "band" shape. Consumers that must not mistake
@@ -3850,6 +3850,10 @@ void CDX11VideoProcessor::GetMLStats(std::wstring& str)
 			? (float)m_MLBarDetected.contentTop / (float)ML_DOWNSAMPLE_H : 0.0f),
 		(double)((m_MLBarDetected.contentBottom >= m_MLBarDetected.contentTop)
 			? (float)(ML_DOWNSAMPLE_H - 1 - m_MLBarDetected.contentBottom) / (float)ML_DOWNSAMPLE_H : 0.0f),
+		(double)((m_MLBarDetected.contentRight >= m_MLBarDetected.contentLeft)
+			? (float)m_MLBarDetected.contentLeft / (float)ML_DOWNSAMPLE_W : 0.0f),
+		(double)((m_MLBarDetected.contentRight >= m_MLBarDetected.contentLeft)
+			? (float)(ML_DOWNSAMPLE_W - 1 - m_MLBarDetected.contentRight) / (float)ML_DOWNSAMPLE_W : 0.0f),
 		// activeFrac argument (see the format line).
 		(double)m_MLActiveFrac,
 		m_iExperimentalToneMapper, (ToneLutActive() ? L"yes" : L"no"),

@@ -105,6 +105,7 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 	thread_local uint32_t histogram[65536] = {};
 	thread_local std::vector<float> sat((size_t)(w + 1) * (h + 1));
 	thread_local std::vector<float> rowMean(h);
+	thread_local std::vector<float> colMean(w);
 	thread_local std::vector<float> tv((size_t)w * h); // per-pixel feature-domain value
 	ZeroMemory(histogram, sizeof(histogram));
 
@@ -204,6 +205,14 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 		}
 		rowMean[y] = (float)(rowSum / w);
 	}
+	// Column means for pillarbox detection. Computed from the same downsample;
+	// no feature slots are added, because the 88-entry vector is a trained model
+	// contract. Side bars are exposed through MLBarBounds only.
+	for (int x = 0; x < w; x++) {
+		double colSum = 0.0;
+		for (int y = 0; y < h; y++) colSum += tv[(size_t)y * w + x];
+		colMean[x] = (float)(colSum / h);
+	}
 
 	// 3) [0..8] global luma stats
 	features[0] = (float)((double)max_bin / 65535.0);
@@ -273,6 +282,19 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 	}
 	features[85] = (float)top_bars / h;
 	features[86] = (float)bottom_bars / h;
+	// Pillarbox detection, same absolute near-black rule as the row means.
+	// Deliberately kept OUT of features[85]/[86]: those two slots are the
+	// trained top/bottom bar contract. MLBarBounds carries the side bounds for
+	// NLS and the repaint/debug paths.
+	int left_bars = 0, right_bars = 0;
+	for (int x = 0; x < w; x++) {
+		if (colMean[x] < bar_threshold) left_bars = x + 1; else break;
+	}
+	for (int x = w - 1; x >= 0; x--) {
+		if (colMean[x] < bar_threshold) right_bars = w - x; else break;
+	}
+	const int contentLeft = left_bars;
+	const int contentRight = w - 1 - right_bars;
 
 	// The noise-robust scene peak that drives the Hable ANCHOR — measured over the
 	// CONTENT rows only, so player graphics in the letterbox bars cannot move it.
@@ -415,6 +437,8 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 	if (bars) {
 		bars->contentTop = contentTop;
 		bars->contentBottom = contentBottom;
+		bars->contentLeft = (contentRight >= contentLeft) ? contentLeft : 0;
+		bars->contentRight = (contentRight >= contentLeft) ? contentRight : -1;
 		bars->threshold = kCropLimit;
 	}
 
