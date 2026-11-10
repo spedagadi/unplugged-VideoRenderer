@@ -582,6 +582,12 @@ private:
 	// the PQ-coded average (m_PeakAvgPq) decodes to a fraction of a nit and cannot be
 	// used for exposure at all.
 	float m_MLMeanNitsRaw = 0.0f;
+	// Trimmed mean over the LOWER HALF of the content distribution. A large
+	// white background lives in the top half; the scene decision must follow
+	// the light on the subject, not the wall. Kept separate from the raw mean,
+	// which the DBLE trigger and the model features still use.
+	float m_MLMeanNitsRobust = 0.0f;
+	float m_MeanNitsRobustSmooth = -1.0f;
 	float m_MeanNitsSmooth = -1.0f;
 	// Running max of the smoothed scene mean over the title: the exposure is solved
 	// from the brightest scene, which is how the per-title hand value was always
@@ -865,6 +871,16 @@ private:
 	// Statistics
 	CD3D11Rectangle m_StatsBackground;
 	CD3D11Font      m_Font3D;
+	CD3D11Font      m_DbleFont;      // DBLE on-screen overlay (own size, not the stats font)
+	UINT            m_dbleFontH = 0;
+	// DBLEFix measurement pass: the finished SDR picture at 128x72 cells, read
+	// two frames later through a 3-texture staging ring. Same design as the
+	// contributed DbleFix.h, but the roll-off itself stays in the final pass.
+	CComPtr<ID3D11PixelShader> m_pPSDbleMeasure;
+	CComPtr<ID3D11Buffer>      m_pCBDbleMeasure;
+	CComPtr<ID3D11Texture2D>   m_pDbleMeasure;
+	CComPtr<ID3D11Texture2D>   m_pDbleStaging[3];
+	UINT m_dbleFrame = 0;
 	CD3D11Rectangle m_Rect3D;
 	CD3D11Rectangle m_Underlay;
 	CD3D11Lines     m_Lines;
@@ -1015,6 +1031,16 @@ private:
 	// decides the extractor's luma domain, the ML passes' input domain, and which
 	// shader SetShaderLuminanceParams feeds.
 	bool IsPqToSdrSelected() const;
+
+	// True when the final pass must convert the display transfer. Follow source
+	// (5) is pass-through; HDR->SDR at 2.2 is already the tone map's native code.
+	bool DisplayTransferActive() const;
+	// Display black normalized to display white, for BT.1886's encode.
+	float DisplayBlackNorm() const;
+	// SDR primaries conversion. Source: 0=BT.709 (601 treated as 709),
+	// 1=BT.2020. The HDR tone map does its own conversion.
+	bool GamutTransferActive() const;
+	int  SourceGamutId() const;
 
 	// Which luma domain each consumer's texture is actually in. TWO predicates,
 	// deliberately — they read DIFFERENT textures, and one flag cannot be right
@@ -1206,6 +1232,11 @@ private:
 	void UpdateStatsStatic() override;
 	//void UpdateStatsPostProc();
 	HRESULT DrawStats(ID3D11Texture2D* pRenderTarget);
+	void DrawDbleOverlay(ID3D11Texture2D* pRenderTarget);
+	HRESULT InitDbleMeasure();
+	void ReleaseDbleMeasure();
+	void MeasureDblePicture(const Tex2D_t& Tex, const CRect& srcRect);
+	void ReadDbleMeasurement();
 
 public:
 	// IMFVideoProcessor

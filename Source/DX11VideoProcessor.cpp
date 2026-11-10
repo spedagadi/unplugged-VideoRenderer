@@ -412,6 +412,15 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_iHdrOsdBrightness    = config.iHdrOsdBrightness;
 	m_bConvertToSdr        = config.bConvertToSdr;
 	m_iSDRDisplayNits      = config.iSDRDisplayNits;
+	m_iDisplayTransfer    = config.iDisplayTransfer;
+	m_bDbleEnabled        = config.bDbleEnabled;
+	m_fDbleStrength       = config.fDbleStrength;
+	m_fDbleTriggerPct     = config.fDbleTriggerPct;
+	m_fDbleKnee           = config.fDbleKnee;
+	m_iDbleView           = config.iDbleView;
+	m_bDbleOsdEnabled     = config.bDbleOsd;
+	m_bDbleOsdPinned      = config.bDbleOsdPinned;
+	m_iDbleOsdSelected    = config.iDbleOsdSelected;
 	m_fHdrDisplayMinNits   = config.fHdrDisplayMinNits;
 	m_fHdrTitlePeakNits    = config.fHdrTitlePeakNits;
 	m_fHdrHableKnee        = config.fHdrHableKnee;
@@ -836,6 +845,9 @@ void CDX11VideoProcessor::ReleaseDevice()
 
 	m_StatsBackground.InvalidateDeviceObjects();
 	m_Font3D.InvalidateDeviceObjects();
+	m_DbleFont.InvalidateDeviceObjects();
+	m_dbleFontH = 0;
+	ReleaseDbleMeasure();
 	m_Rect3D.InvalidateDeviceObjects();
 
 	m_Underlay.InvalidateDeviceObjects();
@@ -1342,6 +1354,50 @@ bool CDX11VideoProcessor::IsPqToSdrSelected() const
 	return (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084)
 		&& !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping))
 		&& m_bConvertToSdr;
+}
+
+bool CDX11VideoProcessor::DisplayTransferActive() const
+{
+	// Follow source keeps 2.1.0's behaviour for BOTH SDR and HDR->SDR.
+	if (m_iDisplayTransfer == 5) return false;
+	// Raw passthrough is PQ/HLG to the display; there is no SDR code to convert.
+	if (m_bHDRPassthroughRaw) return false;
+
+	const bool hdrToSdr = IsPqToSdrSelected()
+		|| (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG
+			&& m_bConvertToSdr
+			&& !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)));
+	// The tone mapper emits 2.2 code; asking for 2.2 there is identity.
+	if (hdrToSdr && m_iDisplayTransfer == 0) return false;
+	return true;
+}
+
+float CDX11VideoProcessor::DisplayBlackNorm() const
+{
+	const float white = (float)std::max(m_iSDRDisplayNits, 1);
+	return std::clamp(m_fHdrDisplayMinNits / white, 0.0f, 0.99f);
+}
+
+int CDX11VideoProcessor::SourceGamutId() const
+{
+	// DXVA2/MF extended-format primaries: BT.2020 = 9, BT.709 = 2, BT.601 = 6.
+	// 601 SDR is treated as 709 for the matrix; the triangles are close and the
+	// alternative is another matrix that no measurement has asked for.
+	if (m_srcExFmt.VideoPrimaries == 9) return 1;
+	return 0;
+}
+
+bool CDX11VideoProcessor::GamutTransferActive() const
+{
+	if (m_iOutputGamut == 3) return false;   // follow source
+	if (m_bHDRPassthroughRaw) return false;
+	const bool toneMapped = IsPqToSdrSelected()
+		|| (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG
+			&& m_bConvertToSdr
+			&& !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)));
+	// On the HDR path the tone-map shader has already selected 709/2020/P3.
+	if (toneMapped) return false;
+	return SourceGamutId() != m_iOutputGamut;
 }
 
 bool CDX11VideoProcessor::MLFeatureDomainIsPq() const
@@ -2860,7 +2916,7 @@ void CDX11VideoProcessor::SetMLParams()
 	// 90% there. On screen the cut lands, the picture is dim, and the exposure walks
 	// up under it. A cut is a frame being REPLACED â€” it is the one event none of the
 	// smoothing rules below was written to survive.
-	const bool cutNow = m_bSceneCut;
+	const bool cutNow = m_bSceneCut && !m_bSceneSame;
 
 	// Micro-contrast texture gate: IIR-filter the raw texture energy, snapping
 	// on the same scene-jump anchor as the gamma filter (features[0] = maxscl).
@@ -3283,6 +3339,24 @@ void CDX11VideoProcessor::SetMLParams()
 		}
 	}
 
+	// HOLD the model's grade across same-light cuts. The features are whole-frame,
+	// so a white background that changes framing moves gamma/shadow/rolloff even
+	// though the light on the actor has not. The scene decision already holds the
+	// exposure; the model outputs must obey it too. A genuine new light (same=0)
+	// updates the stored values; a matched angle keeps them.
+	{
+		static float s_gradeGamma = 1.0f, s_gradeShadow = 0.0f, s_gradeRolloff = 0.0f;
+		if (m_bSceneSame) {
+			gamma   = s_gradeGamma;
+			shadow  = s_gradeShadow;
+			rolloff = s_gradeRolloff;
+		} else {
+			s_gradeGamma   = gamma;
+			s_gradeShadow  = shadow;
+			s_gradeRolloff = rolloff;
+		}
+	}
+
 	MLParams_t params = {
 		// base + correction: the model's judgement is the prior, the solve is the
 		// closed loop on top. Replacing the model gamma outright deleted its lift on
@@ -3499,7 +3573,7 @@ void CDX11VideoProcessor::ExtractMLFeatures()
 	// over in _gt7probe/curve_solve.cpp. Passing it here rather than reconstructing the
 	// distribution from features[3..8] is deliberate: those six percentiles exclude the
 	// lower half, which is where the delivered mean is actually made.
-	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain, &m_MLBarDetected, &m_MLRawTexture, &m_MLPeakPq995, &m_MLActiveFrac, &m_MLMeanNitsRaw, m_MLQuantiles);
+	BuildMLFeatures((const uint16_t*)mr.pData, (int)(mr.RowPitch / sizeof(uint16_t)), m_MLFeatures, domain, &m_MLBarDetected, &m_MLRawTexture, &m_MLPeakPq995, &m_MLActiveFrac, &m_MLMeanNitsRaw, &m_MLMeanNitsRobust, m_MLQuantiles);
 	m_pDeviceContext->Unmap(m_MLStaging, 0);
 
 	if (m_bMLDebug && m_pMLDebugFile) {
@@ -5262,9 +5336,10 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 	BufferDesc = { sizeof(FLOAT) * 4, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
 	EXECUTE_ASSERT(S_OK == m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pHalfOUtoInterlaceConstantBuffer));
 
-	// 8 floats: [0..1] dither coord scale, [2] cube LUT enabled, [3] cube LUT size,
-	// [4] dither active. Grew from 4 when the display LUT moved into this pass.
-	BufferDesc = { sizeof(FLOAT) * 8, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+	// 32 floats: [0..16] as before, then the DBLE diagnostic view. [20] view,
+	// [21] tex width, [24..27] the picture's UV rect inside Tex, [28] measured
+	// picture %. 32 floats = 128 bytes, a multiple of 16 as D3D11 requires.
+	BufferDesc = { sizeof(FLOAT) * 32, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
 	EXECUTE_ASSERT(S_OK == m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pFinalPassConstantBuffer));
 
 	BufferDesc = { sizeof(PS_EXTSHADER_CONSTANTS), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
@@ -5287,6 +5362,10 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 
 	HRESULT hr3 = m_Font3D.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 	DLogIf(FAILED(hr3), L"m_Font3D.InitDeviceObjects() failed with error {}", HR2Str(hr3));
+	const HRESULT hrDbleFont = m_DbleFont.InitDeviceObjects(m_pDevice, m_pDeviceContext);
+	DLogIf(FAILED(hrDbleFont), L"m_DbleFont.InitDeviceObjects() failed with error {}", HR2Str(hrDbleFont));
+	const HRESULT hrDbleMeasure = InitDbleMeasure();
+	DLogIf(FAILED(hrDbleMeasure), L"InitDbleMeasure() failed with error {}", HR2Str(hrDbleMeasure));
 	if (SUCCEEDED(hr3)) {
 		hr3 = m_StatsBackground.InitDeviceObjects(m_pDevice, m_pDeviceContext);
 		hr3 = m_Rect3D.InitDeviceObjects(m_pDevice, m_pDeviceContext);
@@ -6839,11 +6918,12 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					// ratchet must not carry across it.
 					m_fRefWhiteAuto = 0.0f;
 					m_MeanNitsSmooth = m_MLMeanNitsRaw;
+					m_MeanNitsRobustSmooth = m_MLMeanNitsRobust;
 					m_MeanNitsMax = 0.0f;
 					// A fresh anchor is a fresh scene AND a fresh title: the exposure
 					// memory must not carry across it, or the next film inherits the last
 					// one's ensemble median.
-					m_fSceneMeanRef = m_MLMeanNitsRaw;
+					m_fSceneMeanRef = m_MLMeanNitsRobust;
 					m_fScenePeakMaxNits = 0.0f;
 					m_fScenePeakLockNits = 0.0f;
 					m_ShotHistIdx = 0;
@@ -7043,12 +7123,19 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					                  (demand > med * 0.5f) && (demand < med * 2.0f);
 					m_bSceneSame = same;
 					if (same) {
-						m_fSceneMeanRef = med;
+						// HOLD the scene's reference. Adopting the sliding median here
+						// made the reference walk with the ensemble (11.7 -> 16.5 ->
+						// 21.4 nits in ~3 s on The Substance) even while every shot was
+						// judged the same light. The median is only the test; the scene
+						// reference is established by the light change and stays put.
+						if (m_fSceneMeanRef <= 0.0f) m_fSceneMeanRef = med;
 					} else {
 						m_fSceneMeanRef = demand;
 						m_nCluster = 0;          // a real change ends any cluster
 					}
 				};
+
+				const float refBeforeCut = m_fSceneMeanRef;
 
 				if (sceneCut) {
 					m_bSceneCut = true;
@@ -7062,6 +7149,7 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					m_PeakAvgPq = avgPq;
 					m_PeakMaxPq = maxPq;
 					m_MeanNitsSmooth = m_MLMeanNitsRaw;
+					m_MeanNitsRobustSmooth = m_MLMeanNitsRobust;
 
 					// A cut that lands BEFORE the previous shot reached its lock means that
 					// shot was never measured to convergence â€” which, at dialogue pacing,
@@ -7069,14 +7157,19 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					// itself the evidence: a DOP does not re-light between angles 0.7 s
 					// apart. Fold the shots into one cluster and let its median speak.
 					if (!m_SceneLocked && m_nCluster < CDX11VideoProcessor::kShotHist) {
-						m_ClusterMean[m_nCluster++] = m_MLMeanNitsRaw;
+						m_ClusterMean[m_nCluster++] = m_MLMeanNitsRobust;
 					}
 					if (m_nCluster >= 2) {
 						m_fSceneMeanRef = MedianOf(m_ClusterMean, m_nCluster);
 						m_bSceneSame = true;
 					} else {
-						decideScene(m_MLMeanNitsRaw);   // provisional: refined at lock
+						decideScene(m_MLMeanNitsRobust);   // provisional: refined at lock
 					}
+
+					// A same-light cut must not move the exposure reference, whichever
+					// path set it: the cluster median path bypassed decideScene's hold
+					// and pinned ref=21.9 against a shot demand of 3.8.
+					if (m_bSceneSame && refBeforeCut > 0.0f) m_fSceneMeanRef = refBeforeCut;
 
 					// The bands follow the SCENE, not the cut â€” see m_BandPq. This is the
 					// single change that removes the pump: while the scene holds, the
@@ -7104,6 +7197,11 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 					} else {
 						m_MeanNitsSmooth += settleCoeff * (m_MLMeanNitsRaw - m_MeanNitsSmooth);
 					}
+					if (m_MeanNitsRobustSmooth < 0.0f) {
+						m_MeanNitsRobustSmooth = m_MLMeanNitsRobust;
+					} else {
+						m_MeanNitsRobustSmooth += settleCoeff * (m_MLMeanNitsRobust - m_MeanNitsRobustSmooth);
+					}
 					// Bands converge with the anchor, but only while the scene is allowed
 					// to move â€” a held scene's bands stay held through the settle too.
 					if (!m_bSceneSame) {
@@ -7122,10 +7220,10 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 						// cut landed on. Record it, and refine the provisional decision the
 						// cut made from that one frame. Locking onto frame one is how a
 						// wipe or a flare poisons a scene for its entire duration.
-						m_ShotMeanNits[m_ShotHistIdx] = m_MeanNitsSmooth;
+						m_ShotMeanNits[m_ShotHistIdx] = m_MeanNitsRobustSmooth;
 						m_ShotHistIdx = (m_ShotHistIdx + 1) % (int)kShotHist;
 						if (m_ShotHistN < (int)kShotHist) ++m_ShotHistN;
-						decideScene(m_MeanNitsSmooth);
+						decideScene(m_MeanNitsRobustSmooth);
 						m_nCluster = 0;
 					}
 				}
@@ -7143,10 +7241,11 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// strobe reads as exactly that.
 				if (m_bMLDebug && m_pMLDebugFile && (sceneCut || justLocked)) {
 					fwprintf(m_pMLDebugFile,
-						L"SCENE frame=%llu ev=%s same=%d shot=%.1f ref=%.1f med=%.1f hist=%d "
+						L"SCENE frame=%llu ev=%s same=%d shot=%.1f raw=%.1f ref=%.1f med=%.1f hist=%d "
 						L"clus=%d anchorPk=%.0f maxPk=%.0f trueMax=%.0f usePk=%.0f band=%d/%d/%d\n",
-						(unsigned long long)m_MLDebugFrame, sceneCut ? "cut" : "lock",
-						(int)m_bSceneSame, (double)m_MLMeanNitsRaw, (double)m_fSceneMeanRef,
+						(unsigned long long)m_MLDebugFrame, sceneCut ? L"cut" : L"lock",
+						(int)m_bSceneSame, (double)m_MLMeanNitsRobust, (double)m_MLMeanNitsRaw,
+						(double)m_fSceneMeanRef,
 						(double)MedianOf(m_ShotMeanNits, m_ShotHistN), m_ShotHistN, m_nCluster,
 						(double)exptm::PqToLinearNits(m_PeakMaxPq), (double)m_fScenePeakMaxNits,
 						(double)exptm::PqToLinearNits(m_MLFeatures[0]), (double)m_HableScenePeakNits,
@@ -7290,10 +7389,11 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 				// rather than a creep; creeping toward the live mean is exactly the pump
 				// the lock exists to prevent, and 35% is far outside anything content
 				// movement inside a fixed lighting setup produces.
-				if (m_SceneLocked && m_fSceneMeanRef > 0.0f) {
-					const float dev = fabsf(m_MLMeanNitsRaw - m_fSceneMeanRef) / m_fSceneMeanRef;
+				if (m_SceneLocked && m_fSceneMeanRef > 0.0f && !m_bSceneSame) {
+					const float demand = (m_MLMeanNitsRobust > 0.0f) ? m_MLMeanNitsRobust : m_MLMeanNitsRaw;
+						const float dev = fabsf(demand - m_fSceneMeanRef) / m_fSceneMeanRef;
 					if (dev > 0.35f) {
-						m_fSceneMeanRef = m_MLMeanNitsRaw;
+						m_fSceneMeanRef = demand;
 						m_fScenePeakLockNits = m_HableScenePeakNits;
 						memcpy(m_MLQuantilesLocked, m_MLQuantiles, sizeof(m_MLQuantilesLocked));
 					}
@@ -7551,6 +7651,12 @@ HRESULT CDX11VideoProcessor::Render(int field, const REFERENCE_TIME frameStartTi
 		hr = DrawStats(pBackBuffer);
 	}
 
+	// DBLE overlay, after the picture and the stats so it is never measured by
+	// the fix; toggled by the app's OSD row and Ctrl+Alt shortcuts.
+	if (m_bDbleOsdEnabled) {
+		DrawDbleOverlay(pBackBuffer);
+	}
+
 	if (m_bAlphaBitmapEnable) {
 		D3D11_TEXTURE2D_DESC desc;
 		pBackBuffer->GetDesc(&desc);
@@ -7713,7 +7819,7 @@ void CDX11VideoProcessor::UpdatePostScaleTexures()
 	m_bDitherActive = (m_bUseDither && needDither && m_TexDither.pTexture);
 	// A loaded calibration LUT forces the final pass even with dithering off â€”
 	// it is the last display-referred stage and nothing else can host it.
-	m_bFinalPass = m_bDitherActive || m_bCubeLutEnabled;
+	m_bFinalPass = m_bDitherActive || m_bCubeLutEnabled || DisplayTransferActive() || GamutTransferActive() || m_bDbleEnabled || m_bDbleOsdEnabled;
 	if (m_bFinalPass) {
 		m_pPSFinalPass.Release();
 		m_bFinalPass = SUCCEEDED(CreatePShaderFromResource(
@@ -8046,6 +8152,15 @@ HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRen
 		m_bDeliveredB = true;
 	}
 
+	// DBLEFix measurement: the finished SDR picture at 128x72 cells. Read the
+	// measurement taken two frames ago (a staging Map with DO_NOT_WAIT never
+	// stalls), then queue this frame's. Runs whenever the fix or its overlay is
+	// on; the trigger is independent of the ML grade.
+	if ((m_bDbleEnabled || m_bDbleOsdEnabled) && !m_bHDRPassthroughRaw) {
+		ReadDbleMeasurement();
+		MeasureDblePicture(Tex, srcRect);
+	}
+
 	CComPtr<ID3D11RenderTargetView> pRenderTargetView;
 
 	HRESULT hr = m_pDevice->CreateRenderTargetView(pRenderTarget, nullptr, &pRenderTargetView);
@@ -8059,12 +8174,110 @@ HRESULT CDX11VideoProcessor::FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRen
 		return hr;
 	}
 
-	const FLOAT constants[8] = {
+	const bool toneMapped = IsPqToSdrSelected()
+		|| (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG
+			&& m_bConvertToSdr
+			&& !(m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)));
+	float srcSpace = 0.0f;    // 0 = 2.2, the tone map's native code
+	float srcGamma = 2.2f;
+	if (!toneMapped) {
+		switch (m_srcExFmt.VideoTransferFunction) {
+		case MFVideoTransFunc_709:
+		case MFVideoTransFunc_240M:
+		case MFVideoTransFunc_2020:
+			// SDR video is display-referred through BT.1886 (decision A), not
+			// through the BT.709 OETF inverse; the OETF/1886 difference is visible
+			// as a darkening if the wrong one is used.
+			srcSpace = 1.0f;
+			break;
+		case MFVideoTransFunc_sRGB:
+			srcSpace = 2.0f;
+			break;
+		case MFVideoTransFunc_10: srcGamma = 1.0f; srcSpace = 3.0f; break;
+		case MFVideoTransFunc_18: srcGamma = 1.8f; srcSpace = 3.0f; break;
+		case MFVideoTransFunc_20: srcGamma = 2.0f; srcSpace = 3.0f; break;
+		case MFVideoTransFunc_22: srcGamma = 2.2f; srcSpace = 3.0f; break;
+		case MFVideoTransFunc_28: srcGamma = 2.8f; srcSpace = 3.0f; break;
+		default: srcSpace = 0.0f; break;
+		}
+	}
+	const bool transferConvert = DisplayTransferActive();
+	const bool gamutConvert = GamutTransferActive();
+	const bool convert = transferConvert || gamutConvert;
+	// Gamut-only (SDR, transfer Follow source): decode and re-encode with the
+	// source curve so the transfer is identity and only primaries move.
+	const float dstSpace = transferConvert ? (float)m_iDisplayTransfer : srcSpace;
+	const float gamutSrc = (float)SourceGamutId();
+	const float gamutDst = (m_iOutputGamut == 2) ? 2.0f : (m_iOutputGamut == 1 ? 1.0f : 0.0f);
+
+	// DBLE compensation. The trigger is the MEASURED brightness of the finished
+	// SDR picture, in percent of SDR white, exactly as the contributed DBLEFix
+	// does; no model or scene statistic is involved. The roll-off itself stays in
+	// target code, after the display encode in this pass.
+	bool dble = m_bDbleEnabled && !m_bHDRPassthroughRaw && m_bDbleHaveMeasure;
+	float dbleCeil = 0.0f, dbleKnee = 0.0f;
+	if (dble) {
+		const float trig = fmaxf(m_fDbleTriggerPct, 0.1f);
+		const float t = std::clamp((trig - m_fDblePicturePct) / (0.75f * trig), 0.0f, 1.0f);
+		const float amount = std::clamp(m_fDbleStrength, 0.0f, 1.0f)
+		                   * (t * t * (3.0f - 2.0f * t));
+		m_fDbleSmooth = (m_fDbleSmooth < 0.0f || m_bDbleCut) ? amount
+		              : 0.10f * amount + 0.90f * m_fDbleSmooth;
+		dbleCeil = 1.0f - 0.5f * m_fDbleSmooth;
+		dbleKnee = fminf(std::clamp(m_fDbleKnee, 0.20f, 0.95f), dbleCeil - 0.05f);
+		if (dbleCeil > 0.999f) dble = false;   // strength 0 -> identity
+	}
+	m_bDbleCut = false;   // consumed by the snap above
+	m_bDbleLastActive = dble;
+	m_fDbleLastAmount = std::max(m_fDbleSmooth, 0.0f);
+	m_fDbleLastCeil   = dbleCeil;
+	m_fDbleLastKnee   = dbleKnee;
+
+	// DBLE instrument: one line every 2 s while the feature is enabled, so a
+	// validation run can say whether it acted instead of guessing from the
+	// picture. Written by the renderer's always-on trace to mpcvr_trace.log
+	// beside the .ax; the engine's renderer sink is disabled in the app.
+	static ULONGLONG s_dbleTrace = 0;
+	const ULONGLONG dbleNow = GetTickCount64();
+	if (m_bDbleEnabled && dbleNow - s_dbleTrace >= 2000) {
+		s_dbleTrace = dbleNow;
+		char line[224];
+		snprintf(line, sizeof(line),
+			"[DBLE] active=%d picture=%.3f%% smooth=%.3f ceil=%.3f knee=%.3f trig=%.2f%% str=%.2f clip=%.4f",
+			dble ? 1 : 0, (double)m_fDblePicturePct, (double)m_fDbleSmooth,
+			(double)dbleCeil, (double)dbleKnee,
+			(double)m_fDbleTriggerPct, (double)m_fDbleStrength, (double)m_fDbleClipFrac);
+		mpcvr::TraceLog(line);
+	}
+
+	// The picture's UV rect inside Tex, for the Split view's divider and halves.
+	const float srcMapX = Tex.desc.Width  ? (float)srcRect.left    / Tex.desc.Width  : 0.0f;
+	const float srcMapY = Tex.desc.Height ? (float)srcRect.top     / Tex.desc.Height : 0.0f;
+	const float srcMapW = Tex.desc.Width  ? (float)srcRect.Width() / Tex.desc.Width  : 1.0f;
+	const float srcMapH = Tex.desc.Height ? (float)srcRect.Height()/ Tex.desc.Height : 1.0f;
+
+	const FLOAT constants[32] = {
 		(float)Tex.desc.Width / dither_size, (float)Tex.desc.Height / dither_size,
 		m_bCubeLutEnabled ? 1.0f : 0.0f, (float)m_iCubeLutSize,
 		m_bDitherActive ? 1.0f : 0.0f,
 		(float)m_iCubeLutMode,
-		0, 0
+		convert ? 1.0f : 0.0f,
+		dble ? 1.0f : 0.0f,
+		srcSpace,
+		dstSpace,
+		DisplayBlackNorm(),
+		srcGamma,
+		dbleCeil, dbleKnee,
+		gamutConvert ? 1.0f : 0.0f,
+		gamutSrc,
+		gamutDst,
+		0, 0, 0,
+		(float)std::clamp(m_iDbleView, 0, 2),
+		(float)Tex.desc.Width,
+		0, 0,
+		srcMapX, srcMapY, srcMapW, srcMapH,
+		m_fDblePicturePct,
+		0, 0, 0
 	};
 	D3D11_MAPPED_SUBRESOURCE mr;
 	hr = m_pDeviceContext->Map(m_pFinalPassConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr);
@@ -9333,6 +9546,9 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 
 	if (config.iOutputGamut != m_iOutputGamut) {
 		m_iOutputGamut = config.iOutputGamut;
+		// The SDR primaries conversion lives in the final pass; create or remove
+		// it here. On the HDR path the tone-map cbuffer is refreshed below.
+		changeNumTextures = true;
 		// Read from the correction shader's constant buffer, so it needs the SAME
 		// update mechanism as iSDRDisplayNits just below â€” changeLuminanceParams
 		// -> SetShaderLuminanceParams(). NOT changeConvertShader: that flag
@@ -9342,6 +9558,38 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 			changeLuminanceParams = true;
 		}
 	}
+
+	if (config.iDisplayTransfer != m_iDisplayTransfer) {
+		m_iDisplayTransfer = config.iDisplayTransfer;
+		// The transfer lives in the final pass, whose existence and shader are
+		// decided in UpdatePostScaleTexures(). Recreate the post-scale ring so a
+		// switch out of Follow source creates the pass instead of silently
+		// leaving the setting inert.
+		changeNumTextures = true;
+	}
+
+	if (config.bDbleEnabled != m_bDbleEnabled) {
+		m_bDbleEnabled = config.bDbleEnabled;
+		// DBLE also lives in the final pass; toggling it must create/remove it.
+		changeNumTextures = true;
+		m_fDbleSmooth = -1.0f;
+	}
+	m_fDbleStrength    = config.fDbleStrength;
+	m_fDbleTriggerPct  = config.fDbleTriggerPct;
+	m_fDbleKnee        = config.fDbleKnee;
+	m_iDbleView        = config.iDbleView;
+	// The OSD can be the only reason the final pass (and the measurement) runs,
+	// so a toggle must create/remove the ring just like the fix itself.
+	if (config.bDbleOsd != m_bDbleOsdEnabled) {
+		m_bDbleOsdEnabled = config.bDbleOsd;
+		changeNumTextures = true;
+	}
+	m_bDbleOsdPinned   = config.bDbleOsdPinned;
+	m_iDbleOsdSelected = config.iDbleOsdSelected;
+	m_iDbleOsdX        = config.iDbleOsdX;
+	m_iDbleOsdY        = config.iDbleOsdY;
+	m_iDbleOsdW        = config.iDbleOsdW;
+	m_iDbleOsdH        = config.iDbleOsdH;
 
 	if (config.fHdrDisplayMinNits != m_fHdrDisplayMinNits) {
 		m_fHdrDisplayMinNits = config.fHdrDisplayMinNits;
@@ -10136,6 +10384,317 @@ void CDX11VideoProcessor::UpdateStatsPostProc()
 	}
 }
 */
+
+// DBLEFix measurement shader. Ported from the contributed DbleFix.h: each
+// output cell is the mean of 64 samples (8x8) of the finished SDR picture,
+// with the linear-light weight; the second channel is the cell's brightest
+// sample, which is what finds the picture inside letterbox bars and detects
+// clipping. It writes to a 128x72 R16G16B16A16_FLOAT target.
+static const char kDbleMeasureHLSL[] = R"HLSL(
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+
+cbuffer DbleMeasure : register(b0)
+{
+	float2 CellUV;
+	float2 pad0;
+};
+
+struct PS_INPUT
+{
+	float4 Pos : SV_POSITION;
+	float2 Tex : TEXCOORD;
+};
+
+float4 main(PS_INPUT input) : SV_Target
+{
+	const float2 origin = input.Tex - 0.5 * CellUV;
+	float sumL = 0.0;
+	float maxS = 0.0;
+	[loop]
+	for (int y = 0; y < 8; y++) {
+		[loop]
+		for (int x = 0; x < 8; x++) {
+			const float2 uv = origin + (float2(x, y) + 0.5) * (CellUV / 8.0);
+			const float3 c = saturate(tex.SampleLevel(samp, uv, 0).rgb);
+			const float3 lin = pow(c, 2.2);
+			sumL += dot(lin, float3(0.2126, 0.7152, 0.0722));
+			maxS = max(maxS, max(c.r, max(c.g, c.b)));
+		}
+	}
+	return float4(sumL / 64.0, maxS, 0.0, 1.0);
+}
+)HLSL";
+
+static float DbleHalfToFloat(uint16_t h)
+{
+	const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+	uint32_t exp = (h >> 10) & 0x1F;
+	uint32_t mant = h & 0x3FF;
+	uint32_t f;
+	if (exp == 0) {
+		if (mant == 0) {
+			f = sign;
+		} else {
+			exp = 127 - 15 + 1;
+			while (!(mant & 0x400)) { mant <<= 1; exp--; }
+			mant &= 0x3FF;
+			f = sign | (exp << 23) | (mant << 13);
+		}
+	} else if (exp == 31) {
+		f = sign | 0x7F800000 | (mant << 13);
+	} else {
+		f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+	}
+	float out;
+	memcpy(&out, &f, sizeof(out));
+	return out;
+}
+
+HRESULT CDX11VideoProcessor::InitDbleMeasure()
+{
+	ReleaseDbleMeasure();
+	if (!m_pDevice || !m_pDeviceContext) return E_FAIL;
+
+	ID3DBlob* pBlob = nullptr;
+	HRESULT hr = CompileShader(std::string(kDbleMeasureHLSL), nullptr, "ps_4_0", &pBlob);
+	if (SUCCEEDED(hr) && pBlob) {
+		hr = m_pDevice->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(),
+		                                  nullptr, &m_pPSDbleMeasure);
+	}
+	if (pBlob) pBlob->Release();
+	if (FAILED(hr)) return hr;
+
+	D3D11_BUFFER_DESC bd = {};
+	bd.ByteWidth = sizeof(FLOAT) * 4;
+	bd.Usage = D3D11_USAGE_DEFAULT;
+	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	hr = m_pDevice->CreateBuffer(&bd, nullptr, &m_pCBDbleMeasure);
+	if (FAILED(hr)) return hr;
+
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = 128;
+	td.Height = 72;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET;
+	hr = m_pDevice->CreateTexture2D(&td, nullptr, &m_pDbleMeasure);
+	if (FAILED(hr)) return hr;
+
+	td.Usage = D3D11_USAGE_STAGING;
+	td.BindFlags = 0;
+	td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	for (int i = 0; SUCCEEDED(hr) && i < 3; i++) {
+		hr = m_pDevice->CreateTexture2D(&td, nullptr, &m_pDbleStaging[i]);
+	}
+	if (FAILED(hr)) return hr;
+
+	m_dbleFrame = 0;
+	m_bDbleHaveMeasure = false;
+	m_bDbleCut = false;
+	m_fDbleSmooth = -1.0f;
+	return S_OK;
+}
+
+void CDX11VideoProcessor::ReleaseDbleMeasure()
+{
+	m_pPSDbleMeasure.Release();
+	m_pCBDbleMeasure.Release();
+	m_pDbleMeasure.Release();
+	for (auto& s : m_pDbleStaging) s.Release();
+	m_dbleFrame = 0;
+	m_bDbleHaveMeasure = false;
+}
+
+void CDX11VideoProcessor::MeasureDblePicture(const Tex2D_t& Tex, const CRect& srcRect)
+{
+	if (!m_pPSDbleMeasure || !m_pCBDbleMeasure || !m_pDbleMeasure || !m_pDbleStaging[2]) return;
+	if (!Tex.desc.Width || !Tex.desc.Height || srcRect.Width() <= 0 || srcRect.Height() <= 0) return;
+
+	const FLOAT cb[4] = {
+		(float)srcRect.Width()  / Tex.desc.Width  / 128.0f,
+		(float)srcRect.Height() / Tex.desc.Height / 72.0f,
+		0.0f, 0.0f
+	};
+	m_pDeviceContext->UpdateSubresource(m_pCBDbleMeasure, 0, nullptr, cb, 0, 0);
+
+	const HRESULT hr = TextureCopyRect(Tex, m_pDbleMeasure, srcRect,
+	                                   CRect(0, 0, 128, 72), m_pPSDbleMeasure,
+	                                   m_pCBDbleMeasure, 0, false);
+	if (FAILED(hr)) return;
+
+	// Queue for reading two frames from now; the ring is what keeps the Map
+	// below from ever waiting on the GPU.
+	m_pDeviceContext->CopyResource(m_pDbleStaging[m_dbleFrame % 3], m_pDbleMeasure);
+	m_dbleFrame++;
+}
+
+void CDX11VideoProcessor::ReadDbleMeasurement()
+{
+	if (m_dbleFrame < 2) return;
+	ID3D11Texture2D* pStaging = m_pDbleStaging[(m_dbleFrame + 1) % 3];
+	if (!pStaging) return;
+
+	D3D11_MAPPED_SUBRESOURCE mr = {};
+	if (FAILED(m_pDeviceContext->Map(pStaging, 0, D3D11_MAP_READ,
+	                                 D3D11_MAP_FLAG_DO_NOT_WAIT, &mr))) {
+		return;   // not finished yet (or failed): keep the last values
+	}
+
+	const float kContent = 0.04f;   // a cell brighter than this is picture, not a bar
+	bool rowHas[72] = {};
+	bool colHas[128] = {};
+	auto cell = [&](UINT x, UINT y, int ch) {
+		const uint16_t* row = (const uint16_t*)((const uint8_t*)mr.pData + (size_t)y * mr.RowPitch);
+		return DbleHalfToFloat(row[x * 4 + ch]);
+	};
+	for (UINT y = 0; y < 72; y++) {
+		for (UINT x = 0; x < 128; x++) {
+			if (cell(x, y, 1) > kContent) { rowHas[y] = true; colHas[x] = true; }
+		}
+	}
+	int y0 = 0, y1 = 71, x0 = 0, x1 = 127;
+	while (y0 < 72 && !rowHas[y0]) y0++;
+	while (y1 >= 0 && !rowHas[y1]) y1--;
+	while (x0 < 128 && !colHas[x0]) x0++;
+	while (x1 >= 0 && !colHas[x1]) x1--;
+
+	double sum = 0.0;
+	int n = 0, clipped = 0;
+	if (y0 <= y1 && x0 <= x1) {
+		for (int y = y0; y <= y1; y++) {
+			for (int x = x0; x <= x1; x++) {
+				sum += cell(x, y, 0);
+				if (cell(x, y, 1) >= 0.995f) clipped++;
+				n++;
+			}
+		}
+		m_fDbleBottomBarFrac = (float)(71 - y1) / 72.0f;
+	} else {
+		m_fDbleBottomBarFrac = 0.0f;   // black frame: no picture to measure
+	}
+	m_pDeviceContext->Unmap(pStaging, 0);
+
+	const float pic = n ? (float)(sum / n * 100.0) : 0.0f;
+	// Scene cut: the measured brightness jumps by 2x or more. Snap instead of
+	// easing in; this is the contributed DBLEFix cut detector and needs no model.
+	if (m_bDbleHaveMeasure && std::max(pic, m_fDblePicturePct) > 0.2f
+		&& (pic > m_fDblePicturePct * 2.0f || pic < m_fDblePicturePct * 0.5f)) {
+		m_bDbleCut = true;
+	}
+	m_fDblePicturePct = pic;
+	m_fDbleClipFrac = n ? (float)clipped / (float)n : 0.0f;
+	m_bDbleHaveMeasure = true;
+}
+
+// The contributed DBLEFix overlay: its header, six setting rows with the
+// selected one marked, the measured status line, and the Clipping-test legend.
+// White text: the contributor's own DbleFix.h used dim grey (118 selected, 76
+// otherwise) for a quiet setup readout, but this app's overlay must be legible,
+// so every line is white and the '>' marker carries the selection.
+// Sits in the bottom letterbox bar when there is room, otherwise at the bottom
+// left of the picture. Drawn on the back buffer after the video and the stats,
+// so it is never measured by the fix.
+void CDX11VideoProcessor::DrawDbleOverlay(ID3D11Texture2D* pRenderTarget)
+{
+	if (!m_bDbleOsdEnabled || !m_pDevice || m_windowRect.IsRectEmpty()) return;
+	const SIZE rtSize = m_windowRect.Size();
+	const UINT fontH = (UINT)std::max(14, (int)rtSize.cy / 68);
+	if (fontH != m_dbleFontH) {
+		if (FAILED(m_DbleFont.CreateFontBitmap(L"Consolas", fontH, 0))) return;
+		m_dbleFontH = fontH;
+	}
+	const SIZE ch = m_DbleFont.GetMaxCharMetric();
+	if (ch.cy <= 0) return;
+
+	static const wchar_t* views[] = { L"Normal", L"Clipping test", L"Split screen" };
+	static const wchar_t* names[] = { L"Fix", L"Strength", L"Trigger", L"Highlight start", L"View", L"Overlay" };
+	wchar_t v[6][48] = {};
+	swprintf_s(v[0], L"%ls", m_bDbleEnabled ? L"On" : L"Off");
+	swprintf_s(v[1], L"%.2f", (double)m_fDbleStrength);
+	swprintf_s(v[2], L"%.1f %%", (double)m_fDbleTriggerPct);
+	swprintf_s(v[3], L"%.2f", (double)m_fDbleKnee);
+	swprintf_s(v[4], L"%ls", views[std::clamp(m_iDbleView, 0, 2)]);
+	swprintf_s(v[5], L"%ls", m_bDbleOsdPinned ? L"Always" : L"Auto-hide");
+
+	struct Line { std::wstring text; bool selected; };
+	std::vector<Line> lines;
+	lines.reserve(10);
+	lines.push_back({ L"DBLEFix   Ctrl+Alt+arrows adjust, Ctrl+Alt+0 hide", false });
+	for (int i = 0; i < 6; i++) {
+		wchar_t buf[112];
+		swprintf_s(buf, L"%ls %-16ls %ls", (i == m_iDbleOsdSelected) ? L">" : L" ",
+		           names[i], v[i]);
+		lines.push_back({ buf, i == m_iDbleOsdSelected });
+	}
+
+	wchar_t st[192];
+	if (m_bHDRPassthroughRaw) {
+		swprintf_s(st, L"HDR output: the fix needs SDR output");
+	} else if (!m_bDbleHaveMeasure) {
+		swprintf_s(st, L"Measuring...");
+	} else {
+		const float scene = (m_MLMeanNitsRaw > 0.0f) ? m_MLMeanNitsRaw : -1.0f;
+		if (scene >= 0.0f) {
+			swprintf_s(st, L"Picture %.1f%%  Fix %.0f%%  White %.0f%%  Scene %.2f nits",
+			           (double)m_fDblePicturePct, (double)std::max(m_fDbleSmooth, 0.0f) * 100.0,
+			           (double)m_fDbleLastCeil * 100.0, (double)scene);
+		} else {
+			swprintf_s(st, L"Picture %.1f%%  Fix %.0f%%  White %.0f%%",
+			           (double)m_fDblePicturePct, (double)std::max(m_fDbleSmooth, 0.0f) * 100.0,
+			           (double)m_fDbleLastCeil * 100.0);
+		}
+	}
+	lines.push_back({ st, false });
+	if (m_iDbleView == 1) {
+		lines.push_back({ L"Green fixable   Red clipped in video   Blue lowered by fix", false });
+	}
+
+	// The overlay is LOCKED to the bottom-left of the app's VIDEO SAFE AREA.
+	// The app sends the rect the chrome does not cover (status rail on the left,
+	// settings rail on the right, transport bar at the bottom); when a panel
+	// opens, Layout recomputes it and the overlay moves with it in one frame.
+	// With no rect (zero size) it falls back to the whole window.
+	const int lineH = (int)ch.cy;
+	const int textH = lineH * (int)lines.size();
+	const int margin = std::max(8, lineH / 2);
+	int safeL = 0, safeB = (int)rtSize.cy;
+	if (m_iDbleOsdW > 0 && m_iDbleOsdH > 0) {
+		safeL = m_iDbleOsdX;
+		safeB = m_iDbleOsdY + m_iDbleOsdH;
+	}
+	safeL = std::clamp(safeL, 0, std::max(0, (int)rtSize.cx));
+	safeB = std::clamp(safeB, 0, (int)rtSize.cy);
+	const int x = safeL + 2 * margin;
+	int y = safeB - textH - margin;
+	y = std::clamp(y, 0, std::max(0, (int)rtSize.cy - textH));
+
+	// Instrument: the overlay must be LOCKED in place. This line proves y does
+	// not move (bar is kept only as a reference; placement no longer uses it).
+	static ULONGLONG s_osdTrace = 0;
+	const ULONGLONG osdNow = GetTickCount64();
+	if (osdNow - s_osdTrace >= 2000) {
+		s_osdTrace = osdNow;
+		char line[220];
+		snprintf(line, sizeof(line),
+			"[DBLE-OSD] win=%dx%d safe=(%d,%d,%d,%d) bar=%.4f lineH=%d lines=%d y=%d",
+			(int)rtSize.cx, (int)rtSize.cy,
+			m_iDbleOsdX, m_iDbleOsdY, m_iDbleOsdW, m_iDbleOsdH,
+			(double)m_fDbleBottomBarFrac, lineH, (int)lines.size(), y);
+		mpcvr::TraceLog(line);
+	}
+
+	CComPtr<ID3D11RenderTargetView> pRTV;
+	if (FAILED(m_pDevice->CreateRenderTargetView(pRenderTarget, nullptr, &pRTV))) return;
+	for (size_t i = 0; i < lines.size(); i++) {
+		const D3DCOLOR col = D3DCOLOR_XRGB(255, 255, 255);
+		m_DbleFont.Draw2DText(pRTV, rtSize, (float)x, (float)(y + (int)i * lineH),
+		                      col, lines[i].text.c_str());
+	}
+}
 
 HRESULT CDX11VideoProcessor::DrawStats(ID3D11Texture2D* pRenderTarget)
 {

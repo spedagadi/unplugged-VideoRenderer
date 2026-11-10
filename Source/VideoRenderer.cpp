@@ -82,6 +82,17 @@
 // DWORD like its neighbours, and 1/1000 nit is ample resolution for a black level.
 #define OPT_HdrDisplayMinNits              L"HdrDisplayMinNits"
 #define OPT_OutputGamut                    L"OutputGamut"
+// Final display-referred encode: 0=2.2, 1=2.4, 2=BT.1886, 3=sRGB, 4=2.0,
+// 5=follow source (the 2.1.0 pass-through).
+#define OPT_DisplayTransfer                L"DisplayTransfer"
+// DBLE compensation. Strength/trigger/knee are stored as MILLI-units in a
+// DWORD like the other fractional settings.
+#define OPT_DbleEnabled                    L"DbleEnabled"
+#define OPT_DbleStrength                   L"DbleStrength"
+#define OPT_DbleTriggerPct                 L"DbleTriggerPct"
+#define OPT_DbleKnee                       L"DbleKnee"
+#define OPT_DbleView                       L"DbleView"
+#define OPT_DbleOsd                        L"DbleOsd"
 // Content peak, nits (the top of the range the tone curves map FROM), stored as
 // MILLINITS in a DWORD like HdrDisplayMinNits. Distinct from HdrDisplayNits, which
 // is the DISPLAY's peak.
@@ -444,7 +455,28 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 			m_Sets.fHdrDisplayMinNits = discard<float>((float)dw / 1000.0f, 0.0f, 0.0f, (float)HDR_NITS_MIN);
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_OutputGamut, dw)) {
-			m_Sets.iOutputGamut = discard<int>(dw, 0, 0, 1);
+			m_Sets.iOutputGamut = discard<int>(dw, 0, 0, 3);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DisplayTransfer, dw)) {
+			m_Sets.iDisplayTransfer = discard<int>(dw, 5, 0, 5);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleEnabled, dw)) {
+			m_Sets.bDbleEnabled = !!dw;
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleStrength, dw)) {
+			m_Sets.fDbleStrength = discard<float>((float)dw / 1000.0f, 1.0f, 0.0f, 1.0f);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleTriggerPct, dw)) {
+			m_Sets.fDbleTriggerPct = discard<float>((float)dw / 1000.0f, 5.0f, 0.5f, 30.0f);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleKnee, dw)) {
+			m_Sets.fDbleKnee = discard<float>((float)dw / 1000.0f, 0.30f, 0.20f, 0.95f);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleView, dw)) {
+			m_Sets.iDbleView = discard<int>(dw, 0, 0, 2);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DbleOsd, dw)) {
+			m_Sets.bDbleOsd = !!dw;
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrTitlePeakNits, dw)) {
 			m_Sets.fHdrTitlePeakNits = discard<float>((float)dw / 1000.0f, 1000.0f, 100.0f, 4000.0f);
@@ -2267,6 +2299,13 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 		key.SetDWORDValue(OPT_HdrDisplayNits,      m_Sets.iHdrDisplayMaxNits);
 		key.SetDWORDValue(OPT_HdrDisplayMinNits,   (DWORD)(m_Sets.fHdrDisplayMinNits * 1000.0f + 0.5f));
 		key.SetDWORDValue(OPT_OutputGamut,         m_Sets.iOutputGamut);
+		key.SetDWORDValue(OPT_DisplayTransfer,     m_Sets.iDisplayTransfer);
+		key.SetDWORDValue(OPT_DbleEnabled,         m_Sets.bDbleEnabled);
+		key.SetDWORDValue(OPT_DbleStrength,        (DWORD)(m_Sets.fDbleStrength * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_DbleTriggerPct,      (DWORD)(m_Sets.fDbleTriggerPct * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_DbleKnee,            (DWORD)(m_Sets.fDbleKnee * 1000.0f + 0.5f));
+		key.SetDWORDValue(OPT_DbleView,            m_Sets.iDbleView);
+		key.SetDWORDValue(OPT_DbleOsd,             m_Sets.bDbleOsd);
 		key.SetDWORDValue(OPT_HdrTitlePeakNits,    (DWORD)(m_Sets.fHdrTitlePeakNits * 1000.0f + 0.5f));
 		key.SetDWORDValue(OPT_ExperimentalToneMapper, m_Sets.iExperimentalToneMapper);
 		key.SetDWORDValue(OPT_ToneLutContrast,     (DWORD)(m_Sets.fToneLutContrast * 1000.0f + 0.5f));

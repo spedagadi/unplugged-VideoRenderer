@@ -351,6 +351,15 @@ float4 main(PS_INPUT input) : SV_Target
                 color.rgb = Colorspace_Gamut_Constrain(color.rgb,
                                                        (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
+        else if (outputGamut > 1.5 && outputGamut < 2.5) {
+            // DCI-P3 (D65). The 709 capacity pull is fitted to the 709 triangle,
+            // so it is deliberately not applied here; out-of-P3 colours clip at
+            // the P3 triangle. A P3-specific capacity curve needs its own
+            // measurements before it can be a dial.
+            color.rgb = saturate(Colorspace_Gamut_Conversion_2020_to_P3(color.rgb));
+        }
+        // outputGamut 1 (BT.2020) and 3 (follow source on HDR) keep the source
+        // primaries; the display must be set to match.
         // Nothing after the gamut step: the taste operators and their debug views
         // now live in the taste stage, which runs after the grade.
     }
@@ -606,6 +615,15 @@ float4 main(PS_INPUT input) : SV_Target
                 color.rgb = Colorspace_Gamut_Constrain(color.rgb,
                                                        (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
+        else if (outputGamut > 1.5 && outputGamut < 2.5) {
+            // DCI-P3 (D65). The 709 capacity pull is fitted to the 709 triangle,
+            // so it is deliberately not applied here; out-of-P3 colours clip at
+            // the P3 triangle. A P3-specific capacity curve needs its own
+            // measurements before it can be a dial.
+            color.rgb = saturate(Colorspace_Gamut_Conversion_2020_to_P3(color.rgb));
+        }
+        // outputGamut 1 (BT.2020) and 3 (follow source on HDR) keep the source
+        // primaries; the display must be set to match.
     }
     // ---------------------------------------------------------------------
     // 11 = DYNAMIC & AUTO. One solved transfer function replaces the whole
@@ -680,6 +698,15 @@ float4 main(PS_INPUT input) : SV_Target
                 color.rgb = Colorspace_Gamut_Constrain(color.rgb,
                                                        (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
+        else if (outputGamut > 1.5 && outputGamut < 2.5) {
+            // DCI-P3 (D65). The 709 capacity pull is fitted to the 709 triangle,
+            // so it is deliberately not applied here; out-of-P3 colours clip at
+            // the P3 triangle. A P3-specific capacity curve needs its own
+            // measurements before it can be a dial.
+            color.rgb = saturate(Colorspace_Gamut_Conversion_2020_to_P3(color.rgb));
+        }
+        // outputGamut 1 (BT.2020) and 3 (follow source on HDR) keep the source
+        // primaries; the display must be set to match.
     }
     else {
         float sdrNits = 10000.0 / max(LuminanceScale, 1e-3);
@@ -959,6 +986,15 @@ float4 main(PS_INPUT input) : SV_Target
                 color.rgb = Colorspace_Gamut_Constrain(color.rgb,
                                                        (gamutCap > 0.001f) ? gamutCap : 1.0f);
         }
+        else if (outputGamut > 1.5 && outputGamut < 2.5) {
+            // DCI-P3 (D65). The 709 capacity pull is fitted to the 709 triangle,
+            // so it is deliberately not applied here; out-of-P3 colours clip at
+            // the P3 triangle. A P3-specific capacity curve needs its own
+            // measurements before it can be a dial.
+            color.rgb = saturate(Colorspace_Gamut_Conversion_2020_to_P3(color.rgb));
+        }
+        // outputGamut 1 (BT.2020) and 3 (follow source on HDR) keep the source
+        // primaries; the display must be set to match.
     }
 
     // Linear to sRGB. Encoding stretches the shadow end, so the bottom of the

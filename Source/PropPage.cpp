@@ -137,6 +137,9 @@ const MLSliderRange kHdrSliders[] = {
 	{ IDC_SLIDER24, IDC_EDIT28, 0.0f,   1.0f,    &Settings_t::fHdrGt7Adapt },
 	{ IDC_SLIDER25, IDC_EDIT29, 0.02f,  0.90f,   &Settings_t::fHdrGt7Alpha },
 	{ IDC_SLIDER26, IDC_EDIT30, 0.0f,   1.0f,    &Settings_t::fHdrGt7Desat },
+	{ IDC_SLIDER37, IDC_EDIT41, 0.0f,   1.0f,    &Settings_t::fDbleStrength },
+	{ IDC_SLIDER38, IDC_EDIT42, 0.5f,   30.0f,   &Settings_t::fDbleTriggerPct },
+	{ IDC_SLIDER39, IDC_EDIT43, 0.20f,  0.95f,   &Settings_t::fDbleKnee },
 };
 
 // Zion tab owns: the ML table above plus grade / micro contrast / segments.
@@ -861,6 +864,10 @@ void CVRHdrPPage::SetControls()
 	CheckDlgButton(IDC_CHECK36, m_SetsPP.bHdrAutoRefWhite ? BST_CHECKED : BST_UNCHECKED);
 	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO12, m_SetsPP.iOutputGamut);
 	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO13, (LONG_PTR)(int)m_SetsPP.fHdrGt7Dbg);
+	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO15, (LONG_PTR)m_SetsPP.iDisplayTransfer);
+	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO16, (LONG_PTR)m_SetsPP.iDbleView);
+	CheckDlgButton(IDC_CHECK43, m_SetsPP.bDbleEnabled ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(IDC_CHECK44, m_SetsPP.bDbleOsd ? BST_CHECKED : BST_UNCHECKED);
 
 	// Curve selection state. Ignore/Passthrough are flag-only states (the stored
 	// type keeps whatever curve was last chosen), so item data encodes them as
@@ -927,6 +934,13 @@ void CVRHdrPPage::Graft(Settings_t& dst) const
 	dst.fHdrTitlePeakNits        = m_SetsPP.fHdrTitlePeakNits;
 	dst.fHdrDisplayMinNits       = m_SetsPP.fHdrDisplayMinNits;
 	dst.iOutputGamut             = m_SetsPP.iOutputGamut;
+	dst.iDisplayTransfer         = m_SetsPP.iDisplayTransfer;
+	dst.bDbleEnabled             = m_SetsPP.bDbleEnabled;
+	dst.fDbleStrength            = m_SetsPP.fDbleStrength;
+	dst.fDbleTriggerPct          = m_SetsPP.fDbleTriggerPct;
+	dst.fDbleKnee                = m_SetsPP.fDbleKnee;
+	dst.iDbleView                = m_SetsPP.iDbleView;
+	dst.bDbleOsd                 = m_SetsPP.bDbleOsd;
 	dst.fGamutCap                = m_SetsPP.fGamutCap;
 	dst.fMLHiDesat               = m_SetsPP.fMLHiDesat;
 	dst.iHdrExposureTrim         = m_SetsPP.iHdrExposureTrim;
@@ -987,6 +1001,19 @@ HRESULT CVRHdrPPage::OnActivate()
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Fade ratio", 2);
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Knee crossing", 3);
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO13, L"Ceiling crossing", 4);
+
+	// Display transfer: the final, display-referred encode. Follow source keeps
+	// the 2.1.0 pass-through; the explicit values convert SDR too.
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO15, L"Follow source", 5);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO15, L"Gamma 2.2", 0);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO15, L"Gamma 2.4", 1);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO15, L"BT.1886", 2);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO15, L"sRGB", 3);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO15, L"Gamma 2.0", 4);
+
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO16, L"Normal", 0);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO16, L"Clipping test", 1);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO16, L"Split screen", 2);
 
 	// The full curve list lives here now (same engine values as the Settings
 	// tab's device block). Item data is the engine type; 0/1 encode the
@@ -1050,6 +1077,18 @@ INT_PTR CVRHdrPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARA
 		const int action = HIWORD(wParam);
 
 		if (action == BN_CLICKED) {
+			if (nID == IDC_CHECK43) {
+				m_SetsPP.bDbleEnabled = IsDlgButtonChecked(IDC_CHECK43) == BST_CHECKED;
+				ApplyOwn();   // live: the roll-off is visible at once
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_CHECK44) {
+				m_SetsPP.bDbleOsd = IsDlgButtonChecked(IDC_CHECK44) == BST_CHECKED;
+				ApplyOwn();   // live: the overlay appears/disappears at once
+				SetDirty();
+				return (LRESULT)1;
+			}
 			if (nID == IDC_CHECK36) {
 				m_SetsPP.bHdrAutoRefWhite = IsDlgButtonChecked(IDC_CHECK36) == BST_CHECKED;
 				EnableControls();
@@ -1059,6 +1098,24 @@ INT_PTR CVRHdrPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARA
 			}
 		}
 		if (action == CBN_SELCHANGE) {
+			if (nID == IDC_COMBO15) {
+				const LRESULT lValue = ComboBox_GetCurItemData(m_hWnd, IDC_COMBO15);
+				if (lValue != m_SetsPP.iDisplayTransfer) {
+					m_SetsPP.iDisplayTransfer = (int)lValue;
+					ApplyOwn();   // live: the transfer is felt at once
+					SetDirty();
+				}
+				return (LRESULT)1;
+			}
+			if (nID == IDC_COMBO16) {
+				const LRESULT lValue = ComboBox_GetCurItemData(m_hWnd, IDC_COMBO16);
+				if (lValue != m_SetsPP.iDbleView) {
+					m_SetsPP.iDbleView = (int)lValue;
+					ApplyOwn();   // live diagnostic view
+					SetDirty();
+				}
+				return (LRESULT)1;
+			}
 			if (nID == IDC_COMBO12) {
 				const LRESULT lValue = ComboBox_GetCurItemData(m_hWnd, IDC_COMBO12);
 				if (lValue != m_SetsPP.iOutputGamut) {

@@ -239,7 +239,48 @@ struct Settings_t {
 	//       source's real colour instead of having everything outside 709
 	//       mapped away. Not a standards target — it is the "use the panel's
 	//       full gamut" choice, and the display must be set to match.
+	//   2 = DCI-P3 (D65), the consumer projector's P3 mode.
+	//   3 = follow the source primaries (SDR pass-through by default).
 	int iOutputGamut = 0;
+	// Display transfer applied at the final, display-referred stage.
+	//   0 = 2.2, 1 = 2.4, 2 = BT.1886, 3 = sRGB, 4 = 2.0
+	//   5 = follow source (default): SDR passes through; HDR->SDR keeps the
+	//       house 2.2 reference. Explicit values convert SDR too, decoding
+	//       BT.709 video as BT.1886 and sRGB/plain-gamma as their own curve.
+	int iDisplayTransfer = 5;
+	// DBLE compensation. In dark scenes, roll the top of the range down so a
+	// projector's dynamic laser dimming (DBLE) does not push highlights into
+	// clipping. The roll-off is applied in the TARGET code space, after the
+	// display transfer, so knee/ceiling follow the configured TRC. The scene
+	// mean and cut flag come from the always-on frame statistics, so this works
+	// with the ML grade Off, Auto or Manual. SDR output only.
+	bool  bDbleEnabled = false;
+	float fDbleStrength = 1.0f;      // 0..1; 1.0 puts peak white at 50 %
+	// Picture brightness measured on the finished SDR picture, in percent of
+	// SDR white. The fix starts below this and reaches full effect at a quarter
+	// of it. This is the contributed DBLEFix trigger and is independent of the
+	// ML grade (it is measured from the picture, not from the model).
+	float fDbleTriggerPct = 5.0f;    // 0.5 .. 30.0
+	float fDbleKnee = 0.30f;         // target-code level where the roll-off starts
+	// Diagnostic views of the fix, as in the contributed overlay:
+	//   0 = normal, 1 = clipping test (green/red/blue), 2 = split screen
+	int   iDbleView = 0;
+	// On-screen DBLE overlay: the contributed overlay, drawn over the finished
+	// picture. Its rows mirror the settings above; the selected row is marked
+	// with '>'. Off by default; the app's OSD row and Ctrl+Alt shortcuts drive
+	// it. overlayPinned shows the overlay continuously ("Always") instead of
+	// hiding 8 s after the last shortcut.
+	bool  bDbleOsd = false;
+	bool  bDbleOsdPinned = true;
+	int   iDbleOsdSelected = 2;      // 0..5, the row the shortcuts adjust
+	// The OSD's safe area in window pixels: the part of the picture the app's
+	// chrome (status rail, settings rail, transport bar) does not cover. Zero
+	// width/height means the whole window. The app updates this on every layout
+	// change, so the overlay moves out from under a panel that opens.
+	int   iDbleOsdX = 0;
+	int   iDbleOsdY = 0;
+	int   iDbleOsdW = 0;
+	int   iDbleOsdH = 0;
 	// The CONTENT's peak luminance, in nits — the top of the range the tone curves
 	// map FROM. Distinct from iHdrDisplayMaxNits, which is the DISPLAY's peak and is
 	// only read by the HDR-output path.
@@ -651,6 +692,19 @@ struct Settings_t {
 		iSDRDisplayNits                 = SDR_NITS_DEF;
 		fHdrDisplayMinNits              = 0.0f; // 0 == the mapping assumes an ideal black
 		iOutputGamut                    = 0;    // 0 == Rec.709 SDR output
+		iDisplayTransfer                = 5;    // 5 == follow source
+		bDbleEnabled                    = false;
+		fDbleStrength                   = 1.0f;
+		fDbleTriggerPct                 = 5.0f;
+		fDbleKnee                       = 0.30f;
+		iDbleView                       = 0;
+		bDbleOsd                        = false;
+		bDbleOsdPinned                  = true;
+		iDbleOsdSelected                = 2;
+		iDbleOsdX                       = 0;
+		iDbleOsdY                       = 0;
+		iDbleOsdW                       = 0;
+		iDbleOsdH                       = 0;
 		fHdrTitlePeakNits               = 1000.0f; // HDR10 nominal content peak
 		iExperimentalToneMapper         = 0;    // 0 == the shipped tone mapping
 		fToneLutContrast                = 0.50f; // pl_tone_map_spline default

@@ -1,5 +1,7 @@
 # Zion ML Grade — Technical Reference
 
+> **Historical snapshot (2026-09-09).** For the current implementation, including the band controller, taste stage and the sky/micro-contrast decoupling, see [`docs/ZION_GRADE_REFERENCE.md`](docs/ZION_GRADE_REFERENCE.md). This file is retained for the original design rationale.
+
 ## Overview
 
 Zion ML Grade is a real-time video enhancement pipeline for MPC Video Renderer (MPCVR) that applies scene-adaptive tone mapping and chroma tuning using machine learning models trained on Dolby Vision Profile 5 metadata. All luminance operations are performed in the **ICtCp perceptual color space** (BT.2100 / SMPTE ST 2084 PQ transfer), which preserves chrominance (Ct/Cp) when the intensity (I) channel is modified — eliminating the hue and saturation shifts inherent in RGB or YCbCr-domain grading.

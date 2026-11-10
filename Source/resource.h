@@ -278,6 +278,22 @@
 #define IDC_STATIC133                   1211
 #define IDC_STATIC134                   1212
 #define IDC_COMBO14                     1213
+#define IDC_STATIC135                   1214
+#define IDC_COMBO15                     1215
+#define IDC_CHECK43                     1216
+#define IDC_SLIDER37                    1217
+#define IDC_EDIT41                      1218
+#define IDC_STATIC136                   1219
+#define IDC_SLIDER38                    1220
+#define IDC_EDIT42                      1221
+#define IDC_STATIC137                   1222
+#define IDC_SLIDER39                    1223
+#define IDC_EDIT43                      1224
+#define IDC_COMBO16                     1225
+#define IDC_CHECK44                     1226
+#define IDC_STATIC138                   1227
+#define IDC_STATIC139                   1228
+#define IDC_STATIC140                   1229
 
 // Next default values for new objects
 // 

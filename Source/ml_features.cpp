@@ -94,7 +94,7 @@ constexpr float kCropLimit = 0.01f;
 void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[ML_FEATURE_DIM],
                      MLLumaDomain domain, MLBarBounds* bars, float* outTextureEnergy,
                      float* outPeakP995, float* outActiveFrac, float* outMeanNits,
-                     float* outQuantiles)
+                     float* outMeanNitsRobust, float* outQuantiles)
 {
 	const int w = ML_DOWNSAMPLE_W;
 	const int h = ML_DOWNSAMPLE_H;
@@ -154,19 +154,34 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 	// because the content bounds are not known until the first one finishes. This is
 	// the number an exposure solver needs: the mean of the PQ codes (features[1])
 	// decodes to a fraction of a nit and is useless for it.
-	if (outMeanNits) {
+	if (outMeanNits || outMeanNitsRobust) {
 		const int y0 = (contentTop >= 0 && contentTop < h) ? contentTop : 0;
 		const int y1 = (contentBottom >= y0 && contentBottom < h) ? contentBottom : h - 1;
-		double acc = 0.0;
-		int64_t cnt = 0;
+		// The ROBUST mean excludes a near-white background by its relation to THIS
+		// frame's peak, not by absolute nits. The Substance's white wall sits around
+		// 20-40 nits in this title's tone map, below any fixed "bright" threshold,
+		// so a constant fails; 85 % of the frame's own peak follows the wall in a
+		// white shot and the subject in a dark one. The 0.20 PQ floor stops the
+		// threshold collapsing in near-black frames, and the 1 % fallback leaves
+		// the full mean when there is genuinely no subject below it.
+		const float peakPq = (float)max_bin / 65535.0f;
+		const float kRobustPq = fmaxf(0.20f, 0.85f * peakPq);
+		double acc = 0.0, accR = 0.0;
+		int64_t cnt = 0, cntR = 0;
 		for (int y = y0; y <= y1; y++) {
 			const float* rowv = tv.data() + (size_t)y * w;
 			for (int x = 0; x < w; x++) {
-				acc += PqToNits(rowv[x]);
+				const float v = rowv[x];
+				const double nits = PqToNits(v);
+				acc += nits;
 				cnt++;
+				if (v <= kRobustPq) { accR += nits; cntR++; }
 			}
 		}
-		*outMeanNits = cnt ? (float)(acc / (double)cnt) : 0.0f;
+		const float mean = cnt ? (float)(acc / (double)cnt) : 0.0f;
+		if (outMeanNits) *outMeanNits = mean;
+		if (outMeanNitsRobust)
+			*outMeanNitsRobust = (cntR > cnt / 100) ? (float)(accR / (double)cntR) : mean;
 	}
 
 	// 1b) texture energy — fraction of interior pixels whose feature-domain
@@ -353,8 +368,14 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch, float features[
 		// Left in place, at zero, so the mechanism is here if it becomes a setting
 		// the operator sets deliberately for their own player.
 		constexpr float kSubtitleBand = 0.0f;            // bottom fraction of the picture
-		const int y0 = top_bars;
-		const int contentEnd = h - bottom_bars;          // exclusive
+		int y0 = std::clamp(top_bars, 0, h - 1);
+		int contentEnd = std::clamp(h - bottom_bars, 0, h);
+		// An all-dark frame makes top_bars == h and bottom_bars == h, so the
+		// original contentEnd (h - h) was 0 while y0 was h. The loop then read
+		// row h — one past this 256x144 buffer — and clamped heap garbage into
+		// the anchor histogram (observed on The Substance: luma -5.99e+13 at
+		// y=144). Fall back to the full frame, safely.
+		if (contentEnd <= y0) { y0 = 0; contentEnd = h; }
 		const int contentRows = contentEnd - y0;
 		const int y1 = std::max(y0 + 1, contentEnd - (int)(contentRows * kSubtitleBand));
 		int anchorCount = 0;

@@ -69,7 +69,41 @@ protected:
 	int  m_iHdrLocalToneMappingType        = 0;
 	int  m_iHdrDisplayMaxNits              = 1000;
 	float m_fHdrDisplayMinNits             = 0.0f;   // display black, nits (0 = assume ideal black)
-	int   m_iOutputGamut                   = 0;      // 0 = BT.709 SDR out, 1 = keep BT.2020
+	int   m_iOutputGamut                   = 0;      // 0 = BT.709 SDR out, 1 = keep BT.2020, 2 = DCI-P3 (D65), 3 = follow source
+	// Display transfer applied at the DX11 final pass (the last display-referred
+	// stage): 0=2.2, 1=2.4, 2=BT.1886, 3=sRGB, 4=2.0, 5=follow source (default).
+	// Follow source keeps SDR pass-through and the HDR->SDR 2.2 reference; an
+	// explicit value converts SDR sources too. DX9 has no final pass, so the
+	// value is inert there.
+	int   m_iDisplayTransfer               = 5;
+	// DBLE compensation (final pass, target code). Smoothing state is per
+	// activation: -1 means "no history", snapped on a scene cut.
+	bool  m_bDbleEnabled                   = false;
+	float m_fDbleStrength                  = 1.0f;
+	float m_fDbleTriggerPct                = 5.0f;
+	float m_fDbleKnee                      = 0.30f;
+	float m_fDbleSmooth                    = -1.0f;
+	int   m_iDbleView                      = 0;
+	bool  m_bDbleOsdEnabled                = false;
+	bool  m_bDbleOsdPinned                 = true;
+	int   m_iDbleOsdSelected               = 2;
+	int   m_iDbleOsdX                      = 0;   // OSD safe area, window pixels
+	int   m_iDbleOsdY                      = 0;
+	int   m_iDbleOsdW                      = 0;   // 0 = whole window
+	int   m_iDbleOsdH                      = 0;
+	// Last frame's applied DBLE state, for the on-screen overlay.
+	bool  m_bDbleLastActive                = false;
+	float m_fDbleLastAmount                = 0.0f;
+	float m_fDbleLastCeil                  = 1.0f;
+	float m_fDbleLastKnee                  = 0.30f;
+	// Measurement of the finished SDR picture (128x72 cells, read two frames
+	// later): picture brightness in percent of SDR white, clipping fraction,
+	// bottom-bar fraction. The contributed DBLEFix trigger, independent of ML.
+	float m_fDblePicturePct                = 0.0f;
+	float m_fDbleClipFrac                  = 0.0f;
+	float m_fDbleBottomBarFrac             = 0.0f;
+	bool  m_bDbleHaveMeasure               = false;
+	bool  m_bDbleCut                       = false;
 	// Content peak, nits — the top of the range the tone curves map from. Distinct
 	// from m_iHdrDisplayMaxNits (the display's peak). Falls back to the HDR10
 	// nominal 1000 when the source carries no metadata, which is always on the

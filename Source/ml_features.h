@@ -105,6 +105,7 @@ void BuildMLFeatures(const uint16_t* luma16, const int rowPitch,
                      float* outPeakP995 = nullptr,
                      float* outActiveFrac = nullptr,
                      float* outMeanNits = nullptr,
+                     float* outMeanNitsRobust = nullptr,
                      float* outQuantiles = nullptr);
 
 // ---------------------------------------------------------------------------

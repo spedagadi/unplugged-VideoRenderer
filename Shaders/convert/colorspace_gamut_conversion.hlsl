@@ -4,6 +4,9 @@
 
 static const float REC_709_PRIMARIES[3][2]  = { { 0.640, 0.330 }, { 0.300, 0.600 }, { 0.150, 0.060 } };
 static const float REC_2020_PRIMARIES[3][2] = { { 0.708, 0.292 }, { 0.170, 0.797 }, { 0.131, 0.046 } };
+// Consumer "DCI-P3" is P3 with a D65 white point (the projector's P3 mode),
+// not the cinema DCI white (0.314, 0.351).
+static const float DCI_P3_D65_PRIMARIES[3][2] = { { 0.680, 0.320 }, { 0.265, 0.690 }, { 0.150, 0.060 } };
 
 static const float ILLUMINANT_D65[2] = { 0.3127, 0.3290 };
 
@@ -83,11 +86,43 @@ const float3x3 gamut_rgb_to_xyz_matrix(const float primaries_xy[3][2])
 
 static const float3x3 gamut_xyz_color_matrix_2020 = gamut_rgb_to_xyz_matrix(REC_2020_PRIMARIES);
 static const float3x3 gamut_xyz_color_matrix_709  = gamut_rgb_to_xyz_matrix(REC_709_PRIMARIES);
+static const float3x3 gamut_xyz_color_matrix_p3   = gamut_rgb_to_xyz_matrix(DCI_P3_D65_PRIMARIES);
 static const float3x3 convert_matrix_2020_to_709  = mul(inverse(gamut_xyz_color_matrix_709), gamut_xyz_color_matrix_2020);
+static const float3x3 convert_matrix_709_to_2020  = mul(inverse(gamut_xyz_color_matrix_2020), gamut_xyz_color_matrix_709);
+static const float3x3 convert_matrix_2020_to_p3   = mul(inverse(gamut_xyz_color_matrix_p3), gamut_xyz_color_matrix_2020);
+static const float3x3 convert_matrix_709_to_p3    = mul(inverse(gamut_xyz_color_matrix_p3), gamut_xyz_color_matrix_709);
+static const float3x3 convert_matrix_p3_to_709    = mul(inverse(gamut_xyz_color_matrix_709), gamut_xyz_color_matrix_p3);
+static const float3x3 convert_matrix_p3_to_2020   = mul(inverse(gamut_xyz_color_matrix_2020), gamut_xyz_color_matrix_p3);
 
 float3 Colorspace_Gamut_Conversion_2020_to_709(const float3 rgb)
 {
     return mul(convert_matrix_2020_to_709, rgb);
+}
+
+float3 Colorspace_Gamut_Conversion_2020_to_P3(const float3 rgb)
+{
+    return mul(convert_matrix_2020_to_p3, rgb);
+}
+
+// Generic linear-RGB primaries conversion for the SDR final pass. Codes:
+// 0 = BT.709 (601 SDR is treated as 709), 1 = BT.2020, 2 = DCI-P3 (D65).
+// The caller saturates; out-of-target colours are clipped at the target
+// triangle because the 709 capacity pull is fitted to 709, not P3.
+float3 GamutConvertSpace(const float3 c, const float src, const float dst)
+{
+    if (src < 0.5) {
+        if (dst > 1.5) return mul(convert_matrix_709_to_p3, c);
+        if (dst > 0.5) return mul(convert_matrix_709_to_2020, c);
+        return c;
+    }
+    if (src < 1.5) {
+        if (dst > 1.5) return mul(convert_matrix_2020_to_p3, c);
+        if (dst < 0.5) return mul(convert_matrix_2020_to_709, c);
+        return c;
+    }
+    if (dst < 0.5) return mul(convert_matrix_p3_to_709, c);
+    if (dst < 1.5) return mul(convert_matrix_p3_to_2020, c);
+    return c;
 }
 
 // 2020 -> 709 as gamut MAPPING rather than gamut CLIPPING.
