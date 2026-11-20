@@ -25,6 +25,8 @@
 #include "PropPage.h"
 
 #include <span>
+#include <commdlg.h>
+#pragma comment(lib, "comdlg32.lib")
 
 void SetCursor(HWND hWnd, LPCWSTR lpCursorName)
 {
@@ -862,6 +864,9 @@ void CVRHdrPPage::SetControls()
 	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO12, m_SetsPP.iOutputGamut);
 	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO13, (LONG_PTR)(int)m_SetsPP.fHdrGt7Dbg);
 	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO15, (LONG_PTR)m_SetsPP.iDisplayTransfer);
+	CheckDlgButton(IDC_CHECK_SDRBT2020, m_SetsPP.bSdrBt2020 ? BST_CHECKED : BST_UNCHECKED);
+	SetDlgItemTextW(IDC_EDIT_LUTPATH, m_SetsPP.sCubeLutPath);
+	ComboBox_SelectByItemData(m_hWnd, IDC_COMBO_LUTMODE, m_SetsPP.iCubeLutMode);
 
 	// Curve selection state. Ignore/Passthrough are flag-only states (the stored
 	// type keeps whatever curve was last chosen), so item data encodes them as
@@ -929,6 +934,9 @@ void CVRHdrPPage::Graft(Settings_t& dst) const
 	dst.fHdrDisplayMinNits       = m_SetsPP.fHdrDisplayMinNits;
 	dst.iOutputGamut             = m_SetsPP.iOutputGamut;
 	dst.iDisplayTransfer         = m_SetsPP.iDisplayTransfer;
+	dst.bSdrBt2020               = m_SetsPP.bSdrBt2020;
+	wcscpy_s(dst.sCubeLutPath, m_SetsPP.sCubeLutPath);
+	dst.iCubeLutMode             = m_SetsPP.iCubeLutMode;
 	dst.clipGuard                = m_SetsPP.clipGuard;
 	dst.fGamutCap                = m_SetsPP.fGamutCap;
 	dst.fMLHiDesat               = m_SetsPP.fMLHiDesat;
@@ -1003,6 +1011,14 @@ HRESULT CVRHdrPPage::OnActivate()
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO15, L"sRGB", 3);
 	ComboBox_AddStringData(m_hWnd, IDC_COMBO15, L"Gamma 2.0", 4);
 
+	// Display-calibration LUT. The shell loads a .cube by command; the
+	// standalone property page persists this path and mode in the renderer's
+	// settings so it survives a graph/device rebuild.
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO_LUTMODE, L"Off", 0);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO_LUTMODE, L"Gamma only", 1);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO_LUTMODE, L"Greyscale", 2);
+	ComboBox_AddStringData(m_hWnd, IDC_COMBO_LUTMODE, L"Full 3D", 3);
+
 	// The full curve list lives here now (same engine values as the Settings
 	// tab's device block). Item data is the engine type; 0/1 encode the
 	// flag-only Ignore/Passthrough states.
@@ -1051,6 +1067,18 @@ HRESULT CVRHdrPPage::OnActivate()
 		"each scene measures, and unlocks the GT7 controls beside it.\n"
 		"Passthrough sends the HDR signal to the display untouched;\n"
 		"Ignore applies no HDR processing at all.");
+	AddHint(IDC_CHECK_SDRBT2020,
+		L"Declares SDR output as BT.2020 so a projector with a real SDR\n"
+		"BT.2020 mode sees the correct gamut. Requires Output gamut =\n"
+		"BT.2020. Many displays ignore the SDR flag and show a shift.");
+	AddHint(IDC_BUTTON_LUTBROWSE,
+		L"Loads a DisplayCAL/ArgyllCMS .cube as the final display pass.\n"
+		"Choose the mode that matches the cube: Full 3D for a calibrated\n"
+		"3D LUT, Gamma only or Greyscale for a partial calibration.");
+	AddHint(IDC_COMBO_LUTMODE,
+		L"Off = loaded but not applied. Gamma only = neutral lightness.\n"
+		"Greyscale = per-channel tone/balance. Full 3D = complete gamut\n"
+		"and colour calibration.");
 
 	m_bActivated = true;
 	InitSliders();
@@ -1072,6 +1100,42 @@ INT_PTR CVRHdrPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARA
 				SetDirty();
 				return (LRESULT)1;
 			}
+			if (nID == IDC_CHECK_SDRBT2020) {
+				m_SetsPP.bSdrBt2020 = IsDlgButtonChecked(IDC_CHECK_SDRBT2020) == BST_CHECKED;
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
+			if (nID == IDC_BUTTON_LUTBROWSE) {
+				WCHAR path[MAX_PATH] = {};
+				wcscpy_s(path, m_SetsPP.sCubeLutPath);
+				OPENFILENAMEW ofn = {};
+				ofn.lStructSize = sizeof(ofn);
+				ofn.hwndOwner = m_hWnd;
+				ofn.lpstrFilter = L"Calibration LUT (*.cube)\0*.cube\0All files (*.*)\0*.*\0";
+				ofn.lpstrFile = path;
+				ofn.nMaxFile = MAX_PATH;
+				ofn.lpstrTitle = L"Select a .cube calibration LUT";
+				ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+				if (GetOpenFileNameW(&ofn)) {
+					wcscpy_s(m_SetsPP.sCubeLutPath, path);
+					SetDlgItemTextW(IDC_EDIT_LUTPATH, path);
+					if (m_SetsPP.iCubeLutMode == 0) {
+						m_SetsPP.iCubeLutMode = 3;   // a chosen LUT should do something
+						ComboBox_SelectByItemData(m_hWnd, IDC_COMBO_LUTMODE, 3);
+					}
+					ApplyOwn();
+					SetDirty();
+				}
+				return (LRESULT)1;
+			}
+			if (nID == IDC_BUTTON_LUTCLEAR) {
+				m_SetsPP.sCubeLutPath[0] = 0;
+				SetDlgItemTextW(IDC_EDIT_LUTPATH, L"");
+				ApplyOwn();
+				SetDirty();
+				return (LRESULT)1;
+			}
 		}
 		if (action == CBN_SELCHANGE) {
 			if (nID == IDC_COMBO15) {
@@ -1089,6 +1153,15 @@ INT_PTR CVRHdrPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARA
 					m_SetsPP.iOutputGamut = (int)lValue;
 					SetDirty();
 					EnableControls(); // gamut capacity acts only inside BT.709
+				}
+				return (LRESULT)1;
+			}
+			if (nID == IDC_COMBO_LUTMODE) {
+				const LRESULT lValue = ComboBox_GetCurItemData(m_hWnd, IDC_COMBO_LUTMODE);
+				if (lValue != m_SetsPP.iCubeLutMode) {
+					m_SetsPP.iCubeLutMode = (int)lValue;
+					ApplyOwn();
+					SetDirty();
 				}
 				return (LRESULT)1;
 			}

@@ -5,7 +5,7 @@ Unplugged, packaged for MPC-HC and MPC-BE: the same HDR tone mapping, the
 Unplugged tone curve, the ML grade (Auto/Manual) and the renderer property
 pages.
 
-Package version 2.2.1 -- a renderer-only update for Unplugged 2.2.x users.
+Package version 2.3.0 -- the renderer-only release that matches Unplugged 2.3.0.
 It does not require or install the Unplugged application. The renderer binary
 inside it is build 0.11.0.2637; the filter's own properties show that build
 number.
@@ -83,11 +83,22 @@ leaves SDR untouched and keeps the 2.1.0 behaviour. Set it to the projector's
 calibrated transfer. If a calibration 3D LUT is loaded, author it for the same
 transfer.
 
-The HDR page also carries the DBLE compensation rows (Enable, Strength,
-Trigger picture %, Highlight start), the diagnostic View (Normal / Clipping
-test / Split screen) and the OSD readout. DBLE is for projectors whose dynamic
-laser dimming clips highlights in dark scenes; it works on the finished SDR
-picture and does not require the ML grade.
+"Output gamut" chooses the gamut the tone mapper writes for HDR/DV (Follow
+source / BT.709 / BT.2020 / DCI-P3). "SDR BT.2020 (projector)" declares direct
+SDR output as BT.2020 and requires a display with a real SDR BT.2020 mode; leave
+it Off for displays that only use BT.2020 for HDR.
+
+DISPLAY CALIBRATION 3D LUT
+--------------------------
+The HDR page's Display calibration group loads a DisplayCAL/ArgyllCMS .cube
+file as the final display stage. Pick the file, choose Off / Gamma only /
+Greyscale / Full 3D, and apply. The path and mode are stored in the renderer's
+settings and reloaded when the graph or D3D device is rebuilt, so the LUT does
+not disappear when playback restarts. Clear removes it.
+
+10-bit output is automatic: the renderer uses a 10-bit swap chain when the
+display link reports 10 bpc. Set 10 bpc in the GPU driver; the renderer cannot
+raise an 8-bit link.
 
 
 UNINSTALL

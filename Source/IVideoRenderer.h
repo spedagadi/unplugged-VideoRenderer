@@ -224,6 +224,12 @@ struct Settings_t {
 	// BT.2020 colourimetry flag to the display. The image must already be in
 	// BT.2020 (Output gamut = BT.2020); this only changes the declaration.
 	bool bSdrBt2020;
+	// Display-calibration 3D LUT. The shell loads a .cube with a command, but
+	// standalone players have only this property page, so the path and mode are
+	// persisted here and re-applied when the graph/device is rebuilt. Empty path
+	// = no LUT. Mode: 0 off, 1 gamma only, 2 greyscale, 3 full 3D.
+	WCHAR sCubeLutPath[MAX_PATH] = {};
+	int   iCubeLutMode = 3;
 	bool bHdrPreferDoVi;
 	bool bHdrPassthrough;
 	int  iHdrToggleDisplay;

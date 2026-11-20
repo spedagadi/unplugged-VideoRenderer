@@ -81,6 +81,8 @@
 // Stored as MILLINITS in a DWORD (0.16 nits -> 160): keeps every nits setting a
 // DWORD like its neighbours, and 1/1000 nit is ample resolution for a black level.
 #define OPT_HdrDisplayMinNits              L"HdrDisplayMinNits"
+#define OPT_CubeLutPath                    L"CubeLutPath"
+#define OPT_CubeLutMode                    L"CubeLutMode"
 #define OPT_OutputGamut                    L"OutputGamut"
 // Final display-referred encode: 0=2.2, 1=2.4, 2=BT.1886, 3=sRGB, 4=2.0,
 // 5=follow source (the 2.1.0 pass-through).
@@ -529,6 +531,15 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 		// SDR BT.2020 signal declaration (test, 2026-11-19).
 		if (ERROR_SUCCESS == key.QueryDWORDValue(L"SdrBt2020", dw)) {
 			m_Sets.bSdrBt2020 = !!dw;
+		}
+		{
+			ULONG nChars = _countof(m_Sets.sCubeLutPath);
+			if (ERROR_SUCCESS != key.QueryStringValue(OPT_CubeLutPath, m_Sets.sCubeLutPath, &nChars)) {
+				m_Sets.sCubeLutPath[0] = 0;
+			}
+			if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_CubeLutMode, dw)) {
+				m_Sets.iCubeLutMode = discard<int>(dw, 3, 0, 3);
+			}
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_HdrOsdBrightness, dw)) {
 			m_Sets.iHdrOsdBrightness = discard<int>(dw, 0, 0, 2);
@@ -2369,6 +2380,8 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 		key.SetDWORDValue(OPT_ToneLutContrast,     (DWORD)(m_Sets.fToneLutContrast * 1000.0f + 0.5f));
 		key.SetDWORDValue(OPT_HdrToggleDisplay,    m_Sets.iHdrToggleDisplay);
 		key.SetDWORDValue(L"SdrBt2020",            m_Sets.bSdrBt2020 ? 1 : 0);
+		key.SetStringValue(OPT_CubeLutPath,         m_Sets.sCubeLutPath);
+		key.SetDWORDValue(OPT_CubeLutMode,         m_Sets.iCubeLutMode);
 		key.SetDWORDValue(OPT_HdrOsdBrightness,    m_Sets.iHdrOsdBrightness);
 		key.SetDWORDValue(OPT_ConvertToSdr,        m_Sets.bConvertToSdr);
 		key.SetDWORDValue(OPT_DisplayNits,         m_Sets.iSDRDisplayNits);

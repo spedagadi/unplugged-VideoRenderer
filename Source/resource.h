@@ -294,6 +294,14 @@
 #define IDC_STATIC138                   1227
 #define IDC_STATIC139                   1228
 #define IDC_STATIC140                   1229
+#define IDC_CHECK_SDRBT2020             1230
+#define IDC_COMBO_LUTMODE               1231
+#define IDC_EDIT_LUTPATH                1232
+#define IDC_BUTTON_LUTBROWSE            1233
+#define IDC_BUTTON_LUTCLEAR             1234
+#define IDC_STATIC141                   1235
+#define IDC_STATIC142                   1236
+#define IDC_STATIC143                   1237
 
 // Next default values for new objects
 // 

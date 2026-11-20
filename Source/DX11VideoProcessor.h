@@ -98,6 +98,11 @@ private:
 	int  m_iCubeLutSize    = 0;      // N of LUT_3D_SIZE N; 0 == no LUT loaded
 	bool m_bCubeLutEnabled = false;
 	int  m_iCubeLutMode    = 3;      // default full 3D (the historical behaviour)
+	// Property-page configuration (persisted in Settings_t). Applied on Configure
+	// when the device exists and again at the end of SetDevice, so a LUT chosen
+	// before the graph exists is not lost.
+	std::wstring m_sCubeLutPathCfg;
+	void ApplyCubeLutConfig();
 	// The final pass is normally gated on dithering. A loaded LUT must run there
 	// regardless (it is the only display-referred stage), so the pass is forced on
 	// and the dither sample is skipped in the shader when it is not wanted.

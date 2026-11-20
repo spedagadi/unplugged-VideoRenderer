@@ -47,7 +47,7 @@
 ; Unplugged application now: 2.2.1 is the first standalone renderer release,
 ; with KrigBilateral as the default chroma upsampler. build_renderer_setup.ps1
 ; no longer requires this to match the app.
-#define MyAppVersion   "2.2.1"
+#define MyAppVersion   "2.3.0"
 #define MyAppPublisher "unplugged"
 
 ; The renderer BINARY build (Include\Version.h + revision.h). It names the

@@ -2007,6 +2007,23 @@ HRESULT CDX11VideoProcessor::LoadCubeLut(const char* utf8Path)
 	return S_OK;
 }
 
+// Applies the property-page LUT choice. Configure() can run before the graph
+// has a device, so the path is kept on the object and re-applied from SetDevice.
+void CDX11VideoProcessor::ApplyCubeLutConfig()
+{
+	if (!m_pDevice) {
+		return;
+	}
+	char u8[MAX_PATH * 3] = {};
+	if (!m_sCubeLutPathCfg.empty()) {
+		WideCharToMultiByte(CP_UTF8, 0, m_sCubeLutPathCfg.c_str(), -1, u8, (int)sizeof(u8), nullptr, nullptr);
+	}
+	const HRESULT hr = LoadCubeLut(u8);
+	if (FAILED(hr)) {
+		DLog(L"CDX11VideoProcessor::ApplyCubeLutConfig() : load failed for '{}'", m_sCubeLutPathCfg);
+	}
+}
+
 // The experimental tone curve. libplacebo builds its tone LUT on the CPU once
 // per parameter change and lets the shader sample it Ã¢â‚¬â€ complex curves become
 // practical, and each curve carries a tunable parameter instead of being one
@@ -5454,6 +5471,7 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 	UpdateStatsByDisplay();
 
 	InitMLResources();
+	ApplyCubeLutConfig();
 
 	return hr;
 }
@@ -10211,6 +10229,19 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 	if (changeResizeStats) {
 		UpdateStatsByWindow();
 		UpdateStatsByDisplay();
+	}
+
+	// Property-page display-calibration LUT: apply when the path/mode changes.
+	// If the device does not exist yet, SetDevice() applies the stored path.
+	{
+		const int lutMode = std::clamp(config.iCubeLutMode, 0, 3);
+		if (lutMode != m_iCubeLutMode) {
+			m_iCubeLutMode = lutMode;
+		}
+		if (m_sCubeLutPathCfg != config.sCubeLutPath) {
+			m_sCubeLutPathCfg = config.sCubeLutPath;
+			ApplyCubeLutConfig();
+		}
 	}
 
 	if (changeSuperRes) {
